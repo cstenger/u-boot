@@ -153,8 +153,15 @@ SECTIONS
 
 	/*
 	 * arch/arm/lib/crt0_64.S assumes __bss_start - __bss_end % 8 == 0
+	 *
+	 * H713 branch: ld.lld miscomputes the historical
+	 * ".bss ADDR(.rela.dyn) (OVERLAY)" placement, assigning the .bss
+	 * VMA 0. That breaks gd->mon_len (__bss_end - _start wraps) and
+	 * the pc-relative BSS clear in crt0_64.S. Place .bss after the
+	 * image instead of overlaying .rela.dyn; costs bss-size bytes of
+	 * relocated RAM only.
 	 */
-	.bss ADDR(.rela.dyn) (OVERLAY) : {
+	.bss ALIGN(8) : {
 		__bss_start = .;
 		*(.bss*)
 		. = ALIGN(8);
