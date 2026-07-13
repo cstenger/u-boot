@@ -604,9 +604,21 @@ struct mmc *sunxi_mmc_init(int sdc_no)
 	       SUNXI_MMC_COMMON_BASE + 4 * sdc_no);
 #endif
 #else /* CONFIG_SUN50I_GEN_H6 */
-	setbits_le32(ccm + CCU_H6_MMC_GATE_RESET, 1 << sdc_no);
-	/* unassert reset */
-	setbits_le32(ccm + CCU_H6_MMC_GATE_RESET, 1 << (RESET_SHIFT + sdc_no));
+	/*
+	 * The H713 SMHC bus interface locks up (register accesses hang
+	 * the CPU) if the bus clock gate opens while the module is still
+	 * held in reset, so release the reset first, as the BROM does.
+	 */
+	if (IS_ENABLED(CONFIG_MACH_SUN50I_H713)) {
+		setbits_le32(ccm + CCU_H6_MMC_GATE_RESET,
+			     1 << (RESET_SHIFT + sdc_no));
+		setbits_le32(ccm + CCU_H6_MMC_GATE_RESET, 1 << sdc_no);
+	} else {
+		setbits_le32(ccm + CCU_H6_MMC_GATE_RESET, 1 << sdc_no);
+		/* unassert reset */
+		setbits_le32(ccm + CCU_H6_MMC_GATE_RESET,
+			     1 << (RESET_SHIFT + sdc_no));
+	}
 #endif
 	ret = mmc_set_mod_clk(priv, 24000000);
 	if (ret)
@@ -709,13 +721,28 @@ static int sunxi_mmc_probe(struct udevice *dev)
 	priv->mmc_no = ((uintptr_t)priv->reg - SUNXI_MMC0_BASE) / 0x1000;
 	priv->mclkreg = (void *)ccu_reg + get_mclk_offset() + priv->mmc_no * 4;
 
-	ret = clk_get_by_name(dev, "ahb", &gate_clk);
-	if (!ret)
-		clk_enable(&gate_clk);
+	/*
+	 * The H713 SMHC bus interface locks up (register accesses hang
+	 * the CPU) if the bus clock gate opens while the module is still
+	 * held in reset, so release the reset first, as the BROM does.
+	 */
+	if (IS_ENABLED(CONFIG_MACH_SUN50I_H713)) {
+		ret = reset_get_bulk(dev, &reset_bulk);
+		if (!ret)
+			reset_deassert_bulk(&reset_bulk);
 
-	ret = reset_get_bulk(dev, &reset_bulk);
-	if (!ret)
-		reset_deassert_bulk(&reset_bulk);
+		ret = clk_get_by_name(dev, "ahb", &gate_clk);
+		if (!ret)
+			clk_enable(&gate_clk);
+	} else {
+		ret = clk_get_by_name(dev, "ahb", &gate_clk);
+		if (!ret)
+			clk_enable(&gate_clk);
+
+		ret = reset_get_bulk(dev, &reset_bulk);
+		if (!ret)
+			reset_deassert_bulk(&reset_bulk);
+	}
 
 	ret = mmc_set_mod_clk(priv, 24000000);
 	if (ret)
