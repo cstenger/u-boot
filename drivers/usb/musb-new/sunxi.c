@@ -289,13 +289,26 @@ static int sunxi_musb_init(struct musb *musb)
 
 	pr_debug("%s():\n", __func__);
 
+	/*
+	 * The H713 bus interfaces lock up if a module's clock gate opens
+	 * while it is still held in reset (proven on the SMHC), so
+	 * release the reset first there, as the BROM does.
+	 */
+	if (IS_ENABLED(CONFIG_MACH_SUN50I_H713) && reset_valid(&glue->rst)) {
+		ret = reset_deassert(&glue->rst);
+		if (ret) {
+			dev_err(musb->controller, "failed to deassert reset\n");
+			return ret;
+		}
+	}
+
 	ret = clk_enable(&glue->clk);
 	if (ret) {
 		dev_err(musb->controller, "failed to enable clock\n");
 		return ret;
 	}
 
-	if (reset_valid(&glue->rst)) {
+	if (!IS_ENABLED(CONFIG_MACH_SUN50I_H713) && reset_valid(&glue->rst)) {
 		ret = reset_deassert(&glue->rst);
 		if (ret) {
 			dev_err(musb->controller, "failed to deassert reset\n");
