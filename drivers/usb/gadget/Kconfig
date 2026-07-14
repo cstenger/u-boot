@@ -229,6 +229,16 @@ config USB_FUNCTION_ACM
 	  interoperate with MS-Windows hosts or with the Linux-USB "cdc-acm"
 	  driver.
 
+config USB_FUNCTION_ACM_WAIT_FOR_CONNECTION
+	bool "Wait for a CDC ACM host connection"
+	depends on USB_FUNCTION_ACM
+	default y
+	help
+	  Wait for the USB host to configure the CDC ACM function when it is
+	  selected as a console device. Disable this to allow U-Boot to continue
+	  booting when the USB cable is disconnected. The USB gadget will remain
+	  registered and can be serviced by subsequent console polling.
+
 endif # USB_GADGET_DOWNLOAD
 
 config USB_ETHER
