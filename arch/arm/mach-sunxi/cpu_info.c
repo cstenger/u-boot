@@ -104,6 +104,8 @@ int print_cpuinfo(void)
 	puts("CPU:   Allwinner H6 (SUN50I)\n");
 #elif defined CONFIG_MACH_SUN50I_H616
 	puts("CPU:   Allwinner H616 (SUN50I)\n");
+#elif defined CONFIG_MACH_SUN50I_H713
+	puts("CPU:   Allwinner H713 (SUN50I)\n");
 #elif defined CONFIG_MACH_SUN50I_A133
 	puts("CPU:   Allwinner A133 (SUN50I)\n");
 #elif defined CONFIG_MACH_SUN55I_A523

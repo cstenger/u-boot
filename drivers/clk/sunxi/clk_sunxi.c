@@ -201,6 +201,14 @@ static const struct udevice_id sunxi_clk_ids[] = {
 #ifdef CONFIG_CLK_SUN20I_D1
 	{ .compatible = "allwinner,sun20i-d1-ccu",
 	  .data = (ulong)&d1_ccu_desc },
+	/*
+	 * The H713 (sun50iw12) CCU uses the D1 register layout for
+	 * every block verified so far (MMC 0x84c/0x830, USB 0xa70/0xa8c,
+	 * UART 0x90c), so reuse the D1 gate/reset tables until a
+	 * dedicated binding exists.
+	 */
+	{ .compatible = "allwinner,sun50i-h713-ccu",
+	  .data = (ulong)&d1_ccu_desc },
 #endif
 #ifdef CONFIG_CLK_SUN50I_H6
 	{ .compatible = "allwinner,sun50i-h6-ccu",

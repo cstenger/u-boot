@@ -89,10 +89,11 @@ config CLK_SUN8I_H3
 
 config CLK_SUN20I_D1
 	bool "Clock driver for Allwinner D1"
-	default MACH_SUN8I_R528
+	default MACH_SUN8I_R528 || MACH_SUN50I_H713
 	help
 	  This enables common clock driver support for platforms based
-	  on Allwinner D1 SoC.
+	  on Allwinner D1 SoC. The H713 CCU shares the D1 register
+	  layout and reuses these tables.
 
 config CLK_SUN50I_H6
 	bool "Clock driver for Allwinner H6"

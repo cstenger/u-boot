@@ -49,6 +49,7 @@
 #include <net.h>
 #include <spl.h>
 #include <sy8106a.h>
+#include <usb.h>
 #include <asm/setup.h>
 
 DECLARE_GLOBAL_DATA_PTR;
@@ -113,7 +114,7 @@ void i2c_init_board(void)
 	clock_twi_onoff(5, 1);
 	sunxi_gpio_set_cfgpin(SUNXI_GPL(8), SUN50I_GPL_R_TWI);
 	sunxi_gpio_set_cfgpin(SUNXI_GPL(9), SUN50I_GPL_R_TWI);
-#elif defined(CONFIG_MACH_SUN50I_H616)
+#elif defined(CONFIG_MACH_SUN50I_H616) || defined(CONFIG_MACH_SUN50I_H713)
 	clock_twi_onoff(5, 1);
 	sunxi_gpio_set_cfgpin(SUNXI_GPL(0), SUN50I_H616_GPL_R_TWI);
 	sunxi_gpio_set_cfgpin(SUNXI_GPL(1), SUN50I_H616_GPL_R_TWI);
@@ -189,7 +190,6 @@ enum env_location env_get_location(enum env_operation op, int prio)
 	return ENVL_UNKNOWN;
 }
 
-/* called only from U-Boot proper */
 int board_init(void)
 {
 	__maybe_unused int id_pfr1, ret;
@@ -308,7 +308,8 @@ static void nand_clock_setup(void)
 {
 	void * const ccm = (void *)SUNXI_CCM_BASE;
 
-#if defined(CONFIG_MACH_SUN50I_H616) || defined(CONFIG_MACH_SUN50I_H6)
+#if defined(CONFIG_MACH_SUN50I_H616) || defined(CONFIG_MACH_SUN50I_H713) || \
+    defined(CONFIG_MACH_SUN50I_H6)
 	setbits_le32(ccm + CCU_H6_NAND_GATE_RESET,
 		     (1 << GATE_SHIFT) | (1 << RESET_SHIFT));
 	setbits_le32(ccm + CCU_H6_MBUS_GATE, (1 << MBUS_GATE_OFFSET_NAND));
@@ -447,8 +448,8 @@ static void mmc_pinmux_setup(int sdc)
 			sunxi_gpio_set_pull(pin, SUNXI_GPIO_PULL_UP);
 			sunxi_gpio_set_drv(pin, 2);
 		}
-#elif defined(CONFIG_MACH_SUN50I_H616) || defined(CONFIG_MACH_SUN50I_A133) || \
-      defined(CONFIG_MACH_SUN55I_A523)
+#elif defined(CONFIG_MACH_SUN50I_H616) || defined(CONFIG_MACH_SUN50I_H713) || \
+      defined(CONFIG_MACH_SUN50I_A133) || defined(CONFIG_MACH_SUN55I_A523)
 		/* SDC2: PC0-PC1, PC5-PC6, PC8-PC11, PC13-PC16 */
 		for (pin = SUNXI_GPC(0); pin <= SUNXI_GPC(16); pin++) {
 			if (pin > SUNXI_GPC(1) && pin < SUNXI_GPC(5))
@@ -672,6 +673,16 @@ void sunxi_board_init(void)
 #endif /* CONFIG_XPL_BUILD */
 
 #ifdef CONFIG_USB_GADGET
+int board_usb_init(int index, enum usb_init_type init)
+{
+	struct udevice *dev;
+
+	if (init != USB_INIT_DEVICE)
+		return 0;
+
+	return uclass_get_device(UCLASS_USB_GADGET_GENERIC, index, &dev);
+}
+
 int g_dnl_board_usb_cable_connected(void)
 {
 	struct udevice *dev;

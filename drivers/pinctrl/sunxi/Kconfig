@@ -124,6 +124,16 @@ config PINCTRL_SUN50I_H616_R
 	default MACH_SUN50I_H616
 	select PINCTRL_SUNXI
 
+config PINCTRL_SUN50I_H713
+	bool "Support for the Allwinner H713 PIO"
+	default MACH_SUN50I_H713
+	select PINCTRL_SUNXI
+
+config PINCTRL_SUN50I_H713_R
+	bool "Support for the Allwinner H713 R-PIO"
+	default MACH_SUN50I_H713
+	select PINCTRL_SUNXI
+
 config PINCTRL_SUN50I_A100
 	bool "Support for the Allwinner A100/A133 PIO"
 	default MACH_SUN50I_A133
