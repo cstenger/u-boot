@@ -40,6 +40,13 @@ ENTRY(return_to_fel)
 	adr	x1, fel_stash_addr	// to find the fel_stash address in AA32
 	str	w2, [x1]
 
+#if defined(CONFIG_MACH_SUN50I_H713)
+	/*
+	 * H713 cannot return via the H616/H6 RMR hotplug mailbox; it
+	 * exception-returns directly into the AArch32 FEL restore stub.
+	 */
+	b	return_to_fel_eret
+#else
 	ldr	w0, =0xfa50392f		// CPU hotplug magic
 #if defined(CONFIG_MACH_SUN50I_H616) || defined(CONFIG_MACH_SUN50I_A133) || \
     defined(CONFIG_MACH_SUN55I_A523)
@@ -63,6 +70,48 @@ ENTRY(return_to_fel)
 	isb	sy
 1:	wfi
 	b	1b
+#endif
+
+ENTRY(return_to_fel_eret)
+	adr	x2, fel_stash
+	adr	x1, fel_stash_addr	// to find the fel_stash address in AA32
+	str	w2, [x1]
+
+	ldr	w0, [x2, #8]		// saved AArch32 CPSR
+	adr	x3, back_in_32
+	dsb	sy
+	isb	sy
+
+	mrs	x1, CurrentEL
+	cmp	x1, #0xc
+	b.eq	3f
+	cmp	x1, #0x8
+	b.eq	2f
+
+	msr	SPSR_EL1, x0
+	msr	ELR_EL1, x3
+	isb	sy
+	eret
+
+2:	mrs	x4, HCR_EL2
+	bic	x4, x4, #(1 << 31)	// lower EL runs AArch32
+	msr	HCR_EL2, x4
+	msr	SPSR_EL2, x0
+	msr	ELR_EL2, x3
+	isb	sy
+	eret
+
+3:	mrs	x4, SCR_EL3
+	bic	x4, x4, #0xf		// restore secure AArch32-style routing
+	bic	x4, x4, #(1 << 10)	// lower EL runs AArch32
+	msr	SCR_EL3, x4
+	msr	SPSR_EL3, x0
+	msr	ELR_EL3, x3
+	isb	sy
+	eret
+1:	wfi
+	b	1b
+ENDPROC(return_to_fel_eret)
 
 fel_stash_addr:			// must immediately precede back_in_32:
 	.word   0x00000000	// receives fel_stash addr, by AA64 code above
