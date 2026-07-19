@@ -872,12 +872,17 @@ int misc_init_r(void)
 		env_set("fdtfile", str);
 	}
 
-	/* Existing H713 boards may load an environment saved before this target
-	 * was added.  Populate it at runtime without replacing a user override.
+	/* Existing H713 boards may load an environment saved before these defaults
+	 * were added.  Populate missing values without replacing user overrides.
 	 */
 	if (IS_ENABLED(CONFIG_MACH_SUN50I_H713) &&
 	    !env_get("fastboot_raw_partition_bootloader"))
 		env_set("fastboot_raw_partition_bootloader", "0x10 0x1ff0");
+	if (IS_ENABLED(CONFIG_MACH_SUN50I_H713) &&
+	    IS_ENABLED(CONFIG_USB_FUNCTION_ACM) &&
+	    IS_ENABLED(CONFIG_USB_FUNCTION_FASTBOOT) &&
+	    !env_get("fastboot_mode"))
+		env_set("fastboot_mode", H713_FASTBOOT_COMMAND);
 
 	setup_environment(gd->fdt_blob);
 

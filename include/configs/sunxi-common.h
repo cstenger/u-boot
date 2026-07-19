@@ -244,22 +244,36 @@
 
 #include <config_distro_bootcmd.h>
 
-#ifdef CONFIG_USB_KEYBOARD
+/*
+ * The H713 boards have a single USB device controller.  Keep CDC ACM in the
+ * default console mux for normal operation; download gadgets temporarily
+ * replace it when explicitly requested.
+ */
+#if defined(CONFIG_MACH_SUN50I_H713) && defined(CONFIG_USB_FUNCTION_ACM)
+#define H713_CONSOLE_ACM ",usbacm"
+#else
+#define H713_CONSOLE_ACM
+#endif
+
+#if defined(CONFIG_MACH_SUN50I_H713) && defined(CONFIG_USB_FUNCTION_ACM)
 #define CONSOLE_STDIN_SETTINGS \
-	"stdin=serial,usbkbd\0"
+	"stdin=serial,usbacm\0"
+#elif defined(CONFIG_USB_KEYBOARD)
+#define CONSOLE_STDIN_SETTINGS \
+	"stdin=serial,usbkbd" H713_CONSOLE_ACM "\0"
 #else
 #define CONSOLE_STDIN_SETTINGS \
-	"stdin=serial\0"
+	"stdin=serial" H713_CONSOLE_ACM "\0"
 #endif
 
 #ifdef CONFIG_VIDEO
 #define CONSOLE_STDOUT_SETTINGS \
-	"stdout=serial,vidconsole\0" \
-	"stderr=serial,vidconsole\0"
+	"stdout=serial,vidconsole" H713_CONSOLE_ACM "\0" \
+	"stderr=serial,vidconsole" H713_CONSOLE_ACM "\0"
 #else
 #define CONSOLE_STDOUT_SETTINGS \
-	"stdout=serial\0" \
-	"stderr=serial\0"
+	"stdout=serial" H713_CONSOLE_ACM "\0" \
+	"stderr=serial" H713_CONSOLE_ACM "\0"
 #endif
 
 #define PARTS_DEFAULT \
@@ -288,9 +302,25 @@
  * Use the unambiguous name "bootloader": the factory GPT already contains a
  * different partition named "bootloader_a" starting at 36 MiB.
  */
+#if defined(CONFIG_MACH_SUN50I_H713) && \
+	defined(CONFIG_USB_FUNCTION_ACM) && \
+	defined(CONFIG_USB_FUNCTION_FASTBOOT)
+#define H713_FASTBOOT_COMMAND \
+	"setenv stdout serial; setenv stderr serial; setenv stdin serial; " \
+	"fastboot usb 0; " \
+	"setenv stdin serial,usbacm; setenv stdout serial,usbacm; " \
+	"setenv stderr serial,usbacm"
+#define H713_FASTBOOT_MODE_ENV_SETTINGS \
+	"fastboot_mode=" H713_FASTBOOT_COMMAND "\0"
+#else
+#define H713_FASTBOOT_COMMAND ""
+#define H713_FASTBOOT_MODE_ENV_SETTINGS
+#endif
+
 #ifdef CONFIG_MACH_SUN50I_H713
 #define H713_FASTBOOT_ENV_SETTINGS \
-	"fastboot_raw_partition_bootloader=0x10 0x1ff0\0"
+	"fastboot_raw_partition_bootloader=0x10 0x1ff0\0" \
+	H713_FASTBOOT_MODE_ENV_SETTINGS
 #else
 #define H713_FASTBOOT_ENV_SETTINGS
 #endif
