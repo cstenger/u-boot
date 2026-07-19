@@ -881,6 +881,16 @@ int misc_init_r(void)
 	if (IS_ENABLED(CONFIG_MACH_SUN50I_H713) &&
 	    IS_ENABLED(CONFIG_USB_FUNCTION_ACM) &&
 	    IS_ENABLED(CONFIG_USB_FUNCTION_FASTBOOT) &&
+	    !env_get("serial_mode"))
+		env_set("serial_mode", H713_SERIAL_COMMAND);
+	if (IS_ENABLED(CONFIG_MACH_SUN50I_H713) &&
+	    IS_ENABLED(CONFIG_USB_FUNCTION_ACM) &&
+	    IS_ENABLED(CONFIG_USB_FUNCTION_FASTBOOT) &&
+	    !env_get("acm_mode"))
+		env_set("acm_mode", H713_ACM_COMMAND);
+	if (IS_ENABLED(CONFIG_MACH_SUN50I_H713) &&
+	    IS_ENABLED(CONFIG_USB_FUNCTION_ACM) &&
+	    IS_ENABLED(CONFIG_USB_FUNCTION_FASTBOOT) &&
 	    !env_get("fastboot_mode"))
 		env_set("fastboot_mode", H713_FASTBOOT_COMMAND);
 
