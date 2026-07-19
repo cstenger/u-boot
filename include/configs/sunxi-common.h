@@ -280,6 +280,21 @@
 	CONSOLE_STDIN_SETTINGS \
 	CONSOLE_STDOUT_SETTINGS
 
+/*
+ * H713 boots the eMMC user area from LBA 16.  Give fastboot a bounded raw
+ * target for the active SPL/U-Boot image.  The range ends immediately before
+ * the persistent environment at LBA 0x2000 (4 MiB).
+ *
+ * Use the unambiguous name "bootloader": the factory GPT already contains a
+ * different partition named "bootloader_a" starting at 36 MiB.
+ */
+#ifdef CONFIG_MACH_SUN50I_H713
+#define H713_FASTBOOT_ENV_SETTINGS \
+	"fastboot_raw_partition_bootloader=0x10 0x1ff0\0"
+#else
+#define H713_FASTBOOT_ENV_SETTINGS
+#endif
+
 #if defined(CONFIG_ARM64) || defined(CONFIG_RISCV)
 #define FDTFILE "allwinner/" CONFIG_DEFAULT_DEVICE_TREE ".dtb"
 #else
@@ -296,6 +311,7 @@
 	"uuid_gpt_esp=" UUID_GPT_ESP "\0" \
 	"uuid_gpt_system=" UUID_GPT_SYSTEM "\0" \
 	"partitions=" PARTS_DEFAULT "\0" \
+	H713_FASTBOOT_ENV_SETTINGS \
 	BOOTCMD_SUNXI_COMPAT \
 	BOOTENV
 

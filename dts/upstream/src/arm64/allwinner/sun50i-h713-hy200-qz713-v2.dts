@@ -1,0 +1,9 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+// U-Boot uses the shared HY200 boot-time hardware; Linux owns projector peripherals.
+
+#include "sun50i-h713-hy200-qz713df-a1.dts"
+
+/ {
+	model = "HY200 QZ713_V2 projector (Allwinner H713)";
+	compatible = "cstenger,hy200-qz713-v2", "allwinner,sun50i-h713";
+};
