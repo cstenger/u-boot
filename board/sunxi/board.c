@@ -229,6 +229,33 @@ int board_init(void)
 	if (ret)
 		return ret;
 
+#ifdef CONFIG_H713_POWERON_LIGHT_FAN
+	/*
+	 * Bring up the cooling fan and LED backlight at power-on so the panel is
+	 * lit and cooled immediately -- the projector shows the boot process like
+	 * a monitor -- rather than waiting for Linux to apply its gpio-hog.
+	 *
+	 * PB5 is the shared fan-power / backlight-enable line: driving it high
+	 * powers the cooling fan and enables the LED backlight together. Keeping
+	 * it unconditionally high makes the fan a hard interlock -- the backlight
+	 * cannot be lit without the fan already running.
+	 */
+	gpio_request(SUNXI_GPB(5), "fan-bl-power");
+	gpio_direction_output(SUNXI_GPB(5), 1);
+
+	/*
+	 * TODO: backlight BRIGHTNESS is not controlled here yet, and needs to be.
+	 * The projector DTS's panel_pwm_ch=2 (PB4 / PWM channel 2) was verified
+	 * NOT to drive this board's LED: a correct, running 25 kHz PWM on PB4
+	 * (counter advancing, pin muxed) changed the brightness not at all. So the
+	 * LED level is set elsewhere -- most likely an LED-driver IC or a separate
+	 * rail, part of the display/LED pipeline -- and must be reverse-engineered.
+	 * Do NOT re-attempt PB4/PWM2. For now the light comes up at a fixed (dim)
+	 * level; full brightness belongs at this U-Boot stage once the real
+	 * control is found. See docs/roadmap.md.
+	 */
+#endif
+
 	eth_init_board();
 
 	return 0;

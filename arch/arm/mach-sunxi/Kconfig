@@ -644,6 +644,20 @@ config MACH_SUN50I_H713
 	select SUNXI_NEW_PINCTRL
 	imply OF_UPSTREAM
 
+config H713_POWERON_LIGHT_FAN
+	bool "H713: drive cooling fan + LED backlight enable from U-Boot"
+	depends on MACH_SUN50I_H713
+	help
+	  Drive the shared PB5 fan-power / backlight-enable line (and the PB4
+	  backlight brightness line) high in board_init(), so the cooling fan
+	  runs and the backlight is enabled from power-on rather than only once
+	  Linux applies its gpio-hog. Because PB5 powers both the fan and the
+	  backlight, keeping it high makes the fan a hard interlock for the
+	  light: the backlight cannot be lit without the fan already running.
+
+	  Bench board (HY200 QZ713DF_A1) only. Do not enable for the projector,
+	  whose panel power sequencing must gate the backlight.
+
 config MACH_SUN50I_A133
 	bool "sun50i (Allwinner A133)"
 	select ARM64

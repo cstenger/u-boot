@@ -319,8 +319,17 @@
 #endif
 
 #ifdef CONFIG_MACH_SUN50I_H713
+/*
+ * The BROM-loaded first stage is a single raw image at LBA 0x10 (not slotted).
+ * Provide it under a non-slotted alias "uboot" as well as "bootloader":
+ * slot-aware fastboot hosts auto-append the A/B suffix to "bootloader" and end
+ * up writing the unused 36 MiB GPT partition "bootloader_a" instead of LBA 0x10.
+ * "uboot" is not a GPT partition name, so the host passes it through verbatim.
+ * Flash the first stage with:  fastboot flash uboot u-boot-sunxi-with-spl-*.bin
+ */
 #define H713_FASTBOOT_ENV_SETTINGS \
 	"fastboot_raw_partition_bootloader=0x10 0x1ff0\0" \
+	"fastboot_raw_partition_uboot=0x10 0x1ff0\0" \
 	H713_FASTBOOT_MODE_ENV_SETTINGS
 #else
 #define H713_FASTBOOT_ENV_SETTINGS
