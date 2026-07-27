@@ -292,6 +292,13 @@ config FASTBOOT_OEM_BOARD
 	  command allows running vendor custom code defined in board/ files.
 	  Otherwise, it will do nothing and send fastboot fail.
 
+config FASTBOOT_CMD_OEM_POWEROFF
+	bool "Enable the 'oem poweroff' command"
+	depends on CMD_POWEROFF
+	help
+	  Add a bounded fastboot command which acknowledges the host request
+	  before invoking the platform's normal poweroff implementation.
+
 endif # FASTBOOT
 
 endmenu

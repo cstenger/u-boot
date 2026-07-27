@@ -51,6 +51,7 @@ enum {
 	FASTBOOT_COMMAND_OEM_RUN,
 	FASTBOOT_COMMAND_OEM_CONSOLE,
 	FASTBOOT_COMMAND_OEM_BOARD,
+	FASTBOOT_COMMAND_OEM_POWEROFF,
 	FASTBOOT_COMMAND_ACMD,
 	FASTBOOT_COMMAND_UCMD,
 	FASTBOOT_COMMAND_COUNT
@@ -104,6 +105,15 @@ void fastboot_okay(const char *reason, char *response);
  * requires in order to re-enter the bootloader.
  */
 int fastboot_set_reboot_flag(enum fastboot_reboot_reason reason);
+
+/**
+ * fastboot_set_reboot_flag_board() - Set a board-specific reboot flag
+ *
+ * Boards may implement this hook when their normal reboot-mode handoff is
+ * preferable to the generic Android BCB. Return -ENOSYS to use the BCB
+ * fallback.
+ */
+int fastboot_set_reboot_flag_board(enum fastboot_reboot_reason reason);
 
 /**
  * fastboot_set_progress_callback() - set progress callback

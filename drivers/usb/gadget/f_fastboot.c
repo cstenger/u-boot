@@ -425,6 +425,14 @@ static void compl_do_reset(struct usb_ep *ep, struct usb_request *req)
 	do_reset(NULL, 0, 0, NULL);
 }
 
+#if CONFIG_IS_ENABLED(FASTBOOT_CMD_OEM_POWEROFF)
+static void compl_do_poweroff(struct usb_ep *ep, struct usb_request *req)
+{
+	g_dnl_unregister();
+	do_poweroff(NULL, 0, 0, NULL);
+}
+#endif
+
 static unsigned int rx_bytes_expected(struct usb_ep *ep)
 {
 	int rx_remain = fastboot_data_remaining();
@@ -573,6 +581,11 @@ static void rx_handler_command(struct usb_ep *ep, struct usb_request *req)
 		case FASTBOOT_COMMAND_REBOOT_RECOVERY:
 			fastboot_func->in_req->complete = compl_do_reset;
 			break;
+#if CONFIG_IS_ENABLED(FASTBOOT_CMD_OEM_POWEROFF)
+		case FASTBOOT_COMMAND_OEM_POWEROFF:
+			fastboot_func->in_req->complete = compl_do_poweroff;
+			break;
+#endif
 		case FASTBOOT_COMMAND_ACMD:
 			if (CONFIG_IS_ENABLED(FASTBOOT_UUU_SUPPORT))
 				fastboot_func->in_req->complete = do_acmd_complete;

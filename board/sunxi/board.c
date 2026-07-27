@@ -13,6 +13,7 @@
 #include <clock_legacy.h>
 #include <dm.h>
 #include <env.h>
+#include <fastboot.h>
 #include <hang.h>
 #include <i2c.h>
 #include <image.h>
@@ -53,6 +54,27 @@
 #include <asm/setup.h>
 
 DECLARE_GLOBAL_DATA_PTR;
+
+#if defined(CONFIG_FASTBOOT) && defined(CONFIG_MACH_SUN50I_H713)
+#define H713_RTC_GP7_REG		0x0709011cUL
+#define H713_REBOOT_BOOTLOADER_MAGIC	0xb007c0de
+
+int fastboot_set_reboot_flag_board(enum fastboot_reboot_reason reason)
+{
+	if (reason != FASTBOOT_REBOOT_REASON_BOOTLOADER)
+		return -ENOSYS;
+
+	/*
+	 * Reuse Linux's nvmem-reboot-mode handoff. RTC GP7 survives the PSCI
+	 * watchdog reset, and H713 preboot consumes and clears this magic before
+	 * dropping to the U-Boot prompt.
+	 */
+	writel(H713_REBOOT_BOOTLOADER_MAGIC, H713_RTC_GP7_REG);
+
+	return readl(H713_RTC_GP7_REG) == H713_REBOOT_BOOTLOADER_MAGIC ?
+	       0 : -EIO;
+}
+#endif
 
 void i2c_init_board(void)
 {

@@ -89,6 +89,11 @@ void fastboot_okay(const char *reason, char *response)
  * which sets whatever flag your board specific Android bootloader flow
  * requires in order to re-enter the bootloader.
  */
+int __weak fastboot_set_reboot_flag_board(enum fastboot_reboot_reason reason)
+{
+	return -ENOSYS;
+}
+
 int __weak fastboot_set_reboot_flag(enum fastboot_reboot_reason reason)
 {
 	int ret;
@@ -113,6 +118,10 @@ int __weak fastboot_set_reboot_flag(enum fastboot_reboot_reason reason)
 
 	if (reason >= FASTBOOT_REBOOT_REASONS_COUNT)
 		return -EINVAL;
+
+	ret = fastboot_set_reboot_flag_board(reason);
+	if (ret != -ENOSYS)
+		return ret;
 
 	ret = bcb_find_partition_and_load(bcb_iface, device, "misc");
 	if (ret)
@@ -208,6 +217,12 @@ void fastboot_handle_boot(int command, bool success)
 	case FASTBOOT_COMMAND_REBOOT_RECOVERY:
 		do_reset(NULL, 0, 0, NULL);
 		break;
+
+#if CONFIG_IS_ENABLED(FASTBOOT_CMD_OEM_POWEROFF)
+	case FASTBOOT_COMMAND_OEM_POWEROFF:
+		do_poweroff(NULL, 0, 0, NULL);
+		break;
+#endif
 	}
 }
 

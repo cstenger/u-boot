@@ -120,6 +120,10 @@ static const struct {
 		.command = "oem board",
 		.dispatch = CONFIG_IS_ENABLED(FASTBOOT_OEM_BOARD, (oem_board), (NULL))
 	},
+	[FASTBOOT_COMMAND_OEM_POWEROFF] = {
+		.command = "oem poweroff",
+		.dispatch = CONFIG_IS_ENABLED(FASTBOOT_CMD_OEM_POWEROFF, (okay), (NULL))
+	},
 	[FASTBOOT_COMMAND_UCMD] = {
 		.command = "UCmd",
 		.dispatch = CONFIG_IS_ENABLED(FASTBOOT_UUU_SUPPORT, (run_ucmd), (NULL))
