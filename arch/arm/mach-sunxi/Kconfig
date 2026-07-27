@@ -658,6 +658,18 @@ config H713_POWERON_LIGHT_FAN
 	  Bench board (HY200 QZ713DF_A1) only. Do not enable for the projector,
 	  whose panel power sequencing must gate the backlight.
 
+config H713_MIPS_BOOT
+	bool "H713: manual display MIPS firmware loader"
+	depends on MACH_SUN50I_H713 && CMD_FS_GENERIC
+	select SHA256
+	help
+	  Add the manual h713_mips command for loading, SHA-256 checking, and
+	  releasing the H713 display coprocessor. The command deliberately has
+	  no automatic boot hook: firmware execution must first be validated on
+	  the HY200 QZ713DF_A1 DDR3 bench board.
+
+	  Do not enable this on the untested HY200 QZ713_V2 projector.
+
 config MACH_SUN50I_A133
 	bool "sun50i (Allwinner A133)"
 	select ARM64
