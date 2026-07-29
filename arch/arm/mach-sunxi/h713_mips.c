@@ -42,6 +42,21 @@
 #define H713_MIPS_RESET_RELEASED	0x00070001
 #define H713_MIPS_STATUS_RELEASED	0x00000001
 
+/*
+ * Workspace layout, from the vendor display_cfg.xml header. The ARM stages the
+ * config and TSE windows, so those are the only regions it must not clear.
+ * Everything else above the firmware image is uninitialized DRAM that differs
+ * per boot, and the firmware reads it — leaving it alone makes runs
+ * irreproducible.
+ */
+#define H713_MIPS_DBG_ADDR		0x4bd01000UL
+#define H713_MIPS_CFG_ADDR		0x4be01000UL
+#define H713_MIPS_CFG_SIZE		0x00040000UL
+#define H713_MIPS_TSE_ADDR		0x4be41000UL
+#define H713_MIPS_TSE_SIZE		0x00100000UL
+#define H713_MIPS_FB_ADDR		0x4bf41000UL
+#define H713_MIPS_FB_SIZE		0x01a00000UL
+
 #define H713_MIPS_SHMEM_ADDR		0x4e300000UL
 #define H713_MIPS_SHMEM_SIZE		0x00500000UL
 #define H713_MIPS_SHMEM_MAGIC		0xdeadbeef
@@ -52,7 +67,13 @@
 #define H713_MIPS_SHMEM_MAGIC2_OFF	0x000075b8UL
 #define H713_MIPS_SHMEM_ARM_READY	(BIT(0) | BIT(2))
 #define H713_MIPS_SHMEM_MIPS_READY	BIT(0)
-#define H713_MIPS_READY_TIMEOUT_US	1000000
+/*
+ * One second was chosen when the firmware stalled in its first few hundred
+ * milliseconds. With the config and TSE artifacts staged it now runs its whole
+ * instrumented startup, so give an uninstrumented run the same budget as a
+ * traced one before calling readiness a failure.
+ */
+#define H713_MIPS_READY_TIMEOUT_US	10000000
 #define H713_MIPS_TRACE_TIMEOUT_US	10000000
 #define H713_MIPS_TRACE_OFF		0x00040000UL
 #define H713_MIPS_TRACE_COUNT		151
@@ -1050,6 +1071,25 @@ static void h713_display_prepare(void)
 	printf("H713 MIPS: display clocks/routing prepared\n");
 }
 
+/*
+ * Zero everything the firmware may read except the two staged windows, so a
+ * run does not depend on what the previous boot left in DRAM. Identical cold
+ * boots have otherwise diverged by more than ten markers.
+ */
+static void h713_mips_clear_workspace(void)
+{
+	ulong tail = H713_MIPS_FW_ADDR + H713_MIPS_FW_SIZE;
+
+	memset((void *)tail, 0, H713_MIPS_CFG_ADDR - tail);
+	memset((void *)H713_MIPS_FB_ADDR, 0, H713_MIPS_FB_SIZE);
+
+	flush_cache(H713_MIPS_FW_ADDR, H713_MIPS_CFG_ADDR - H713_MIPS_FW_ADDR);
+	flush_cache(H713_MIPS_FB_ADDR, H713_MIPS_FB_SIZE);
+
+	printf("H713 MIPS: workspace cleared (cfg@0x%08lx, tse@0x%08lx kept)\n",
+	       H713_MIPS_CFG_ADDR, H713_MIPS_TSE_ADDR);
+}
+
 static u32 h713_mips_read_witness(void)
 {
 	invalidate_dcache_range(H713_MIPS_WITNESS_ADDR,
@@ -1350,9 +1390,7 @@ static int h713_mips_probe_ready(bool trace, bool release_tvcap)
 		return ret;
 	}
 
-	memset((void *)(H713_MIPS_FW_ADDR + H713_MIPS_FW_SIZE), 0,
-	       H713_MIPS_FW_WINDOW_SIZE - H713_MIPS_FW_SIZE);
-	flush_cache(H713_MIPS_FW_ADDR, H713_MIPS_FW_WINDOW_SIZE);
+	h713_mips_clear_workspace();
 	h713_mips_seed_witness();
 	h713_mips_prepare_ready_probe();
 	if (trace) {
@@ -1383,18 +1421,16 @@ static int h713_mips_probe_ready(bool trace, bool release_tvcap)
 			h713_mips_stream_trace(trace_shadow);
 
 		/*
-		 * The firmware initializes INCAP while TVCAP reset is asserted,
-		 * so releasing reset earlier wedges that initializer. Marker 14
-		 * proves platform registration (including INCAP) has returned,
-		 * which is the best available guess at the factory ordering
-		 * boundary — but only a guess.
+		 * Releasing TVCAP from the ARM wedges the board. It once looked
+		 * like a prerequisite because a run without it stalled early,
+		 * but that stall was a missing display_cfg.xml: the unresolved
+		 * "sys:dbg_buf" pointer landed in unclocked capture MMIO, and
+		 * releasing TVCAP merely let those stalled writes retire.
 		 *
-		 * It is not yet established as safe. On 2026-07-28 a trace run
-		 * released TVCAP here, the firmware advanced four more markers
-		 * into display resource discovery (marker 31), and the whole
-		 * interconnect stalled, taking ARM's UART with it. Keep this
-		 * switchable ("probe-trace no-tvcap") until an A/B says which
-		 * side owns that wedge.
+		 * With the config staged, leaving TVCAP alone reaches marker 44
+		 * and returns cleanly, while releasing it here stalls the
+		 * interconnect and takes ARM's UART with it. Kept only as an
+		 * opt-in diagnostic ("probe-trace tvcap").
 		 */
 		if (release_tvcap && !tvcap_released &&
 		    h713_mips_read_shmem(H713_MIPS_TRACE_OFF +
@@ -1530,13 +1566,13 @@ static int do_h713_mips(struct cmd_tbl *cmdtp, int flag, int argc,
 	}
 
 	/*
-	 * "probe-trace no-tvcap" leaves the capture block alone, isolating the
-	 * firmware's own progress from the ARM-side TVCAP release.
+	 * The ARM leaves TVCAP alone by default; "probe-trace tvcap" opts into
+	 * releasing it, which is known to wedge the board.
 	 */
 	if (!strcmp(argv[1], "probe-trace")) {
-		bool tvcap = !(argc == 3 && !strcmp(argv[2], "no-tvcap"));
+		bool tvcap = argc == 3 && !strcmp(argv[2], "tvcap");
 
-		if (argc > 3)
+		if (argc > 3 || (argc == 3 && !tvcap))
 			return CMD_RET_USAGE;
 
 		ret = h713_mips_probe_ready(true, tvcap);
@@ -1565,7 +1601,7 @@ U_BOOT_CMD(h713_mips, 5, 0, do_h713_mips,
 	   "h713_mips prepare\n"
 	   "h713_mips start\n"
 	   "h713_mips probe-ready\n"
-	   "h713_mips probe-trace [no-tvcap]\n"
+	   "h713_mips probe-trace [tvcap]\n"
 	   "h713_mips load <interface> <dev[:part]> <path>\n"
 	   "h713_mips boot <interface> <dev[:part]> <path>"
 );
