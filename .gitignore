@@ -142,3 +142,6 @@ __pycache__
 
 # Clang's compilation database file
 /compile_commands.json
+
+# Generated recovery payload (our own SPL, regenerate per docs/flash.md)
+arch/arm/mach-sunxi/h713_spl_payload.h

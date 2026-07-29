@@ -371,9 +371,79 @@ unsigned long board_spl_mmc_get_uboot_raw_sector(struct mmc *mmc,
 	return sector;
 }
 
+#ifdef CONFIG_H713_SPL_FORCE_MMC
+#include <mmc.h>
+#include "h713_spl_payload.h"
+
+/*
+ * Recovery hook. The SPL framework has already brought up eMMC by the time the
+ * image is loaded, so reuse that device rather than initialising the
+ * controller by hand -- doing it by hand wedges on this board.
+ *
+ * Writes our SPL back over sectors 16..79, the only range a clobbered first
+ * stage occupies; U-Boot proper at sector 80 survives untouched. Then halts,
+ * so the board is restored by a power cycle rather than by continuing to boot
+ * from a half-known state.
+ */
+void spl_board_prepare_for_boot(void)
+{
+	struct blk_desc *bd;
+	struct mmc *mmc;
+	unsigned long nblk = sizeof(h713_spl_payload) / 512;
+	unsigned long n;
+
+	printf("\n=== H713 SPL RESTORE ===\n");
+
+	/*
+	 * mmc0 is the (absent) SD slot on this board and the eMMC is slot 2,
+	 * so do not assume an index: take the first device the SPL has already
+	 * brought up, which is by definition the one it just read the boot
+	 * image from. Asking for device 0 gets an uninitialised controller and
+	 * blk_dwrite then fails in re-init with "did not respond to voltage
+	 * select".
+	 */
+	bd = NULL;
+	for (int i = 0; i < 4; i++) {
+		struct blk_desc *cand;
+
+		mmc = find_mmc_device(i);
+		if (!mmc)
+			continue;
+		cand = mmc_get_blk_desc(mmc);
+		printf("mmc%d: %s lba=%lu\n", i, cand ? "present" : "no desc",
+		       cand ? (unsigned long)cand->lba : 0UL);
+		if (cand && cand->lba > 0) {
+			bd = cand;
+			break;
+		}
+	}
+
+	if (!bd) {
+		printf("no initialised mmc device\n");
+		hang();
+	}
+
+	n = blk_dwrite(bd, 16, nblk, h713_spl_payload);
+	printf("wrote %lu/%lu %s\n", n, nblk,
+	       n == nblk ? "RESTORED-OK" : "FAILED");
+	printf("power-cycle now\n");
+	hang();
+}
+#endif
+
 u32 spl_boot_device(void)
 {
+#ifdef CONFIG_H713_SPL_FORCE_MMC
+	/*
+	 * Recovery: FEL-load this SPL and have it fetch U-Boot from eMMC rather
+	 * than waiting for the host to send it. sunxi-fel cannot transfer
+	 * U-Boot proper on H713 (see docs/flash.md), but a first stage whose
+	 * own 32 KiB loads fine can chain into a U-Boot that is still on eMMC.
+	 */
+	return BOOT_DEVICE_MMC2;
+#else
 	return sunxi_get_boot_device();
+#endif
 }
 
 __weak void sunxi_sram_init(void)

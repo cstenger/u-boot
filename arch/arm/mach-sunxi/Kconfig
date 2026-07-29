@@ -60,6 +60,15 @@ config DRAM_SUN50I_H713
 	  controller/PHY block at 0x04820000, not the H616 register layout.
 	  Supports both the LPDDR3 (HY310) and DDR3 (HY200) board variants.
 
+config H713_SPL_FORCE_MMC
+	bool "H713 recovery: SPL always loads U-Boot from eMMC"
+	depends on MACH_SUN50I_H713
+	help
+	  Make spl_boot_device() report eMMC unconditionally, so an SPL loaded
+	  over FEL fetches U-Boot from flash instead of waiting for the host to
+	  send it. Recovers a board whose first stage was overwritten while
+	  U-Boot proper is still intact. Never enable this in a shipping image.
+
 config DRAM_SUN50I_A133
 	bool
 	help
