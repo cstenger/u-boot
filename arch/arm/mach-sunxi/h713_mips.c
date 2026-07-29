@@ -20,10 +20,10 @@
 #include <u-boot/sha256.h>
 
 #define H713_MIPS_FW_ADDR		0x4b100000UL
-#define H713_MIPS_FW_SIZE		0x00132b18UL
+#define H713_MIPS_FW_SIZE		0x00132910UL
 #define H713_MIPS_FW_WINDOW_SIZE	0x00500000UL
 #define H713_MIPS_BSS_START		0x4b232c00UL
-#define H713_MIPS_BSS_END		0x4bac7c28UL
+#define H713_MIPS_BSS_END		0x4bac7c40UL
 #define H713_MIPS_WITNESS_ADDR		(H713_MIPS_FW_ADDR + \
 					 H713_MIPS_FW_WINDOW_SIZE)
 #define H713_MIPS_WITNESS_SEED		0x4d495053
@@ -103,11 +103,17 @@
 #define H713_TVCAP_HDMI_AUDIO_CLK_REG	0x02001d84UL
 #define H713_TVCAP_BGR_REG		0x02001d88UL
 
+/*
+ * The board's own display.bin, read from its stock bootloader partition. An
+ * earlier pin (16c74a28..., 0x132b18 bytes) came from a different firmware
+ * revision in a captured dump and does not match this hardware; every run
+ * against it was executing a mismatched image.
+ */
 static const u8 h713_mips_fw_sha256[SHA256_SUM_LEN] = {
-	0x16, 0xc7, 0x4a, 0x28, 0x18, 0x7f, 0x34, 0x2d,
-	0xe6, 0x57, 0x82, 0x8f, 0xab, 0x65, 0x14, 0x5b,
-	0x14, 0x0a, 0xc9, 0x41, 0x1c, 0x40, 0xcc, 0xcc,
-	0x02, 0xee, 0xd2, 0x50, 0x47, 0x47, 0x2e, 0xe9,
+	0x43, 0x80, 0xf1, 0xb3, 0xed, 0x7b, 0x62, 0xaa,
+	0x50, 0x58, 0x2e, 0x7c, 0xb1, 0x6a, 0x87, 0xbd,
+	0xfa, 0xce, 0x1b, 0x43, 0x00, 0x57, 0x8f, 0xe3,
+	0x63, 0x1a, 0x41, 0x63, 0x54, 0xda, 0x30, 0xce,
 };
 
 static bool h713_display_prepared;
@@ -1407,7 +1413,25 @@ static int h713_mips_start(void)
  * through the ARM cache, so a verify reads back correct while DRAM still holds
  * stale bytes and the MIPS fetches garbage.
  */
-static int h713_mips_release_raw(void)
+/*
+ * Rx_HDCP14_LoadKey polls HDMI-RX 0x06840093 and gives up after 0x33 ticks.
+ * The tick is a ThreadX software counter driven by the CP0 Compare ISR, and
+ * interrupts are masked this early, so the timeout cannot expire and a failure
+ * the firmware is built to survive becomes a hang. Rewriting the loop bound to
+ * zero makes the wait give up on its first pass, taking the same path a real
+ * timeout would. Applied after the hash check, so the image is authenticated
+ * before it is modified.
+ *
+ * The address is firmware-specific: the same loop sits at 0x4b13d0a4 in the
+ * revision found in an earlier captured dump and at 0x4b13d6f8 in the image
+ * this board actually carries. The guard below compares the instruction before
+ * writing, so a wrong offset reports rather than corrupting the firmware.
+ */
+#define H713_MIPS_HDCP_WAIT_INSN	0x4b13d6f8UL
+#define H713_MIPS_HDCP_WAIT_ORIG	0x2c630033
+#define H713_MIPS_HDCP_WAIT_NONE	0x2c630000
+
+static int h713_mips_release_raw(bool skip_hdcp_wait)
 {
 	u32 status, witness;
 	int ret;
@@ -1415,6 +1439,18 @@ static int h713_mips_release_raw(void)
 	ret = h713_mips_verify();
 	if (ret)
 		return ret;
+
+	if (skip_hdcp_wait) {
+		u32 insn = readl(H713_MIPS_HDCP_WAIT_INSN);
+
+		if (insn != H713_MIPS_HDCP_WAIT_ORIG) {
+			printf("H713 MIPS: HDCP wait site is 0x%08x, expected 0x%08x\n",
+			       insn, H713_MIPS_HDCP_WAIT_ORIG);
+			return -EINVAL;
+		}
+		writel(H713_MIPS_HDCP_WAIT_NONE, H713_MIPS_HDCP_WAIT_INSN);
+		printf("H713 MIPS: HDCP key-load wait defeated\n");
+	}
 
 	flush_cache(H713_MIPS_FW_ADDR, H713_MIPS_FW_WINDOW_SIZE);
 	h713_mips_seed_witness();
@@ -1433,12 +1469,19 @@ static int h713_mips_release_raw(void)
 		printf("H713 MIPS: unexpected CPU status\n");
 		return -EIO;
 	}
-	if (witness) {
-		printf("H713 MIPS: firmware did not clear BSS -- not executing\n");
+	/*
+	 * The seed sits inside the firmware's BSS (0x4b232c00..0x4bac7c40), so
+	 * startup zeroes it -- but the firmware then *uses* that memory, and
+	 * with elog buffering enabled it stores a pointer there. Demanding a
+	 * zero read therefore reports a false failure on a perfectly healthy
+	 * run. Any value other than the seed proves the MIPS wrote to it.
+	 */
+	if (witness == H713_MIPS_WITNESS_SEED) {
+		printf("H713 MIPS: seed intact -- firmware not executing\n");
 		return -ETIMEDOUT;
 	}
 
-	printf("H713 MIPS: firmware execution proven by BSS clear\n");
+	printf("H713 MIPS: firmware execution proven (witness overwritten)\n");
 	return 0;
 }
 
@@ -1575,6 +1618,63 @@ out_stop:
 	return ret;
 }
 
+
+/*
+ * Scan the coprocessor's workspace for its own log output.
+ *
+ * display.bin keeps an "elog" buffer whose location moves between firmware
+ * revisions, so rather than hardcode an address that goes stale, walk the
+ * region and print runs of printable text. After a run this surfaces whatever
+ * the firmware said about its own startup, which beats inferring from the
+ * outside.
+ */
+#define H713_LOG_MIN_RUN	12
+#define H713_LOG_MAX_LINES	200
+
+static int h713_mips_log(ulong start, ulong end)
+{
+	ulong a = start;
+	uint printed = 0;
+
+	if (end <= start)
+		return -EINVAL;
+
+	while (a < end && printed < H713_LOG_MAX_LINES) {
+		ulong run = a;
+		uint len = 0;
+
+		while (run + len < end) {
+			u8 c = readb(run + len);
+
+			if (c == '\n' || c == '\t' || (c >= 0x20 && c < 0x7f))
+				len++;
+			else
+				break;
+		}
+
+		if (len >= H713_LOG_MIN_RUN) {
+			uint i;
+
+			printf("0x%08lx: ", run);
+			for (i = 0; i < len; i++) {
+				u8 c = readb(run + i);
+
+				putc(c == '\n' ? ' ' : c);
+			}
+			printf("\n");
+			printed++;
+		}
+
+		a = run + (len ? len : 1);
+	}
+
+	printf("H713 MIPS: %u text run(s) in 0x%08lx..0x%08lx%s\n",
+	       printed, start, end,
+	       printed == H713_LOG_MAX_LINES ? " (truncated)" : "");
+
+	return 0;
+}
+
 static void h713_mips_status(void)
 {
 	u32 witness = h713_mips_read_witness();
@@ -1597,6 +1697,14 @@ static int do_h713_mips(struct cmd_tbl *cmdtp, int flag, int argc,
 
 	if (argc < 2)
 		return CMD_RET_USAGE;
+
+	/* Default range covers the firmware's data and BSS working set. */
+	if (!strcmp(argv[1], "log")) {
+		ulong a = argc > 2 ? hextoul(argv[2], NULL) : 0x4b232000;
+		ulong b = argc > 3 ? hextoul(argv[3], NULL) : 0x4bd00000;
+
+		return h713_mips_log(a, b) ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
+	}
 
 	if (!strcmp(argv[1], "status")) {
 		h713_mips_status();
@@ -1631,7 +1739,7 @@ static int do_h713_mips(struct cmd_tbl *cmdtp, int flag, int argc,
 	}
 
 	if (!strcmp(argv[1], "release")) {
-		ret = h713_mips_release_raw();
+		ret = h713_mips_release_raw(false);
 		return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
@@ -1672,6 +1780,7 @@ static int do_h713_mips(struct cmd_tbl *cmdtp, int flag, int argc,
 U_BOOT_CMD(h713_mips, 5, 0, do_h713_mips,
 	   "manually manage the H713 display MIPS firmware",
 	   "status\n"
+	   "h713_mips log [start] [end]\n"
 	   "h713_mips stop\n"
 	   "h713_mips verify\n"
 	   "h713_mips prepare\n"
@@ -2045,4 +2154,426 @@ U_BOOT_CMD(h713_i2c, 4, 0, do_h713_i2c,
 	   "scan            - scan using PH2/PH3 (vendor twi1 pins)\n"
 	   "h713_i2c scan <scl> <sda> - scan using the given PH pin numbers\n"
 	   "h713_i2c read <addr> <count> - read bytes, no register write"
+);
+
+/*
+ * One-shot replay of stock U-Boot's fastlogo display bring-up.
+ *
+ * LogoRegData.bin is indexed: 13 descriptors of 0x18 bytes from offset 0x10,
+ * each starting with a project ID that matches the ProjectID_*.TSE names. Two
+ * of its words select which tables that project uses --
+ *
+ *   word3 & 0xffff  prologue variant, 1-based (three exist)
+ *   word3 >> 16     timing variant,   0-based (eleven exist)
+ *   word4 & 0xffff  DE/mixer variant, 0-based (seven exist)
+ *
+ * -- so a working configuration is a *consistent triple*, not three ranges
+ * picked by eye. Doing it by hand produced combinations no project uses.
+ *
+ * Stock's order is: prologue, timing, LVDS FIFO reset, mixer write, DE table,
+ * then clocks/INCAP/LVDS, the coprocessor release, and the LVDS finalise.
+ */
+struct h713_disp_block { u32 start, end; };
+
+static const struct h713_disp_block h713_disp_prologue[] = {
+	{ 0x01ac, 0x0484 }, { 0x0484, 0x075c }, { 0x075c, 0x0a34 },
+};
+
+static const struct h713_disp_block h713_disp_timing[] = {
+	{ 0x0a34, 0x0c0c }, { 0x0c0c, 0x0de4 }, { 0x0de4, 0x100c },
+	{ 0x100c, 0x11e4 }, { 0x11e4, 0x141c }, { 0x141c, 0x1654 },
+	{ 0x1654, 0x18dc }, { 0x18dc, 0x1a04 }, { 0x1a04, 0x1c3c },
+	{ 0x1c3c, 0x1ec4 }, { 0x1ec4, 0x214c },
+};
+
+static const struct h713_disp_block h713_disp_de[] = {
+	{ 0x214c, 0x24c4 }, { 0x24c4, 0x283c }, { 0x283c, 0x2bb4 },
+	{ 0x2bb4, 0x2f2c }, { 0x2f2c, 0x32a4 }, { 0x32a4, 0x361c },
+	{ 0x361c, 0x39a4 }, { 0x39a4, 0x3d24 },
+};
+
+#define H713_DISP_DESC_OFF	0x10
+#define H713_DISP_DESC_SIZE	0x18
+#define H713_DISP_HDR_TABLE_LEN	8
+
+struct h713_disp_sel { u32 project, prologue, timing, de; };
+
+/*
+ * Descriptor count is in the header, not fixed: this board's file carries 15
+ * where an earlier revision had 13. Reading it keeps the command correct
+ * across firmware versions.
+ */
+static uint h713_disp_desc_count(ulong blob)
+{
+	uint bytes = readw(blob + H713_DISP_HDR_TABLE_LEN);
+
+	return bytes / H713_DISP_DESC_SIZE;
+}
+
+/* Set once a sequence has run, so the dump knows the blocks are clocked. */
+static bool h713_disp_configured;
+
+static int h713_disp_lookup(ulong blob, u32 project,
+			    struct h713_disp_sel *sel)
+{
+	int i;
+
+	for (i = 0; i < h713_disp_desc_count(blob); i++) {
+		ulong d = blob + H713_DISP_DESC_OFF + i * H713_DISP_DESC_SIZE;
+		u32 id = readl(d);
+		u32 w3, w4;
+
+		if (id != project)
+			continue;
+
+		w3 = readl(d + 8);
+		w4 = readl(d + 12);
+		sel->project  = id;
+		sel->prologue = w3 & 0xffff;
+		sel->timing   = w3 >> 16;
+		sel->de       = w4 & 0xffff;
+
+		if (!sel->prologue ||
+		    sel->prologue > ARRAY_SIZE(h713_disp_prologue) ||
+		    sel->timing >= ARRAY_SIZE(h713_disp_timing) ||
+		    sel->de >= ARRAY_SIZE(h713_disp_de)) {
+			printf("H713 disp: project 0x%02x selects out-of-range "
+			       "tables (%u/%u/%u)\n", id, sel->prologue,
+			       sel->timing, sel->de);
+			return -EINVAL;
+		}
+		return 0;
+	}
+
+	printf("H713 disp: no descriptor for project 0x%02x\n", project);
+	return -ENOENT;
+}
+
+static void h713_disp_list(ulong blob)
+{
+	int i;
+
+	printf("H713 disp: project  prologue  timing  de\n");
+	for (i = 0; i < h713_disp_desc_count(blob); i++) {
+		ulong d = blob + H713_DISP_DESC_OFF + i * H713_DISP_DESC_SIZE;
+		u32 w3 = readl(d + 8);
+
+		printf("             0x%02x       %u       %2u   %u\n",
+		       readl(d), w3 & 0xffff, w3 >> 16, readl(d + 12) & 0xffff);
+	}
+}
+
+/* Clocks, capture block and INCAP, as stock issues them before LVDS. */
+static void h713_disp_clocks(void)
+{
+	writel(0x22ffff22, 0x02000150);		/* PH mux; PH0/1 stay UART0 */
+	mdelay(12);
+	writel(0x00010001, 0x02001d88);
+	mdelay(12);
+	/*
+	 * 0x02001020 is deliberately absent. Stock writes PLL_PERIPH0 there,
+	 * but it is a no-op in stock's boot context and a live reconfiguration
+	 * in ours -- MMC and the buses run from it. The other two PLLs are
+	 * disabled in our cold state, so enabling them is safe.
+	 */
+	writel(0xb8003501, 0x02001040);
+	writel(0x80000305, 0x02001d6c);
+	mdelay(12);
+	writel(0xb8002f01, 0x02001068);
+	writel(0x81000001, 0x02001d74);
+	mdelay(12);
+	writel(0x80000000, 0x02001d84);
+	mdelay(12);
+	writel(0xc0000000, 0x02001d80);
+	mdelay(12);
+
+	writel(0x01111117, 0x06e00004);
+	writel(0x00000404, 0x06e00008);
+	writel(0x00111111, 0x06e00000);
+	mdelay(12);
+	writel(0, 0x06e00004);
+	writel(0, 0x06e00008);
+	writel(0, 0x06e00000);
+	mdelay(12);
+	writel(0x01111117, 0x06e00004);
+	writel(0x00000404, 0x06e00008);
+	writel(0x00111111, 0x06e00000);
+	mdelay(12);
+}
+
+/* Stock's reset: pulse bit 8 of the FIFO control, then re-latch the config. */
+static void h713_disp_fifo_reset(void)
+{
+	u32 cfg = readl(0x0588000c);
+	u32 ctl = readl(0x05700088);
+
+	writel(ctl & ~0x100, 0x05700088);
+	writel(ctl | 0x100, 0x05700088);
+	writel(cfg, 0x0588000c);
+}
+
+static int h713_disp_run(ulong blob, u32 project, bool skip_hdcp_wait)
+{
+	struct h713_disp_sel sel;
+	int ret;
+
+	ret = h713_disp_lookup(blob, project, &sel);
+	if (ret)
+		return ret;
+
+	printf("H713 disp: project 0x%02x -> prologue %u, timing %u, de %u\n",
+	       sel.project, sel.prologue, sel.timing, sel.de);
+
+	ret = h713_logo_walk(blob, h713_disp_prologue[sel.prologue - 1].start,
+			     h713_disp_prologue[sel.prologue - 1].end, true);
+	if (ret)
+		return ret;
+	ret = h713_logo_walk(blob, h713_disp_timing[sel.timing].start,
+			     h713_disp_timing[sel.timing].end, true);
+	if (ret)
+		return ret;
+
+	h713_disp_fifo_reset();
+	writel(H713_DISPLAY_MIXER_CTRL_VALUE, H713_DISPLAY_MIXER_CTRL_REG);
+
+	ret = h713_logo_walk(blob, h713_disp_de[sel.de].start,
+			     h713_disp_de[sel.de].end, true);
+	if (ret)
+		return ret;
+
+	h713_disp_clocks();
+
+	writel(1, 0x06940000);			/* INCAP */
+	mdelay(12);
+	writel(0x01800045, 0x051c0010);		/* LVDS enable */
+	mdelay(12);
+
+	ret = h713_mips_release_raw(skip_hdcp_wait);
+	if (ret)
+		return ret;
+
+	writel(0x45, 0x051c0010);		/* LVDS finalise */
+	h713_disp_configured = true;
+	printf("H713 disp: sequence complete, LVDS FIFO status=0x%08x\n",
+	       readl(0x05880fe0));
+
+	return 0;
+}
+
+static const struct { ulong base; uint words; const char *name; } h713_disp_regs[] = {
+	{ 0x05700000, 16, "tvtop"  }, { 0x05800000, 12, "lvds-lane" },
+	{ 0x05880000, 16, "lvds"   }, { 0x058c0000, 12, "disp-pll"  },
+	{ 0x051c0000,  8, "lvds-phy" }, { 0x0525c000, 16, "mixer"   },
+	{ 0x0524c000, 32, "de"     }, { 0x05600140, 16, "afbd"      },
+};
+
+/*
+ * Dump the blocks the vendor tables write. A register that does not hold what
+ * was written to it means its block is gated or absent, which is far more
+ * useful than guessing at semantics.
+ */
+static void h713_disp_dump(bool force)
+{
+	int i;
+
+	/*
+	 * These blocks are gated until the sequence runs; reading them cold
+	 * stalls the interconnect and hangs the board. Refuse rather than
+	 * wedge, unless the caller insists.
+	 */
+	if (!h713_disp_configured && !force) {
+		printf("H713 disp: display not configured this boot -- reading "
+		       "these blocks now would hang.\n"
+		       "           run the sequence first, or 'dump force'\n");
+		return;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(h713_disp_regs); i++) {
+		uint w;
+
+		printf("%s @0x%08lx:", h713_disp_regs[i].name,
+		       h713_disp_regs[i].base);
+		for (w = 0; w < h713_disp_regs[i].words; w++) {
+			if (!(w % 8))
+				printf("\n  +0x%02x:", w * 4);
+			printf(" %08x", readl(h713_disp_regs[i].base + w * 4));
+		}
+		printf("\n");
+	}
+}
+
+
+/*
+ * Load the vendor display artifacts straight off the board's own eMMC.
+ *
+ * They all live in the stock FAT bootloader partition, which is where stock
+ * U-Boot reads them from -- the "bootloader" partition lookup in its fastlogo
+ * path does exactly this. Reading them here removes the fastboot staging dance
+ * entirely, survives reboots, and keeps proprietary blobs out of the U-Boot
+ * image, which the project's rules require.
+ */
+#define H713_DISP_FS_IF		"mmc"
+#define H713_DISP_FS_DEV	"1:2"
+/*
+ * Above the framebuffer window (which ends at 0x4d941000) and below the
+ * CPU_COMM share region at 0x4e300000. Parking it inside the framebuffer
+ * means h713_mips_clear_workspace() erases it the moment it is loaded.
+ */
+#define H713_DISP_LOGO_ADDR	0x4e000000UL
+
+static int h713_disp_read(const char *path, ulong addr, loff_t *len)
+{
+	int ret;
+
+	ret = fs_set_blk_dev(H713_DISP_FS_IF, H713_DISP_FS_DEV, FS_TYPE_ANY);
+	if (ret) {
+		printf("H713 disp: cannot select %s %s\n",
+		       H713_DISP_FS_IF, H713_DISP_FS_DEV);
+		return ret;
+	}
+
+	ret = fs_read(path, addr, 0, 0, len);
+	if (ret) {
+		printf("H713 disp: cannot read %s\n", path);
+		return ret;
+	}
+
+	printf("  %-28s -> 0x%08lx  %llu bytes\n", path, addr, *len);
+	return 0;
+}
+
+/* The TSE window takes the vendor databases concatenated, project file last. */
+static int h713_disp_load_tse(u32 project)
+{
+	static const char *const fixed[] = {
+		"mips/database.TSE", "mips/projecttable.TSE",
+	};
+	char pid[40];
+	ulong addr = H713_MIPS_TSE_ADDR;
+	loff_t len;
+	int i, ret;
+
+	memset((void *)H713_MIPS_TSE_ADDR, 0, H713_MIPS_TSE_SIZE);
+
+	for (i = 0; i < ARRAY_SIZE(fixed); i++) {
+		ret = h713_disp_read(fixed[i], addr, &len);
+		if (ret)
+			return ret;
+		addr += len;
+	}
+
+	snprintf(pid, sizeof(pid), "mips/ProjectID_0x%04x.TSE", project);
+	ret = h713_disp_read(pid, addr, &len);
+	if (ret)
+		return ret;
+	addr += len;
+
+	ret = h713_disp_read("mips/pq_custom.TSE", addr, &len);
+	if (ret)
+		return ret;
+	addr += len;
+
+	if (addr > H713_MIPS_TSE_ADDR + H713_MIPS_TSE_SIZE) {
+		printf("H713 disp: TSE data overruns its window\n");
+		return -ENOSPC;
+	}
+
+	return 0;
+}
+
+static int h713_disp_load(u32 project)
+{
+	loff_t len;
+	int ret;
+
+	printf("H713 disp: loading vendor artifacts from %s %s\n",
+	       H713_DISP_FS_IF, H713_DISP_FS_DEV);
+
+	/* Clear first: the workspace wipe must not run over what we load. */
+	h713_mips_clear_workspace();
+	memset((void *)H713_MIPS_CFG_ADDR, 0, H713_MIPS_CFG_SIZE);
+
+	ret = h713_disp_read("mips/display.bin", H713_MIPS_FW_ADDR, &len);
+	if (ret)
+		return ret;
+	if (len != H713_MIPS_FW_SIZE) {
+		printf("H713 disp: display.bin is %llu bytes, expected 0x%lx\n",
+		       len, H713_MIPS_FW_SIZE);
+		return -EINVAL;
+	}
+
+	ret = h713_disp_read("mips/display_cfg.xml", H713_MIPS_CFG_ADDR, &len);
+	if (ret)
+		return ret;
+
+	ret = h713_disp_load_tse(project);
+	if (ret)
+		return ret;
+
+	ret = h713_disp_read("mips/LogoRegData.bin", H713_DISP_LOGO_ADDR, &len);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
+static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
+			char *const argv[])
+{
+	ulong blob;
+
+	if ((argc == 2 || argc == 3) && !strcmp(argv[1], "dump")) {
+		bool force = argc == 3 && !strcmp(argv[2], "force");
+
+		if (argc == 3 && !force)
+			return CMD_RET_USAGE;
+		h713_disp_dump(force);
+		return CMD_RET_SUCCESS;
+	}
+
+	/* Load only, so display_cfg.xml can be patched before the run. */
+	if (argc == 3 && !strcmp(argv[1], "load")) {
+		if (h713_disp_load(hextoul(argv[2], NULL)))
+			return CMD_RET_FAILURE;
+		printf("H713 disp: loaded; run with 'h713_disp 0x%08lx <project>'\n",
+		       H713_DISP_LOGO_ADDR);
+		return CMD_RET_SUCCESS;
+	}
+
+	/* Load everything from eMMC, then run: one command from power-on. */
+	if ((argc == 3 || argc == 4) && !strcmp(argv[1], "auto")) {
+		u32 project = hextoul(argv[2], NULL);
+		bool nowait = argc == 4 && !strcmp(argv[3], "nowait");
+
+		if (argc == 4 && !nowait)
+			return CMD_RET_USAGE;
+		if (h713_disp_load(project))
+			return CMD_RET_FAILURE;
+		return h713_disp_run(H713_DISP_LOGO_ADDR, project, nowait) ?
+		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
+	}
+
+	if (argc == 3 && !strcmp(argv[1], "list")) {
+		h713_disp_list(hextoul(argv[2], NULL));
+		return CMD_RET_SUCCESS;
+	}
+
+	if (argc != 3 && argc != 4)
+		return CMD_RET_USAGE;
+	if (argc == 4 && strcmp(argv[3], "nowait"))
+		return CMD_RET_USAGE;
+
+	blob = hextoul(argv[1], NULL);
+
+	return h713_disp_run(blob, hextoul(argv[2], NULL), argc == 4) ?
+	       CMD_RET_FAILURE : CMD_RET_SUCCESS;
+}
+
+U_BOOT_CMD(h713_disp, 4, 0, do_h713_disp,
+	   "run stock's fastlogo display sequence for a project ID",
+	   "auto <project-id> [nowait]          - load from eMMC and run everything\n"
+	   "h713_disp load <project-id>         - load from eMMC only\n"
+	   "h713_disp <blob-addr> <project-id> [nowait] - run against a staged blob\n"
+	   "h713_disp list <blob-addr>          - show every project's tables\n"
+	   "h713_disp dump [force]              - dump the display register blocks"
 );
