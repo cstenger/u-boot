@@ -1431,7 +1431,32 @@ static int h713_mips_start(void)
 #define H713_MIPS_HDCP_WAIT_ORIG	0x2c630033
 #define H713_MIPS_HDCP_WAIT_NONE	0x2c630000
 
-static int h713_mips_release_raw(bool skip_hdcp_wait)
+/*
+ * The firmware's output timing is a hybrid: the geometry lives in the vendor
+ * databases, but the selector that picks which record to use is compiled in.
+ *
+ * _LoadTFDPanelTiming builds the Output_Resolution selector 0x00060004 from an
+ * immediate pair at file offset 0x88120 -- "lui v0, 6; addiu v0, v0, 4" --
+ * where parameter 6 is Output_Resolution. Selector 0x00060004 resolves through
+ * database.TSE's OUTPUT_TIMING_PROJECTOR to the 1080p record, whose fields are
+ * copied verbatim into the LVDS timing registers: the u16 quad (2200, 1125,
+ * 1920, 1080) is byte-identical to the 0x04650898 / 0x04380780 that
+ * 0x05880020 / 0x05880024 read back on the bench. That overrides the 1280x720
+ * the vendor's own register table writes for this panel.
+ *
+ * Rewriting the addiu's immediate to 3 asks for the adjacent resolution. The
+ * mixer and DE already run 720p out of the same database -- both read
+ * 0x02e4059f, which is the (1440, 741, 1280, 720) record in size-minus-one
+ * form -- so the firmware is presently inconsistent with itself, and 3 should
+ * bring the TCON into line with the rest of its own pipeline.
+ *
+ * Applied after the identity check, so the gate still verifies stock bytes.
+ */
+#define H713_MIPS_RES_SEL_BYTE		(H713_MIPS_FW_ADDR + 0x88124)
+#define H713_MIPS_RES_SEL_1080P		0x04
+#define H713_MIPS_RES_SEL_720P		0x03
+
+static int h713_mips_release_raw(bool skip_hdcp_wait, bool force_720p)
 {
 	u32 status, witness;
 	int ret;
@@ -1439,6 +1464,19 @@ static int h713_mips_release_raw(bool skip_hdcp_wait)
 	ret = h713_mips_verify();
 	if (ret)
 		return ret;
+
+	if (force_720p) {
+		u8 sel = readb(H713_MIPS_RES_SEL_BYTE);
+
+		if (sel != H713_MIPS_RES_SEL_1080P) {
+			printf("H713 MIPS: resolution selector is 0x%02x, expected 0x%02x\n",
+			       sel, H713_MIPS_RES_SEL_1080P);
+			return -EINVAL;
+		}
+		writeb(H713_MIPS_RES_SEL_720P, H713_MIPS_RES_SEL_BYTE);
+		printf("H713 MIPS: Output_Resolution selector forced to 0x%02x\n",
+		       H713_MIPS_RES_SEL_720P);
+	}
 
 	if (skip_hdcp_wait) {
 		u32 insn = readl(H713_MIPS_HDCP_WAIT_INSN);
@@ -1739,7 +1777,7 @@ static int do_h713_mips(struct cmd_tbl *cmdtp, int flag, int argc,
 	}
 
 	if (!strcmp(argv[1], "release")) {
-		ret = h713_mips_release_raw(false);
+		ret = h713_mips_release_raw(false, false);
 		return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
@@ -2361,7 +2399,8 @@ static void h713_disp_fifo_reset(void)
 	writel(cfg, 0x0588000c);
 }
 
-static int h713_disp_run(ulong blob, u32 project, bool skip_hdcp_wait)
+static int h713_disp_run(ulong blob, u32 project, bool skip_hdcp_wait,
+			 bool force_720p)
 {
 	struct h713_disp_sel sel;
 	int ret;
@@ -2397,7 +2436,7 @@ static int h713_disp_run(ulong blob, u32 project, bool skip_hdcp_wait)
 	writel(0x01800045, 0x051c0010);		/* LVDS enable */
 	mdelay(12);
 
-	ret = h713_mips_release_raw(skip_hdcp_wait);
+	ret = h713_mips_release_raw(skip_hdcp_wait, force_720p);
 	if (ret)
 		return ret;
 
@@ -2632,7 +2671,7 @@ static int h713_disp_test(u32 project, u32 source_id, u32 level)
 	h713_cfg_set(H713_CFG_OFF_ELOG_ASYNC, '0', "elog async");
 	h713_cfg_set(H713_CFG_OFF_ELOG_LEVEL, '0' + level, "elog level");
 
-	ret = h713_disp_run(H713_DISP_LOGO_ADDR, project, false);
+	ret = h713_disp_run(H713_DISP_LOGO_ADDR, project, false, false);
 	if (ret)
 		return ret;
 
@@ -2680,15 +2719,25 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 	}
 
 	/* Load everything from eMMC, then run: one command from power-on. */
-	if ((argc == 3 || argc == 4) && !strcmp(argv[1], "auto")) {
+	if (argc >= 3 && !strcmp(argv[1], "auto")) {
 		u32 project = hextoul(argv[2], NULL);
-		bool nowait = argc == 4 && !strcmp(argv[3], "nowait");
+		bool nowait = false, force_720p = false;
+		int i;
 
-		if (argc == 4 && !nowait)
-			return CMD_RET_USAGE;
+		/* Modifiers in any order, so neither has to be remembered. */
+		for (i = 3; i < argc; i++) {
+			if (!strcmp(argv[i], "nowait"))
+				nowait = true;
+			else if (!strcmp(argv[i], "720p"))
+				force_720p = true;
+			else
+				return CMD_RET_USAGE;
+		}
+
 		if (h713_disp_load(project))
 			return CMD_RET_FAILURE;
-		return h713_disp_run(H713_DISP_LOGO_ADDR, project, nowait) ?
+		return h713_disp_run(H713_DISP_LOGO_ADDR, project, nowait,
+				     force_720p) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
@@ -2704,14 +2753,14 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 
 	blob = hextoul(argv[1], NULL);
 
-	return h713_disp_run(blob, hextoul(argv[2], NULL), argc == 4) ?
+	return h713_disp_run(blob, hextoul(argv[2], NULL), argc == 4, false) ?
 	       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 }
 
 U_BOOT_CMD(h713_disp, 5, 0, do_h713_disp,
 	   "run stock's fastlogo display sequence for a project ID",
 	   "test <project-id> [source] [level]  - load, patch, run, sample, log\n"
-	   "h713_disp auto <project-id> [nowait]        - load from eMMC and run\n"
+	   "h713_disp auto <project-id> [nowait] [720p] - load from eMMC and run\n"
 	   "h713_disp load <project-id>         - load from eMMC only\n"
 	   "h713_disp <blob-addr> <project-id> [nowait] - run against a staged blob\n"
 	   "h713_disp list <blob-addr>          - show every project's tables\n"
