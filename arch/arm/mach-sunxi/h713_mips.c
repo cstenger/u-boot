@@ -1797,10 +1797,24 @@ U_BOOT_CMD(h713_mips, 5, 0, do_h713_mips,
  *
  * Stock U-Boot drives the panel itself for its boot logo: it parses
  * mips/LogoRegData.bin and applies the register table, then blits a bitmap.
- * The file is a container of 16-byte {address, value, mask, type} records
- * where type 1/2/4 is the access width; records with a zero address and type
- * 0xff are control entries whose value has been observed as small counts (1,
- * 0x64), consistent with a delay.
+ * The file is a container of 16-byte {address, value, mask, type} records.
+ *
+ * The record semantics below are read off the vendor applier itself, at
+ * 0x4a025164 in this board's stock U-Boot 2018.05 (Thumb-2, load base
+ * 0x4a000000). It walks a {?, records, count} descriptor and switches on the
+ * type word at +0xc:
+ *
+ *   type <= 4    masked read-modify-write: *addr = (*addr & ~mask) | value.
+ *                Stock uses a 32-bit access for every type in that range --
+ *                the width field is vestigial, and this container only ever
+ *                uses 4 anyway.
+ *   type 0xfe    pulse the masked bits: *addr = cur & ~mask, then
+ *                *addr = cur | mask, where cur is one read taken up front.
+ *                The value word is not used.
+ *   type 0xff    delay, in MICROSECONDS -- it calls the udelay thunk at
+ *                0x4a000d74, and the delay core busy-waits val * 24 arch-timer
+ *                ticks at 24 MHz. The separate x1000 mdelay wrapper next to it
+ *                is not what the walker uses.
  *
  * The container holds several alternative tables -- a CCU/TVTOP prologue, a
  * set of timing blocks, and seven DE/mixer/LVDS blocks for different modes --
@@ -1811,7 +1825,12 @@ U_BOOT_CMD(h713_mips, 5, 0, do_h713_mips,
  * h713_display_prepare() is, register for register, the opening of the first
  * table.
  */
-#define H713_LOGO_MAX_DELAY_MS	200
+/*
+ * Stock imposes no ceiling; this only bounds a walk that has fallen into
+ * garbage. The largest delay in the container is 15000 us, so 100 ms of
+ * headroom cannot truncate a genuine record.
+ */
+#define H713_LOGO_MAX_DELAY_US	100000
 
 struct h713_logo_rec {
 	u32 addr;
@@ -1830,7 +1849,7 @@ static bool h713_logo_reg_sane(u32 addr)
 static int h713_logo_walk(ulong base, ulong start, ulong end, bool apply)
 {
 	ulong off;
-	int written = 0, skipped = 0, delayed = 0;
+	int written = 0, skipped = 0, delayed = 0, pulsed = 0;
 
 	/*
 	 * Records are 16 bytes but the container only aligns them to 4 -- the
@@ -1859,14 +1878,43 @@ static int h713_logo_walk(ulong base, ulong start, ulong end, bool apply)
 
 		if (!r.addr && r.type == 0xff) {
 			off += sizeof(struct h713_logo_rec);
-			u32 ms = min_t(u32, r.val, H713_LOGO_MAX_DELAY_MS);
+			u32 us = min_t(u32, r.val, H713_LOGO_MAX_DELAY_US);
 
 			if (apply)
-				mdelay(ms);
+				udelay(us);
 			else
-				printf("  +0x%04lx  delay %u\n",
-				       off - sizeof(struct h713_logo_rec), ms);
+				printf("  +0x%04lx  delay %u us\n",
+				       off - sizeof(struct h713_logo_rec), us);
 			delayed++;
+			continue;
+		}
+
+		if (h713_logo_reg_sane(r.addr) && r.type == 0xfe) {
+			u32 cur;
+
+			off += sizeof(struct h713_logo_rec);
+
+			/*
+			 * All four in this container pulse bit 31 of the
+			 * display PLL at 0x058c0014 -- that is PLL_ENABLE, so
+			 * this is a PLL restart, and the one inside timing
+			 * block 6 sits between two 15 ms waits in the middle
+			 * of a divider reprogram. Dropping it left everything
+			 * after it in the block applied to a PLL that had
+			 * never been re-locked.
+			 */
+			if (!apply) {
+				printf("  +0x%04lx  0x%08x pulse mask 0x%08x\n",
+				       off - sizeof(struct h713_logo_rec),
+				       r.addr, r.mask);
+				pulsed++;
+				continue;
+			}
+
+			cur = readl(r.addr);
+			writel(cur & ~r.mask, r.addr);
+			writel(cur | r.mask, r.addr);
+			pulsed++;
 			continue;
 		}
 
@@ -1904,8 +1952,9 @@ static int h713_logo_walk(ulong base, ulong start, ulong end, bool apply)
 		written++;
 	}
 
-	printf("H713 logo: %s %d record(s), %d delay(s), %d resync step(s)\n",
-	       apply ? "applied" : "listed", written, delayed, skipped);
+	printf("H713 logo: %s %d record(s), %d pulse(s), %d delay(s), "
+	       "%d resync step(s)\n", apply ? "applied" : "listed", written,
+	       pulsed, delayed, skipped);
 
 	return 0;
 }
