@@ -1072,6 +1072,33 @@ static void h713_display_prepare(void)
 }
 
 /*
+ * Bring up the capture block before the MIPS leaves reset.
+ *
+ * The firmware writes 0xc0 to HDMI-RX register 0x06840093 and polls bit 0 for
+ * a reset/lock acknowledgement (0x4b13d044). It never comes back, and the
+ * timeout cannot rescue it: the tick is a software counter driven by the CP0
+ * Compare ISR, and interrupts are still masked this early in startup, so the
+ * wait loop spins forever and its caller never returns.
+ *
+ * An earlier attempt released TVCAP from the poll loop once marker 14 appeared
+ * and wedged the interconnect. Doing it here instead matches the factory
+ * ordering, where the capture clocks and reset are up before the coprocessor
+ * runs at all.
+ */
+static void h713_tvcap_prepare(void)
+{
+	setbits_le32((void *)H713_TVCAP_TCD3_CLK_REG, BIT(31));
+	setbits_le32((void *)H713_TVCAP_VINCAP_DMA_CLK_REG, BIT(31));
+	setbits_le32((void *)H713_TVCAP_HDMI_AUDIO_CLK_REG, BIT(31));
+	mdelay(12);
+	setbits_le32((void *)H713_TVCAP_BUS_CLK_REG, BIT(1) | BIT(0));
+	mdelay(12);
+	setbits_le32((void *)H713_TVCAP_BGR_REG, BIT(16) | BIT(0));
+	mdelay(12);
+	printf("H713 MIPS: TVCAP clocks/reset prepared before release\n");
+}
+
+/*
  * Zero everything the firmware may read except the two staged windows, so a
  * run does not depend on what the previous boot left in DRAM. Identical cold
  * boots have otherwise diverged by more than ten markers.
@@ -1365,7 +1392,8 @@ static int h713_mips_start(void)
 	return 0;
 }
 
-static int h713_mips_probe_ready(bool trace, bool release_tvcap)
+static int h713_mips_probe_ready(bool trace, bool release_tvcap,
+				 bool skip_wait)
 {
 	u32 tvcap_saved_tcd3 = 0;
 	u32 tvcap_saved_vincap = 0;
@@ -1398,8 +1426,25 @@ static int h713_mips_probe_ready(bool trace, bool release_tvcap)
 		if (ret)
 			goto out_stop;
 	}
+	/*
+	 * Rx_HDCP14_LoadKey polls HDMI-RX 0x06840093 bit 0 for a key-load
+	 * acknowledgement and gives up after 0x33 ticks with "time out!". The
+	 * tick is a software counter driven by the CP0 Compare ISR, so while
+	 * interrupts are masked this early the timeout can never expire and a
+	 * failure the firmware is designed to survive becomes a hang.
+	 *
+	 * Rewrite the loop bound inside marker 104's cave so the wait gives up
+	 * on its first iteration, taking the same path a real timeout would.
+	 */
+	if (skip_wait) {
+		writel(0x2c630000, 0x4b101168);
+		flush_cache(H713_MIPS_FW_ADDR, H713_MIPS_FW_WINDOW_SIZE);
+		printf("H713 MIPS: tick wait loops forced to expire at once\n");
+	}
+
 	h713_display_prepare();
 
+	/* Capture the cold values before enabling, so stop() can undo this. */
 	if (release_tvcap) {
 		tvcap_saved_tcd3 = readl(H713_TVCAP_TCD3_CLK_REG);
 		tvcap_saved_vincap = readl(H713_TVCAP_VINCAP_DMA_CLK_REG);
@@ -1407,6 +1452,9 @@ static int h713_mips_probe_ready(bool trace, bool release_tvcap)
 		tvcap_saved_hdmi_audio =
 			readl(H713_TVCAP_HDMI_AUDIO_CLK_REG);
 		tvcap_saved_bgr = readl(H713_TVCAP_BGR_REG);
+
+		h713_tvcap_prepare();
+		tvcap_released = true;
 	}
 
 	ret = h713_mips_release_reset(true);
@@ -1420,34 +1468,6 @@ static int h713_mips_probe_ready(bool trace, bool release_tvcap)
 		if (trace)
 			h713_mips_stream_trace(trace_shadow);
 
-		/*
-		 * Releasing TVCAP from the ARM wedges the board. It once looked
-		 * like a prerequisite because a run without it stalled early,
-		 * but that stall was a missing display_cfg.xml: the unresolved
-		 * "sys:dbg_buf" pointer landed in unclocked capture MMIO, and
-		 * releasing TVCAP merely let those stalled writes retire.
-		 *
-		 * With the config staged, leaving TVCAP alone reaches marker 44
-		 * and returns cleanly, while releasing it here stalls the
-		 * interconnect and takes ARM's UART with it. Kept only as an
-		 * opt-in diagnostic ("probe-trace tvcap").
-		 */
-		if (release_tvcap && !tvcap_released &&
-		    h713_mips_read_shmem(H713_MIPS_TRACE_OFF +
-					 13 * sizeof(u32)) == 14) {
-			setbits_le32((void *)H713_TVCAP_TCD3_CLK_REG, BIT(31));
-			setbits_le32((void *)H713_TVCAP_VINCAP_DMA_CLK_REG,
-				     BIT(31));
-			setbits_le32((void *)H713_TVCAP_BUS_CLK_REG,
-				     BIT(1) | BIT(0));
-			setbits_le32((void *)H713_TVCAP_HDMI_AUDIO_CLK_REG,
-				     BIT(31));
-			mdelay(12);
-			setbits_le32((void *)H713_TVCAP_BGR_REG,
-				     BIT(16) | BIT(0));
-			tvcap_released = true;
-			printf("H713 MIPS: TVCAP reset released after INCAP init\n");
-		}
 
 		mips_flag =
 			h713_mips_read_shmem(H713_MIPS_SHMEM_MIPS_FLAG_OFF);
@@ -1561,7 +1581,7 @@ static int do_h713_mips(struct cmd_tbl *cmdtp, int flag, int argc,
 	}
 
 	if (!strcmp(argv[1], "probe-ready")) {
-		ret = h713_mips_probe_ready(false, false);
+		ret = h713_mips_probe_ready(false, false, false);
 		return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
@@ -1571,11 +1591,12 @@ static int do_h713_mips(struct cmd_tbl *cmdtp, int flag, int argc,
 	 */
 	if (!strcmp(argv[1], "probe-trace")) {
 		bool tvcap = argc == 3 && !strcmp(argv[2], "tvcap");
+		bool no_wait = argc == 3 && !strcmp(argv[2], "no-wait");
 
-		if (argc > 3 || (argc == 3 && !tvcap))
+		if (argc > 3 || (argc == 3 && !tvcap && !no_wait))
 			return CMD_RET_USAGE;
 
-		ret = h713_mips_probe_ready(true, tvcap);
+		ret = h713_mips_probe_ready(true, tvcap, no_wait);
 		return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
@@ -1601,7 +1622,7 @@ U_BOOT_CMD(h713_mips, 5, 0, do_h713_mips,
 	   "h713_mips prepare\n"
 	   "h713_mips start\n"
 	   "h713_mips probe-ready\n"
-	   "h713_mips probe-trace [tvcap]\n"
+	   "h713_mips probe-trace [tvcap|no-wait]\n"
 	   "h713_mips load <interface> <dev[:part]> <path>\n"
 	   "h713_mips boot <interface> <dev[:part]> <path>"
 );
