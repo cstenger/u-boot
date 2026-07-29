@@ -2517,6 +2517,84 @@ static int h713_disp_load(u32 project)
 	return 0;
 }
 
+
+/*
+ * Single-command test run.
+ *
+ * The firmware wedges the interconnect some seconds after the sequence
+ * completes, so anything typed by hand afterwards races that failure and the
+ * result depends on how fast the operator types. Do the whole experiment --
+ * load, config patches, sequence, timed sampling, log dump -- inside one
+ * command so the timing is fixed.
+ *
+ * display_cfg.xml offsets are byte positions of single ASCII digits, so each
+ * patch is one character and cannot change the document's length.
+ */
+#define H713_CFG_OFF_SOURCE_ID	0x0e48
+#define H713_CFG_OFF_ELOG_MODE	0x1222
+#define H713_CFG_OFF_ELOG_LEVEL	0x123c
+#define H713_CFG_OFF_ELOG_ASYNC	0x125e
+
+static int h713_cfg_set(ulong off, char want, const char *what)
+{
+	ulong a = H713_MIPS_CFG_ADDR + off;
+	u8 cur = readb(a);
+
+	if (cur < '0' || cur > '9') {
+		printf("H713 disp: %s at +0x%04lx reads '%c', not a digit -- "
+		       "config layout differs, skipping\n", what, off, cur);
+		return -EINVAL;
+	}
+
+	writeb(want, a);
+	printf("  %-14s '%c' -> '%c'\n", what, cur, want);
+
+	return 0;
+}
+
+static void h713_disp_sample(void)
+{
+	static const uint at_ms[] = { 0, 100, 500, 1000, 2000, 4000 };
+	uint i, elapsed = 0;
+
+	printf("H713 disp: LVDS FIFO over time\n");
+	for (i = 0; i < ARRAY_SIZE(at_ms); i++) {
+		if (at_ms[i] > elapsed) {
+			mdelay(at_ms[i] - elapsed);
+			elapsed = at_ms[i];
+		}
+		printf("  t=%4u ms  fifo=0x%08x  status=0x%08x\n",
+		       elapsed, readl(0x05880fe0),
+		       readl(H713_MIPS_STATUS_REG));
+	}
+}
+
+static int h713_disp_test(u32 project, u32 source_id, u32 level)
+{
+	int ret;
+
+	ret = h713_disp_load(project);
+	if (ret)
+		return ret;
+
+	printf("H713 disp: config patches\n");
+	h713_cfg_set(H713_CFG_OFF_SOURCE_ID, '0' + source_id, "source_id");
+	h713_cfg_set(H713_CFG_OFF_ELOG_MODE, '2', "elog mode");
+	h713_cfg_set(H713_CFG_OFF_ELOG_ASYNC, '0', "elog async");
+	h713_cfg_set(H713_CFG_OFF_ELOG_LEVEL, '0' + level, "elog level");
+
+	ret = h713_disp_run(H713_DISP_LOGO_ADDR, project, false);
+	if (ret)
+		return ret;
+
+	h713_disp_sample();
+
+	printf("H713 disp: firmware log\n");
+	h713_mips_log(0x4b232000, 0x4bd00000);
+
+	return 0;
+}
+
 static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 			char *const argv[])
 {
@@ -2529,6 +2607,18 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 			return CMD_RET_USAGE;
 		h713_disp_dump(force);
 		return CMD_RET_SUCCESS;
+	}
+
+	/* Everything in one command, so operator timing is not a variable. */
+	if (argc >= 3 && !strcmp(argv[1], "test")) {
+		u32 project = hextoul(argv[2], NULL);
+		u32 src = argc > 3 ? dectoul(argv[3], NULL) : 2;
+		u32 lvl = argc > 4 ? dectoul(argv[4], NULL) : 3;
+
+		if (argc > 5 || src > 9 || lvl > 5)
+			return CMD_RET_USAGE;
+		return h713_disp_test(project, src, lvl) ?
+		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
 	/* Load only, so display_cfg.xml can be patched before the run. */
@@ -2569,9 +2659,10 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 	       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 }
 
-U_BOOT_CMD(h713_disp, 4, 0, do_h713_disp,
+U_BOOT_CMD(h713_disp, 5, 0, do_h713_disp,
 	   "run stock's fastlogo display sequence for a project ID",
-	   "auto <project-id> [nowait]          - load from eMMC and run everything\n"
+	   "test <project-id> [source] [level]  - load, patch, run, sample, log\n"
+	   "h713_disp auto <project-id> [nowait]        - load from eMMC and run\n"
 	   "h713_disp load <project-id>         - load from eMMC only\n"
 	   "h713_disp <blob-addr> <project-id> [nowait] - run against a staged blob\n"
 	   "h713_disp list <blob-addr>          - show every project's tables\n"
