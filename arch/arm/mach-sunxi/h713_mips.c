@@ -13,6 +13,8 @@
 #include <fs.h>
 #include <linux/delay.h>
 #include <linux/kernel.h>
+#include <vsprintf.h>
+#include <sunxi_gpio.h>
 #include <linux/string.h>
 #include <asm/io.h>
 #include <u-boot/sha256.h>
@@ -1392,6 +1394,54 @@ static int h713_mips_start(void)
 	return 0;
 }
 
+/*
+ * Release the MIPS the way stock fastlogo does, without touching the display
+ * fabric.
+ *
+ * Stock configures the fabric from LogoRegData.bin, writes INCAP and the LVDS
+ * enable, releases the coprocessor, waits 300 ms and finalises LVDS. Replaying
+ * that needs a release step that leaves the vendor register state alone --
+ * h713_mips_start() would re-apply h713_display_prepare() over the top of it.
+ *
+ * The cache flush is the part that is easy to miss: fastboot staging writes
+ * through the ARM cache, so a verify reads back correct while DRAM still holds
+ * stale bytes and the MIPS fetches garbage.
+ */
+static int h713_mips_release_raw(void)
+{
+	u32 status, witness;
+	int ret;
+
+	ret = h713_mips_verify();
+	if (ret)
+		return ret;
+
+	flush_cache(H713_MIPS_FW_ADDR, H713_MIPS_FW_WINDOW_SIZE);
+	h713_mips_seed_witness();
+
+	ret = h713_mips_release_reset(false);
+	if (ret)
+		return ret;
+	mdelay(300);
+
+	status = readl(H713_MIPS_STATUS_REG);
+	witness = h713_mips_read_witness();
+	printf("H713 MIPS: released, status=0x%08x witness=0x%08x\n",
+	       status, witness);
+
+	if (status != H713_MIPS_STATUS_RELEASED) {
+		printf("H713 MIPS: unexpected CPU status\n");
+		return -EIO;
+	}
+	if (witness) {
+		printf("H713 MIPS: firmware did not clear BSS -- not executing\n");
+		return -ETIMEDOUT;
+	}
+
+	printf("H713 MIPS: firmware execution proven by BSS clear\n");
+	return 0;
+}
+
 static int h713_mips_probe_ready(bool trace, bool release_tvcap,
 				 bool skip_wait)
 {
@@ -1580,6 +1630,11 @@ static int do_h713_mips(struct cmd_tbl *cmdtp, int flag, int argc,
 		return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
+	if (!strcmp(argv[1], "release")) {
+		ret = h713_mips_release_raw();
+		return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
+	}
+
 	if (!strcmp(argv[1], "probe-ready")) {
 		ret = h713_mips_probe_ready(false, false, false);
 		return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
@@ -1621,8 +1676,373 @@ U_BOOT_CMD(h713_mips, 5, 0, do_h713_mips,
 	   "h713_mips verify\n"
 	   "h713_mips prepare\n"
 	   "h713_mips start\n"
+	   "h713_mips release\n"
 	   "h713_mips probe-ready\n"
 	   "h713_mips probe-trace [tvcap|no-wait]\n"
 	   "h713_mips load <interface> <dev[:part]> <path>\n"
 	   "h713_mips boot <interface> <dev[:part]> <path>"
+);
+
+/*
+ * LogoRegData.bin replay.
+ *
+ * Stock U-Boot drives the panel itself for its boot logo: it parses
+ * mips/LogoRegData.bin and applies the register table, then blits a bitmap.
+ * The file is a container of 16-byte {address, value, mask, type} records
+ * where type 1/2/4 is the access width; records with a zero address and type
+ * 0xff are control entries whose value has been observed as small counts (1,
+ * 0x64), consistent with a delay.
+ *
+ * The container holds several alternative tables -- a CCU/TVTOP prologue, a
+ * set of timing blocks, and seven DE/mixer/LVDS blocks for different modes --
+ * and which combination this panel needs is not yet established. So this
+ * command applies an explicit byte range rather than trying to pick for you;
+ * bisecting on the bench is cheaper than guessing statically.
+ *
+ * h713_display_prepare() is, register for register, the opening of the first
+ * table.
+ */
+#define H713_LOGO_MAX_DELAY_MS	200
+
+struct h713_logo_rec {
+	u32 addr;
+	u32 val;
+	u32 mask;
+	u32 type;
+};
+
+static bool h713_logo_reg_sane(u32 addr)
+{
+	/* CCU, PIO/MIPS control, and the display/capture blocks only. */
+	return (addr >= 0x02000000 && addr < 0x03100000) ||
+	       (addr >= 0x04000000 && addr < 0x07000000);
+}
+
+static int h713_logo_walk(ulong base, ulong start, ulong end, bool apply)
+{
+	ulong off;
+	int written = 0, skipped = 0, delayed = 0;
+
+	/*
+	 * Records are 16 bytes but the container only aligns them to 4 -- the
+	 * first run starts at 0x17c -- so do not demand 16-byte offsets.
+	 */
+	if ((start | end) & 3 || end <= start) {
+		printf("H713 logo: range must be 4-byte aligned and non-empty\n");
+		return -EINVAL;
+	}
+
+	/*
+	 * Records are 16 bytes but the container inserts other data between
+	 * runs, so the stream shifts phase -- the run at 0xbdc is 0x1d8 from
+	 * the one at 0xa04, which is not a multiple of 16. Resynchronise by
+	 * stepping four bytes until a record parses, then consume sixteen.
+	 * Walking a fixed lattice silently drops entries: it applied 167 of
+	 * the 292 records in the 0xa04..0x1fdc section.
+	 */
+	for (off = start; off + sizeof(struct h713_logo_rec) <= end; ) {
+		struct h713_logo_rec r;
+
+		r.addr = readl(base + off);
+		r.val  = readl(base + off + 4);
+		r.mask = readl(base + off + 8);
+		r.type = readl(base + off + 12);
+
+		if (!r.addr && r.type == 0xff) {
+			off += sizeof(struct h713_logo_rec);
+			u32 ms = min_t(u32, r.val, H713_LOGO_MAX_DELAY_MS);
+
+			if (apply)
+				mdelay(ms);
+			else
+				printf("  +0x%04lx  delay %u\n",
+				       off - sizeof(struct h713_logo_rec), ms);
+			delayed++;
+			continue;
+		}
+
+		if (!h713_logo_reg_sane(r.addr) ||
+		    (r.type != 1 && r.type != 2 && r.type != 4)) {
+			off += 4;
+			skipped++;
+			continue;
+		}
+		off += sizeof(struct h713_logo_rec);
+
+		if (!apply) {
+			printf("  +0x%04lx  0x%08x <- 0x%08x mask 0x%08x w%u\n",
+			       off - sizeof(struct h713_logo_rec),
+			       r.addr, r.val, r.mask, r.type);
+			written++;
+			continue;
+		}
+
+		/* Masked read-modify-write at the record's access width. */
+		switch (r.type) {
+		case 1:
+			writeb((readb(r.addr) & ~(u8)r.mask) |
+			       ((u8)r.val & (u8)r.mask), r.addr);
+			break;
+		case 2:
+			writew((readw(r.addr) & ~(u16)r.mask) |
+			       ((u16)r.val & (u16)r.mask), r.addr);
+			break;
+		default:
+			writel((readl(r.addr) & ~r.mask) | (r.val & r.mask),
+			       r.addr);
+			break;
+		}
+		written++;
+	}
+
+	printf("H713 logo: %s %d record(s), %d delay(s), %d resync step(s)\n",
+	       apply ? "applied" : "listed", written, delayed, skipped);
+
+	return 0;
+}
+
+static int do_h713_logo(struct cmd_tbl *cmdtp, int flag, int argc,
+			char *const argv[])
+{
+	ulong base, start, end;
+	bool apply;
+
+	if (argc != 5)
+		return CMD_RET_USAGE;
+
+	if (!strcmp(argv[1], "apply"))
+		apply = true;
+	else if (!strcmp(argv[1], "dump"))
+		apply = false;
+	else
+		return CMD_RET_USAGE;
+
+	base  = hextoul(argv[2], NULL);
+	start = hextoul(argv[3], NULL);
+	end   = hextoul(argv[4], NULL);
+
+	return h713_logo_walk(base, start, end, apply) ?
+	       CMD_RET_FAILURE : CMD_RET_SUCCESS;
+}
+
+U_BOOT_CMD(h713_logo, 5, 0, do_h713_logo,
+	   "replay a range of the vendor LogoRegData.bin register table",
+	   "dump  <blob-addr> <start-off> <end-off>\n"
+	   "h713_logo apply <blob-addr> <start-off> <end-off>"
+);
+
+/*
+ * Bit-banged I2C scan on TWI1's pins.
+ *
+ * The projector's output chain ends in a TI DLPC3435 DLP controller, and the
+ * stock ge2d driver reaches it over I2C at 0x1b (its normal_i2c probe list).
+ * TWI1 is the only I2C bus the vendor device tree enables: 0x02502400 at
+ * 100 kHz on PH2/PH3, and it also carries an lsm6dsr accelerometer at 0x6a,
+ * which makes a useful positive control -- seeing 0x6a proves the bus works.
+ *
+ * Bit-banging rather than bringing up mvtwsi keeps this self-contained: no
+ * device-tree node, no CCU gate, nothing that can be silently wrong.
+ */
+/*
+ * H713 uses CONFIG_SUNXI_NEW_PINCTRL, so banks are 0x30 apart and the pull
+ * registers sit at +0x24 -- not the 0x24 stride and +0x1c pull of the older
+ * layout. Take the stride from the header rather than restating it.
+ */
+#define H713_PIO_BASE		0x02000000UL
+#define H713_PIO_BANK_H		7
+#define H713_PH_CFG0		(H713_PIO_BASE + \
+				 H713_PIO_BANK_H * SUNXI_PINCTRL_BANK_SIZE)
+#define H713_PH_DATA		(H713_PH_CFG0 + 0x10)
+#define H713_PH_PULL0		(H713_PH_CFG0 + 0x24)
+
+#define H713_I2C_DELAY_US	5		/* ~100 kHz */
+
+/* Selectable so a wrong guess costs a retype, not a rebuild. */
+static uint h713_i2c_scl = 2;
+static uint h713_i2c_sda = 3;
+#define H713_I2C_SCL_PIN	h713_i2c_scl
+#define H713_I2C_SDA_PIN	h713_i2c_sda
+
+/* Drive low by becoming an output; release to high-Z and let the pull-up win. */
+static void h713_i2c_set(uint pin, bool high)
+{
+	u32 cfg = readl(H713_PH_CFG0) & ~(0xfu << (pin * 4));
+
+	if (high) {
+		writel(cfg, H713_PH_CFG0);		/* input: high-Z */
+	} else {
+		clrbits_le32((void *)H713_PH_DATA, BIT(pin));
+		writel(cfg | (1u << (pin * 4)), H713_PH_CFG0);	/* output low */
+	}
+	udelay(H713_I2C_DELAY_US);
+}
+
+static int h713_i2c_get_sda(void)
+{
+	return !!(readl(H713_PH_DATA) & BIT(H713_I2C_SDA_PIN));
+}
+
+static void h713_i2c_start(void)
+{
+	h713_i2c_set(H713_I2C_SDA_PIN, true);
+	h713_i2c_set(H713_I2C_SCL_PIN, true);
+	h713_i2c_set(H713_I2C_SDA_PIN, false);
+	h713_i2c_set(H713_I2C_SCL_PIN, false);
+}
+
+static void h713_i2c_stop(void)
+{
+	h713_i2c_set(H713_I2C_SDA_PIN, false);
+	h713_i2c_set(H713_I2C_SCL_PIN, true);
+	h713_i2c_set(H713_I2C_SDA_PIN, true);
+}
+
+/* Returns true when the slave pulled SDA low for ACK. */
+static bool h713_i2c_write_byte(u8 byte)
+{
+	bool ack;
+	int i;
+
+	for (i = 7; i >= 0; i--) {
+		h713_i2c_set(H713_I2C_SDA_PIN, !!(byte & BIT(i)));
+		h713_i2c_set(H713_I2C_SCL_PIN, true);
+		h713_i2c_set(H713_I2C_SCL_PIN, false);
+	}
+
+	h713_i2c_set(H713_I2C_SDA_PIN, true);
+	h713_i2c_set(H713_I2C_SCL_PIN, true);
+	ack = !h713_i2c_get_sda();
+	h713_i2c_set(H713_I2C_SCL_PIN, false);
+
+	return ack;
+}
+
+static u8 h713_i2c_read_byte(bool ack)
+{
+	u8 v = 0;
+	int i;
+
+	h713_i2c_set(H713_I2C_SDA_PIN, true);		/* release for the slave */
+
+	for (i = 7; i >= 0; i--) {
+		h713_i2c_set(H713_I2C_SCL_PIN, true);
+		if (h713_i2c_get_sda())
+			v |= BIT(i);
+		h713_i2c_set(H713_I2C_SCL_PIN, false);
+	}
+
+	/* ACK to continue, NACK to end the transfer. */
+	h713_i2c_set(H713_I2C_SDA_PIN, !ack);
+	h713_i2c_set(H713_I2C_SCL_PIN, true);
+	h713_i2c_set(H713_I2C_SCL_PIN, false);
+	h713_i2c_set(H713_I2C_SDA_PIN, true);
+
+	return v;
+}
+
+/*
+ * Plain read with no preceding register write: identifying an unknown chip
+ * must not risk changing its state.
+ */
+static int h713_i2c_dump(uint addr, uint count)
+{
+	uint i;
+
+	h713_i2c_start();
+	if (!h713_i2c_write_byte((u8)((addr << 1) | 1))) {
+		h713_i2c_stop();
+		printf("H713 i2c: 0x%02x did not ACK its read address\n", addr);
+		return -EIO;
+	}
+
+	printf("H713 i2c: 0x%02x read:", addr);
+	for (i = 0; i < count; i++)
+		printf(" %02x", h713_i2c_read_byte(i + 1 < count));
+	printf("\n");
+
+	h713_i2c_stop();
+	return 0;
+}
+
+static int do_h713_i2c(struct cmd_tbl *cmdtp, int flag, int argc,
+		       char *const argv[])
+{
+	int addr, found = 0;
+
+	/* Enable the internal pull-ups the vendor pinmux asks for. */
+	clrsetbits_le32((void *)H713_PH_PULL0,
+			(3u << (H713_I2C_SCL_PIN * 2)) |
+			(3u << (H713_I2C_SDA_PIN * 2)),
+			(1u << (H713_I2C_SCL_PIN * 2)) |
+			(1u << (H713_I2C_SDA_PIN * 2)));
+
+	h713_i2c_set(H713_I2C_SCL_PIN, true);
+	h713_i2c_set(H713_I2C_SDA_PIN, true);
+
+	if (argc == 4 && !strcmp(argv[1], "read")) {
+		uint a = hextoul(argv[2], NULL);
+		uint n = dectoul(argv[3], NULL);
+
+		if (a > 0x7f || !n || n > 32) {
+			printf("H713 i2c: address 0..0x7f, count 1..32\n");
+			return CMD_RET_FAILURE;
+		}
+		return h713_i2c_dump(a, n) ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
+	}
+
+	if (argc != 2 && argc != 4)
+		return CMD_RET_USAGE;
+	if (strcmp(argv[1], "scan"))
+		return CMD_RET_USAGE;
+
+	if (argc == 4) {
+		h713_i2c_scl = dectoul(argv[2], NULL);
+		h713_i2c_sda = dectoul(argv[3], NULL);
+		if (h713_i2c_scl > 31 || h713_i2c_sda > 31 ||
+		    h713_i2c_scl == h713_i2c_sda) {
+			printf("H713 i2c: bad PH pin numbers\n");
+			return CMD_RET_FAILURE;
+		}
+	}
+
+
+	/*
+	 * With SDA stuck low every ACK read returns zero and the scan reports
+	 * a device at every address. Refuse to run rather than print 112 lies.
+	 */
+	if (!h713_i2c_get_sda()) {
+		printf("H713 i2c: SDA (PH%d) reads low with the bus idle -- "
+		       "wrong pins, no pull-up, or the line is held\n",
+		       H713_I2C_SDA_PIN);
+		return CMD_RET_FAILURE;
+	}
+
+	printf("H713 i2c: scanning PH%d/PH%d\n",
+	       H713_I2C_SCL_PIN, H713_I2C_SDA_PIN);
+
+	for (addr = 0x08; addr < 0x78; addr++) {
+		bool ack;
+
+		h713_i2c_start();
+		ack = h713_i2c_write_byte((u8)(addr << 1));
+		h713_i2c_stop();
+
+		if (ack) {
+			printf("  0x%02x ACK%s\n", addr,
+			       addr == 0x1b ? "   <-- DLPC3435" :
+			       addr == 0x6a ? "   <-- lsm6dsr (bus works)" : "");
+			found++;
+		}
+	}
+
+	printf("H713 i2c: %d device(s) responded\n", found);
+
+	return CMD_RET_SUCCESS;
+}
+
+U_BOOT_CMD(h713_i2c, 4, 0, do_h713_i2c,
+	   "bit-banged I2C scan on a pair of PH pins",
+	   "scan            - scan using PH2/PH3 (vendor twi1 pins)\n"
+	   "h713_i2c scan <scl> <sda> - scan using the given PH pin numbers\n"
+	   "h713_i2c read <addr> <count> - read bytes, no register write"
 );
