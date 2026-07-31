@@ -69,6 +69,17 @@
 #define H713_MIPS_SHMEM_MAGIC2_OFF	0x000075b8UL
 #define H713_MIPS_SHMEM_ARM_READY	(BIT(0) | BIT(2))
 #define H713_MIPS_SHMEM_MIPS_READY	BIT(0)
+#define H713_MIPS_SHMEM_MIPS_APP_READY	BIT(2)
+#define H713_MIPS_SHMEM_LOCK_COUNT	12
+#define H713_MIPS_SHMEM_LOCK_SIZE	12
+#define H713_MIPS_SHMEM_LOCK_FREE	2
+#define H713_MIPS_SHMEM_LOCK_THREAD_NONE	0x000000ff
+#define H713_MIPS_SHMEM_CALL_VERSION_OFF	0x000075c0UL
+#define H713_MIPS_SHMEM_CALL_COUNT_OFF	0x000075c4UL
+#define H713_MIPS_SHMEM_CALL_TABLE_OFF	0x000075c8UL
+#define H713_MIPS_SHMEM_CALL_ENTRY_COUNT	1224
+#define H713_MIPS_SHMEM_CALL_ENTRY_SIZE	96
+#define H713_MIPS_SHMEM_CALL_NEXT_OFF	92
 /*
  * One second was chosen when the firmware stalled in its first few hundred
  * milliseconds. With the config and TSE artifacts staged it now runs its whole
@@ -77,8 +88,25 @@
  */
 #define H713_MIPS_READY_TIMEOUT_US	10000000
 #define H713_MIPS_TRACE_TIMEOUT_US	10000000
+#define H713_MIPS_DISP_READY_TIMEOUT_US	4000000
 #define H713_MIPS_TRACE_OFF		0x00040000UL
-#define H713_MIPS_TRACE_COUNT		151
+#define H713_MIPS_TRACE_MARKER_COUNT	88
+#define H713_MIPS_TRACE_DBG_ADDR	88
+#define H713_MIPS_TRACE_DBG_SIZE	89
+#define H713_MIPS_TRACE_REG_COUNT	90
+#define H713_MIPS_TRACE_REG_OBJECT	91
+#define H713_MIPS_TRACE_REG_CALLBACK	92
+#define H713_MIPS_TRACE_COUNT		93
+#define H713_MIPS_STABILITY_SECONDS	60
+#define H713_MIPS_DIAG_OFF		0x00041000UL
+#define H713_MIPS_DIAG_HEARTBEAT_OFF	(H713_MIPS_DIAG_OFF + 0x00)
+#define H713_MIPS_DIAG_EXCEPTION_OFF	(H713_MIPS_DIAG_OFF + 0x04)
+#define H713_MIPS_DIAG_STATUS_OFF	(H713_MIPS_DIAG_OFF + 0x08)
+#define H713_MIPS_DIAG_CAUSE_OFF	(H713_MIPS_DIAG_OFF + 0x0c)
+#define H713_MIPS_DIAG_EPC_OFF		(H713_MIPS_DIAG_OFF + 0x10)
+#define H713_MIPS_DIAG_BADVADDR_OFF	(H713_MIPS_DIAG_OFF + 0x14)
+#define H713_MIPS_DIAG_EXCEPTION_GENERAL	1
+#define H713_MIPS_DIAG_EXCEPTION_CACHE	2
 
 /*
  * Display-fabric prerequisites surrounding MIPS release. Several blocks wedge
@@ -127,6 +155,63 @@ struct h713_mips_patch {
 	u32 replacement;
 };
 
+/*
+ * Gate-2 stability instrumentation for the authenticated 4380f1b3... image.
+ *
+ * The timer trampoline preserves the displaced tick increment and store, then
+ * publishes the new ThreadX tick through the MIPS uncached 0xae34xxxx alias.
+ * The two exception trampolines record CP0 state before entering the stock
+ * fatal handlers. EBase is set to 0x8b101000 at raw +0xb11ac..+0xb11b4, so
+ * raw +0x1100 and +0x1180 are the live cache/general exception vectors.
+ */
+static const struct h713_mips_patch h713_mips_stability_patches[] = {
+	/* Timer cave at raw +0x300. */
+	{ 0x4b100300, 0x00000000, 0x26730001 }, /* addiu s3, s3, 1 */
+	{ 0x4b100304, 0x00000000, 0x3c1aae34 }, /* lui k0, 0xae34 */
+	{ 0x4b100308, 0x00000000, 0xaf531000 }, /* sw s3, 0x1000(k0) */
+	{ 0x4b10030c, 0x00000000, 0x0ac412e1 }, /* j 0x8b104b84 */
+	{ 0x4b100310, 0x00000000, 0xac532cc0 }, /* sw s3, 0x2cc0(v0) */
+	{ 0x4b104b7c, 0x26730001, 0x0ac400c0 }, /* j 0x8b100300 */
+
+	/* General-exception cave at raw +0x320; type 1 is stored last. */
+	{ 0x4b100320, 0x00000000, 0x3c1aae34 }, /* lui k0, 0xae34 */
+	{ 0x4b100324, 0x00000000, 0x401b6000 }, /* mfc0 k1, Status */
+	{ 0x4b100328, 0x00000000, 0xaf5b1008 },
+	{ 0x4b10032c, 0x00000000, 0x401b6800 }, /* mfc0 k1, Cause */
+	{ 0x4b100330, 0x00000000, 0xaf5b100c },
+	{ 0x4b100334, 0x00000000, 0x401b7000 }, /* mfc0 k1, EPC */
+	{ 0x4b100338, 0x00000000, 0xaf5b1010 },
+	{ 0x4b10033c, 0x00000000, 0x401b4000 }, /* mfc0 k1, BadVAddr */
+	{ 0x4b100340, 0x00000000, 0xaf5b1014 },
+	{ 0x4b100344, 0x00000000, 0x341b0001 },
+	{ 0x4b100348, 0x00000000, 0xaf5b1004 },
+	{ 0x4b10034c, 0x00000000, 0x0ac56f4a }, /* j 0x8b15bd28 */
+	{ 0x4b100350, 0x00000000, 0x00000000 },
+	{ 0x4b101180, 0x0ac56f4a, 0x0ac400c8 }, /* j 0x8b100320 */
+
+	/* Cache-error cave at raw +0x360; EPC field receives ErrorEPC. */
+	{ 0x4b100360, 0x00000000, 0x3c1aae34 }, /* lui k0, 0xae34 */
+	{ 0x4b100364, 0x00000000, 0x401b6000 }, /* mfc0 k1, Status */
+	{ 0x4b100368, 0x00000000, 0xaf5b1008 },
+	{ 0x4b10036c, 0x00000000, 0x401b6800 }, /* mfc0 k1, Cause */
+	{ 0x4b100370, 0x00000000, 0xaf5b100c },
+	{ 0x4b100374, 0x00000000, 0x401bf000 }, /* mfc0 k1, ErrorEPC */
+	{ 0x4b100378, 0x00000000, 0xaf5b1010 },
+	{ 0x4b10037c, 0x00000000, 0x401b4000 }, /* mfc0 k1, BadVAddr */
+	{ 0x4b100380, 0x00000000, 0xaf5b1014 },
+	{ 0x4b100384, 0x00000000, 0x341b0002 },
+	{ 0x4b100388, 0x00000000, 0xaf5b1004 },
+	{ 0x4b10038c, 0x00000000, 0x0ac56f79 }, /* j 0x8b15bde4 */
+	{ 0x4b100390, 0x00000000, 0x00000000 },
+	{ 0x4b101100, 0x0ac56f79, 0x0ac400d8 }, /* j 0x8b100360 */
+};
+
+/*
+ * Legacy trace for display.bin 16c74a28..., retained only as a reverse-
+ * engineering record. The board's 4380f1b3... image moved the instrumented
+ * functions, so none of these sites may be installed in executable DRAM.
+ */
+#if 0
 /*
  * Volatile display.bin trace used only by "probe-trace". The pristine image is
  * authenticated before these words are installed in DRAM. Three tiny caves
@@ -1018,6 +1103,712 @@ static const struct h713_mips_patch h713_mips_trace_patches[] = {
 	{ 0x4b1002fc, 0x00000000, 0x8fb00040 },
 	{ 0x4b128090, 0x8fb00040, 0x0ac400bb },
 };
+#endif
+
+/*
+ * Minimal CPU_COMM readiness trace rebuilt against display.bin 4380f1b3....
+ *
+ * Each guarded call redirects through a zero-filled code cave, stores its
+ * marker through the firmware's uncached 0xae340000 alias, then either resumes
+ * after a disposable log call (markers 1 and 2) or tail-calls the original
+ * function. Markers 1-9 cover the chain needed for MIPS READY:
+ *
+ *  1. share address absent (polling path)
+ *  2. share address and size accepted
+ *  3. ARM CPU_READY accepted
+ *  4. CPU_COMM hardware spinlock 0 acquired
+ *  5. slave-side CPU_COMM initialization entered
+ *  6. ThreadX application entry reached
+ *  7. CPU_COMM initialization entered
+ *  8. application byte-pool creation succeeded
+ *  9. share-register reader called
+ *
+ * Markers 10-16 cover reset handoff through the ThreadX scheduler:
+ *
+ * 10. reset code handed off to the C runtime
+ * 11-14. successive pre-application initialization calls entered
+ * 15. application/thread construction entered
+ * 16. ThreadX scheduler entry called
+ *
+ * Markers 17-26 cover every direct call in application/thread construction;
+ * marker 26 is the ThreadX thread-creation call whose entry argument is the
+ * application function traced by marker 6.
+ * Marker 21's extended cave also records the sys:dbg_buf address and size
+ * passed to memset in trace slots 88 and 89.
+ *
+ * Markers 27-56 cover every call inside marker 25's early-system-
+ * initialization function at 0x8b15340c.
+ *
+ * Markers 57-61 cover all five calls in marker 38's tse_init function at
+ * 0x8b110478: the global enable write, InitTFDMemory virtual call,
+ * tse_init_data, and its two fatal-log paths.
+ *
+ * Markers 62-66 cover setCPUReady(), its spinlock acquire/unlock calls, and
+ * its return to InitCommMem. Markers 67-71 cover the five calls after
+ * InitCommMem returns and before setCPUAppReady(). Marker 72 enters the first
+ * registration group. Markers 73-77 trace its CPU_COMM request through call-
+ * table insertion, result lookup, and the insertion spinlock. Markers 78-82
+ * retain later registration groups and final calls in hal_adapter_init().
+ * Its repeated registration helper records a call count plus its latest
+ * object/callback pointers in trace slots 90-92. Markers 84-86 cover the
+ * helper's formatting, request construction, and CPU_COMM request call.
+ * Marker 87 covers the final hal-adapter registration lock; marker 88 covers
+ * setCPUAppReady() entry.
+ */
+static const struct h713_mips_patch h713_mips_trace_patches[] = {
+	/* Marker 1: share address absent; skip its log call and resume. */
+	{ 0x4b1002c4, 0x00000000, 0x3c1aae34 },
+	{ 0x4b1002c8, 0x00000000, 0x341b0001 },
+	{ 0x4b1002cc, 0x00000000, 0xaf5b0000 },
+	{ 0x4b1002d0, 0x00000000, 0x0ac48e83 },
+	{ 0x4b1002d4, 0x00000000, 0x00000000 },
+	{ 0x4b123a04, 0x0ec54252, 0x0ac400b1 },
+
+	/* Marker 2: share registers accepted; skip its log call and resume. */
+	{ 0x4b100500, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100504, 0x00000000, 0x341b0002 },
+	{ 0x4b100508, 0x00000000, 0xaf5b0004 },
+	{ 0x4b10050c, 0x00000000, 0x0ac48ea4 },
+	{ 0x4b100510, 0x00000000, 0x00000000 },
+	{ 0x4b123a88, 0x0ec54252, 0x0ac40140 },
+
+	/* Marker 3: ARM CPU_READY accepted, then preserve the original log. */
+	{ 0x4b1005d0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b1005d4, 0x00000000, 0x341b0003 },
+	{ 0x4b1005d8, 0x00000000, 0xaf5b0008 },
+	{ 0x4b1005dc, 0x00000000, 0x0ac54252 },
+	{ 0x4b1005e0, 0x00000000, 0x00000000 },
+	{ 0x4b123ad4, 0x0ec54252, 0x0ec40174 },
+
+	/* Marker 4: hardware spinlock acquired, then preserve the log. */
+	{ 0x4b1005f0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b1005f4, 0x00000000, 0x341b0004 },
+	{ 0x4b1005f8, 0x00000000, 0xaf5b000c },
+	{ 0x4b1005fc, 0x00000000, 0x0ac54252 },
+	{ 0x4b100600, 0x00000000, 0x00000000 },
+	{ 0x4b11b1e0, 0x0ec54252, 0x0ec4017c },
+
+	/* Marker 5: enter slave-side CPU_COMM initialization. */
+	{ 0x4b100520, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100524, 0x00000000, 0x341b0005 },
+	{ 0x4b100528, 0x00000000, 0xaf5b0010 },
+	{ 0x4b10052c, 0x00000000, 0x0ac466ed },
+	{ 0x4b100530, 0x00000000, 0x00000000 },
+	{ 0x4b11b34c, 0x0ec466ed, 0x0ec40148 },
+
+	/* Marker 6: ThreadX application entry reached. */
+	{ 0x4b100540, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100544, 0x00000000, 0x341b0006 },
+	{ 0x4b100548, 0x00000000, 0xaf5b0014 },
+	{ 0x4b10054c, 0x00000000, 0x0ac5719d },
+	{ 0x4b100550, 0x00000000, 0x00000000 },
+	{ 0x4b152e84, 0x0ec5719d, 0x0ec40150 },
+
+	/* Marker 7: enter CPU_COMM initialization. */
+	{ 0x4b100560, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100564, 0x00000000, 0x341b0007 },
+	{ 0x4b100568, 0x00000000, 0xaf5b0018 },
+	{ 0x4b10056c, 0x00000000, 0x0ac490da },
+	{ 0x4b100570, 0x00000000, 0x00000000 },
+	{ 0x4b152e8c, 0x0ec490da, 0x0ec40158 },
+
+	/* Marker 8: CPU_COMM byte-pool creation succeeded. */
+	{ 0x4b100590, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100594, 0x00000000, 0x341b0008 },
+	{ 0x4b100598, 0x00000000, 0xaf5b001c },
+	{ 0x4b10059c, 0x00000000, 0x0ac54252 },
+	{ 0x4b1005a0, 0x00000000, 0x00000000 },
+	{ 0x4b12443c, 0x0ec54252, 0x0ec40164 },
+
+	/* Marker 9: enter the share-register reader. */
+	{ 0x4b1005b0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b1005b4, 0x00000000, 0x341b0009 },
+	{ 0x4b1005b8, 0x00000000, 0xaf5b0020 },
+	{ 0x4b1005bc, 0x00000000, 0x0ac48e55 },
+	{ 0x4b1005c0, 0x00000000, 0x00000000 },
+	{ 0x4b124448, 0x0ec48e55, 0x0ec4016c },
+
+	/* Marker 10: reset code hands off to the C runtime at 0x8b101f04. */
+	{ 0x4b100610, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100614, 0x00000000, 0x341b000a },
+	{ 0x4b100618, 0x00000000, 0xaf5b0024 },
+	{ 0x4b10061c, 0x00000000, 0x0ac407c1 },
+	{ 0x4b100620, 0x00000000, 0x00000000 },
+	{ 0x4b1b1220, 0x0100f809, 0x0ec40184 },
+
+	/* Markers 11-16: every C-runtime call through scheduler entry. */
+	{ 0x4b100630, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100634, 0x00000000, 0x341b000b },
+	{ 0x4b100638, 0x00000000, 0xaf5b0028 },
+	{ 0x4b10063c, 0x00000000, 0x0ac419a4 },
+	{ 0x4b100640, 0x00000000, 0x00000000 },
+	{ 0x4b101f1c, 0x0ec419a4, 0x0ec4018c },
+
+	{ 0x4b100650, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100654, 0x00000000, 0x341b000c },
+	{ 0x4b100658, 0x00000000, 0xaf5b002c },
+	{ 0x4b10065c, 0x00000000, 0x0ac40b86 },
+	{ 0x4b100660, 0x00000000, 0x00000000 },
+	{ 0x4b101f24, 0x0ec40b86, 0x0ec40194 },
+
+	{ 0x4b100670, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100674, 0x00000000, 0x341b000d },
+	{ 0x4b100678, 0x00000000, 0xaf5b0030 },
+	{ 0x4b10067c, 0x00000000, 0x0ac5203a },
+	{ 0x4b100680, 0x00000000, 0x00000000 },
+	{ 0x4b101f2c, 0x0ec5203a, 0x0ec4019c },
+
+	{ 0x4b100690, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100694, 0x00000000, 0x341b000e },
+	{ 0x4b100698, 0x00000000, 0xaf5b0034 },
+	{ 0x4b10069c, 0x00000000, 0x0ac612c9 },
+	{ 0x4b1006a0, 0x00000000, 0x00000000 },
+	{ 0x4b101f34, 0x0ec612c9, 0x0ec401a4 },
+
+	{ 0x4b1006b0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b1006b4, 0x00000000, 0x341b000f },
+	{ 0x4b1006b8, 0x00000000, 0xaf5b0038 },
+	{ 0x4b1006bc, 0x00000000, 0x0ac54d6f },
+	{ 0x4b1006c0, 0x00000000, 0x00000000 },
+	{ 0x4b101f3c, 0x0ec54d6f, 0x0ec401ac },
+
+	{ 0x4b1006d0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b1006d4, 0x00000000, 0x341b0010 },
+	{ 0x4b1006d8, 0x00000000, 0xaf5b003c },
+	{ 0x4b1006dc, 0x00000000, 0x0ac415e4 },
+	{ 0x4b1006e0, 0x00000000, 0x00000000 },
+	{ 0x4b101f4c, 0x0ec415e4, 0x0ec401b4 },
+
+	/* Markers 17-26: each application/thread construction call. */
+	{ 0x4b1006f0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b1006f4, 0x00000000, 0x341b0011 },
+	{ 0x4b1006f8, 0x00000000, 0xaf5b0040 },
+	{ 0x4b1006fc, 0x00000000, 0x0ac674f1 },
+	{ 0x4b100700, 0x00000000, 0x00000000 },
+	{ 0x4b1535c4, 0x0ec674f1, 0x0ec401bc },
+
+	{ 0x4b100710, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100714, 0x00000000, 0x341b0012 },
+	{ 0x4b100718, 0x00000000, 0xaf5b0044 },
+	{ 0x4b10071c, 0x00000000, 0x0ac43a27 },
+	{ 0x4b100720, 0x00000000, 0x00000000 },
+	{ 0x4b1535d0, 0x0ec43a27, 0x0ec401c4 },
+
+	{ 0x4b100730, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100734, 0x00000000, 0x341b0013 },
+	{ 0x4b100738, 0x00000000, 0xaf5b0048 },
+	{ 0x4b10073c, 0x00000000, 0x0ac4354e },
+	{ 0x4b100740, 0x00000000, 0x00000000 },
+	{ 0x4b1535d8, 0x0ec4354e, 0x0ec401cc },
+
+	{ 0x4b100750, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100754, 0x00000000, 0x341b0014 },
+	{ 0x4b100758, 0x00000000, 0xaf5b004c },
+	{ 0x4b10075c, 0x00000000, 0x0ac4355c },
+	{ 0x4b100760, 0x00000000, 0x00000000 },
+	{ 0x4b1535e0, 0x0ec4355c, 0x0ec401d4 },
+
+	{ 0x4b100770, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100774, 0x00000000, 0x341b0015 },
+	{ 0x4b100778, 0x00000000, 0xaf5b0050 },
+	{ 0x4b10077c, 0x00000000, 0xaf440160 },
+	{ 0x4b100780, 0x00000000, 0xaf460164 },
+	{ 0x4b100784, 0x00000000, 0x0ac568d0 },
+	{ 0x4b100788, 0x00000000, 0x00000000 },
+	{ 0x4b1535f0, 0x0ec568d0, 0x0ec401dc },
+
+	{ 0x4b100790, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100794, 0x00000000, 0x341b0016 },
+	{ 0x4b100798, 0x00000000, 0xaf5b0054 },
+	{ 0x4b10079c, 0x00000000, 0x0ac55058 },
+	{ 0x4b1007a0, 0x00000000, 0x00000000 },
+	{ 0x4b1535f8, 0x0ec55058, 0x0ec401e4 },
+
+	{ 0x4b1007b0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b1007b4, 0x00000000, 0x341b0017 },
+	{ 0x4b1007b8, 0x00000000, 0xaf5b0058 },
+	{ 0x4b1007bc, 0x00000000, 0x0ac54643 },
+	{ 0x4b1007c0, 0x00000000, 0x00000000 },
+	{ 0x4b153600, 0x0ec54643, 0x0ec401ec },
+
+	{ 0x4b1007d0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b1007d4, 0x00000000, 0x341b0018 },
+	{ 0x4b1007d8, 0x00000000, 0xaf5b005c },
+	{ 0x4b1007dc, 0x00000000, 0x0ac60d31 },
+	{ 0x4b1007e0, 0x00000000, 0x00000000 },
+	{ 0x4b153608, 0x0ec60d31, 0x0ec401f4 },
+
+	{ 0x4b1007f0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b1007f4, 0x00000000, 0x341b0019 },
+	{ 0x4b1007f8, 0x00000000, 0xaf5b0060 },
+	{ 0x4b1007fc, 0x00000000, 0x0ac54d03 },
+	{ 0x4b100800, 0x00000000, 0x00000000 },
+	{ 0x4b153610, 0x0ec54d03, 0x0ec401fc },
+
+	{ 0x4b100810, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100814, 0x00000000, 0x341b001a },
+	{ 0x4b100818, 0x00000000, 0xaf5b0064 },
+	{ 0x4b10081c, 0x00000000, 0x0ac57225 },
+	{ 0x4b100820, 0x00000000, 0x00000000 },
+	{ 0x4b153634, 0x0ec57225, 0x0ec40204 },
+
+	/* Markers 27-56: every call inside 0x8b15340c. */
+	{ 0x4b100830, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100834, 0x00000000, 0x341b001b },
+	{ 0x4b100838, 0x00000000, 0xaf5b0068 },
+	{ 0x4b10083c, 0x00000000, 0x0ac6017c },
+	{ 0x4b100840, 0x00000000, 0x00000000 },
+	{ 0x4b153444, 0x0ec6017c, 0x0ec4020c },
+
+	{ 0x4b100850, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100854, 0x00000000, 0x341b001c },
+	{ 0x4b100858, 0x00000000, 0xaf5b006c },
+	{ 0x4b10085c, 0x00000000, 0x0ac4354b },
+	{ 0x4b100860, 0x00000000, 0x00000000 },
+	{ 0x4b153454, 0x0ec4354b, 0x0ec40214 },
+
+	{ 0x4b100870, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100874, 0x00000000, 0x341b001d },
+	{ 0x4b100878, 0x00000000, 0xaf5b0070 },
+	{ 0x4b10087c, 0x00000000, 0x00400008 },
+	{ 0x4b100880, 0x00000000, 0x00000000 },
+	{ 0x4b153470, 0x0040f809, 0x0ec4021c },
+
+	{ 0x4b100890, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100894, 0x00000000, 0x341b001e },
+	{ 0x4b100898, 0x00000000, 0xaf5b0074 },
+	{ 0x4b10089c, 0x00000000, 0x0ac4354b },
+	{ 0x4b1008a0, 0x00000000, 0x00000000 },
+	{ 0x4b153478, 0x0ec4354b, 0x0ec40224 },
+
+	{ 0x4b1008b0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b1008b4, 0x00000000, 0x341b001f },
+	{ 0x4b1008b8, 0x00000000, 0xaf5b0078 },
+	{ 0x4b1008bc, 0x00000000, 0x00400008 },
+	{ 0x4b1008c0, 0x00000000, 0x00000000 },
+	{ 0x4b153494, 0x0040f809, 0x0ec4022c },
+
+	{ 0x4b1008d0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b1008d4, 0x00000000, 0x341b0020 },
+	{ 0x4b1008d8, 0x00000000, 0xaf5b007c },
+	{ 0x4b1008dc, 0x00000000, 0x0ac6018e },
+	{ 0x4b1008e0, 0x00000000, 0x00000000 },
+	{ 0x4b1534a4, 0x0ec6018e, 0x0ec40234 },
+
+	{ 0x4b1008f0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b1008f4, 0x00000000, 0x341b0021 },
+	{ 0x4b1008f8, 0x00000000, 0xaf5b0080 },
+	{ 0x4b1008fc, 0x00000000, 0x0ac6018e },
+	{ 0x4b100900, 0x00000000, 0x00000000 },
+	{ 0x4b1534b4, 0x0ec6018e, 0x0ec4023c },
+
+	{ 0x4b100910, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100914, 0x00000000, 0x341b0022 },
+	{ 0x4b100918, 0x00000000, 0xaf5b0084 },
+	{ 0x4b10091c, 0x00000000, 0x0ac6282e },
+	{ 0x4b100920, 0x00000000, 0x00000000 },
+	{ 0x4b1534c0, 0x0ec6282e, 0x0ec40244 },
+
+	{ 0x4b100930, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100934, 0x00000000, 0x341b0023 },
+	{ 0x4b100938, 0x00000000, 0xaf5b0088 },
+	{ 0x4b10093c, 0x00000000, 0x0ac6257d },
+	{ 0x4b100940, 0x00000000, 0x00000000 },
+	{ 0x4b1534c8, 0x0ec6257d, 0x0ec4024c },
+
+	{ 0x4b100950, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100954, 0x00000000, 0x341b0024 },
+	{ 0x4b100958, 0x00000000, 0xaf5b008c },
+	{ 0x4b10095c, 0x00000000, 0x0ac4354b },
+	{ 0x4b100960, 0x00000000, 0x00000000 },
+	{ 0x4b1534d0, 0x0ec4354b, 0x0ec40254 },
+
+	{ 0x4b100970, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100974, 0x00000000, 0x341b0025 },
+	{ 0x4b100978, 0x00000000, 0xaf5b0090 },
+	{ 0x4b10097c, 0x00000000, 0x00400008 },
+	{ 0x4b100980, 0x00000000, 0x00000000 },
+	{ 0x4b1534ec, 0x0040f809, 0x0ec4025c },
+
+	{ 0x4b100990, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100994, 0x00000000, 0x341b0026 },
+	{ 0x4b100998, 0x00000000, 0xaf5b0094 },
+	{ 0x4b10099c, 0x00000000, 0x0ac4411e },
+	{ 0x4b1009a0, 0x00000000, 0x00000000 },
+	{ 0x4b1534fc, 0x0ec4411e, 0x0ec40264 },
+
+	{ 0x4b1009b0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b1009b4, 0x00000000, 0x341b0027 },
+	{ 0x4b1009b8, 0x00000000, 0xaf5b0098 },
+	{ 0x4b1009bc, 0x00000000, 0x0ac54ccf },
+	{ 0x4b1009c0, 0x00000000, 0x00000000 },
+	{ 0x4b153504, 0x0ec54ccf, 0x0ec4026c },
+
+	{ 0x4b1009d0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b1009d4, 0x00000000, 0x341b0028 },
+	{ 0x4b1009d8, 0x00000000, 0xaf5b009c },
+	{ 0x4b1009dc, 0x00000000, 0x0ac627a9 },
+	{ 0x4b1009e0, 0x00000000, 0x00000000 },
+	{ 0x4b15350c, 0x0ec627a9, 0x0ec40274 },
+
+	{ 0x4b1009f0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b1009f4, 0x00000000, 0x341b0029 },
+	{ 0x4b1009f8, 0x00000000, 0xaf5b00a0 },
+	{ 0x4b1009fc, 0x00000000, 0x00400008 },
+	{ 0x4b100a00, 0x00000000, 0x00000000 },
+	{ 0x4b153520, 0x0040f809, 0x0ec4027c },
+
+	{ 0x4b100a10, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100a14, 0x00000000, 0x341b002a },
+	{ 0x4b100a18, 0x00000000, 0xaf5b00a4 },
+	{ 0x4b100a1c, 0x00000000, 0x0ac69eef },
+	{ 0x4b100a20, 0x00000000, 0x00000000 },
+	{ 0x4b153528, 0x0ec69eef, 0x0ec40284 },
+
+	{ 0x4b100a30, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100a34, 0x00000000, 0x341b002b },
+	{ 0x4b100a38, 0x00000000, 0xaf5b00a8 },
+	{ 0x4b100a3c, 0x00000000, 0x0ac561be },
+	{ 0x4b100a40, 0x00000000, 0x00000000 },
+	{ 0x4b153530, 0x0ec561be, 0x0ec4028c },
+
+	{ 0x4b100a50, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100a54, 0x00000000, 0x341b002c },
+	{ 0x4b100a58, 0x00000000, 0xaf5b00ac },
+	{ 0x4b100a5c, 0x00000000, 0x0ac4a11e },
+	{ 0x4b100a60, 0x00000000, 0x00000000 },
+	{ 0x4b153538, 0x0ec4a11e, 0x0ec40294 },
+
+	{ 0x4b100a70, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100a74, 0x00000000, 0x341b002d },
+	{ 0x4b100a78, 0x00000000, 0xaf5b00b0 },
+	{ 0x4b100a7c, 0x00000000, 0x0ac679c4 },
+	{ 0x4b100a80, 0x00000000, 0x00000000 },
+	{ 0x4b153540, 0x0ec679c4, 0x0ec4029c },
+
+	{ 0x4b100a90, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100a94, 0x00000000, 0x341b002e },
+	{ 0x4b100a98, 0x00000000, 0xaf5b00b4 },
+	{ 0x4b100a9c, 0x00000000, 0x0ac57387 },
+	{ 0x4b100aa0, 0x00000000, 0x00000000 },
+	{ 0x4b153548, 0x0ec57387, 0x0ec402a4 },
+
+	{ 0x4b100ab0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100ab4, 0x00000000, 0x341b002f },
+	{ 0x4b100ab8, 0x00000000, 0xaf5b00b8 },
+	{ 0x4b100abc, 0x00000000, 0x0ac5ece3 },
+	{ 0x4b100ac0, 0x00000000, 0x00000000 },
+	{ 0x4b153550, 0x0ec5ece3, 0x0ec402ac },
+
+	{ 0x4b100ad0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100ad4, 0x00000000, 0x341b0030 },
+	{ 0x4b100ad8, 0x00000000, 0xaf5b00bc },
+	{ 0x4b100adc, 0x00000000, 0x0ac610af },
+	{ 0x4b100ae0, 0x00000000, 0x00000000 },
+	{ 0x4b153558, 0x0ec610af, 0x0ec402b4 },
+
+	{ 0x4b100af0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100af4, 0x00000000, 0x341b0031 },
+	{ 0x4b100af8, 0x00000000, 0xaf5b00c0 },
+	{ 0x4b100afc, 0x00000000, 0x0ac6123b },
+	{ 0x4b100b00, 0x00000000, 0x00000000 },
+	{ 0x4b153560, 0x0ec6123b, 0x0ec402bc },
+
+	{ 0x4b100b10, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100b14, 0x00000000, 0x341b0032 },
+	{ 0x4b100b18, 0x00000000, 0xaf5b00c4 },
+	{ 0x4b100b1c, 0x00000000, 0x0ac5f311 },
+	{ 0x4b100b20, 0x00000000, 0x00000000 },
+	{ 0x4b153568, 0x0ec5f311, 0x0ec402c4 },
+
+	{ 0x4b100b30, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100b34, 0x00000000, 0x341b0033 },
+	{ 0x4b100b38, 0x00000000, 0xaf5b00c8 },
+	{ 0x4b100b3c, 0x00000000, 0x0ac678c6 },
+	{ 0x4b100b40, 0x00000000, 0x00000000 },
+	{ 0x4b153570, 0x0ec678c6, 0x0ec402cc },
+
+	{ 0x4b100b50, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100b54, 0x00000000, 0x341b0034 },
+	{ 0x4b100b58, 0x00000000, 0xaf5b00cc },
+	{ 0x4b100b5c, 0x00000000, 0x0ac6b160 },
+	{ 0x4b100b60, 0x00000000, 0x00000000 },
+	{ 0x4b153578, 0x0ec6b160, 0x0ec402d4 },
+
+	{ 0x4b100b70, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100b74, 0x00000000, 0x341b0035 },
+	{ 0x4b100b78, 0x00000000, 0xaf5b00d0 },
+	{ 0x4b100b7c, 0x00000000, 0x0ac54fe5 },
+	{ 0x4b100b80, 0x00000000, 0x00000000 },
+	{ 0x4b153580, 0x0ec54fe5, 0x0ec402dc },
+
+	{ 0x4b100b90, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100b94, 0x00000000, 0x341b0036 },
+	{ 0x4b100b98, 0x00000000, 0xaf5b00d4 },
+	{ 0x4b100b9c, 0x00000000, 0x0ac41bdf },
+	{ 0x4b100ba0, 0x00000000, 0x00000000 },
+	{ 0x4b153590, 0x0ec41bdf, 0x0ec402e4 },
+
+	{ 0x4b100bb0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100bb4, 0x00000000, 0x341b0037 },
+	{ 0x4b100bb8, 0x00000000, 0xaf5b00d8 },
+	{ 0x4b100bbc, 0x00000000, 0x0ac41adf },
+	{ 0x4b100bc0, 0x00000000, 0x00000000 },
+	{ 0x4b153598, 0x0ec41adf, 0x0ec402ec },
+
+	{ 0x4b100bd0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100bd4, 0x00000000, 0x341b0038 },
+	{ 0x4b100bd8, 0x00000000, 0xaf5b00dc },
+	{ 0x4b100bdc, 0x00000000, 0x0ac423ed },
+	{ 0x4b100be0, 0x00000000, 0x00000000 },
+	{ 0x4b1535a0, 0x0ec423ed, 0x0ec402f4 },
+
+	/* Markers 57-61: every call inside tse_init at 0x8b110478. */
+	{ 0x4b100bf0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100bf4, 0x00000000, 0x341b0039 },
+	{ 0x4b100bf8, 0x00000000, 0xaf5b00e0 },
+	{ 0x4b100bfc, 0x00000000, 0x0ac627c9 },
+	{ 0x4b100c00, 0x00000000, 0x00000000 },
+	{ 0x4b1104a0, 0x0ec627c9, 0x0ec402fc },
+
+	{ 0x4b100c10, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100c14, 0x00000000, 0x341b003a },
+	{ 0x4b100c18, 0x00000000, 0xaf5b00e4 },
+	{ 0x4b100c1c, 0x00000000, 0x00400008 },
+	{ 0x4b100c20, 0x00000000, 0x00000000 },
+	{ 0x4b1104b8, 0x0040f809, 0x0ec40304 },
+
+	{ 0x4b100c30, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100c34, 0x00000000, 0x341b003b },
+	{ 0x4b100c38, 0x00000000, 0xaf5b00e8 },
+	{ 0x4b100c3c, 0x00000000, 0x0ac43aa4 },
+	{ 0x4b100c40, 0x00000000, 0x00000000 },
+	{ 0x4b1104c8, 0x0ec43aa4, 0x0ec4030c },
+
+	{ 0x4b100c50, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100c54, 0x00000000, 0x341b003c },
+	{ 0x4b100c58, 0x00000000, 0xaf5b00ec },
+	{ 0x4b100c5c, 0x00000000, 0x0ac54252 },
+	{ 0x4b100c60, 0x00000000, 0x00000000 },
+	{ 0x4b110518, 0x0ec54252, 0x0ec40314 },
+
+	{ 0x4b100c70, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100c74, 0x00000000, 0x341b003d },
+	{ 0x4b100c78, 0x00000000, 0xaf5b00f0 },
+	{ 0x4b100c7c, 0x00000000, 0x0ac54252 },
+	{ 0x4b100c80, 0x00000000, 0x00000000 },
+	{ 0x4b110568, 0x0ec54252, 0x0ec4031c },
+
+	/* Marker 62: enter setCPUReady(getCurCPUID()). */
+	{ 0x4b100c90, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100c94, 0x00000000, 0x341b003e },
+	{ 0x4b100c98, 0x00000000, 0xaf5b00f4 },
+	{ 0x4b100c9c, 0x00000000, 0x0ac468f7 },
+	{ 0x4b100ca0, 0x00000000, 0x00000000 },
+	{ 0x4b11b364, 0x0ec468f7, 0x0ec40324 },
+
+	/* Marker 63: setCPUReady enters comm_SpinLock(3). */
+	{ 0x4b100cb0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100cb4, 0x00000000, 0x341b003f },
+	{ 0x4b100cb8, 0x00000000, 0xaf5b00f8 },
+	{ 0x4b100cbc, 0x00000000, 0x0ac496f1 },
+	{ 0x4b100cc0, 0x00000000, 0x00000000 },
+	{ 0x4b11a56c, 0x0ec496f1, 0x0ec4032c },
+
+	/* Marker 64: READY stores completed; enter comm_SpinUnlock(3). */
+	{ 0x4b100cd0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100cd4, 0x00000000, 0x341b0040 },
+	{ 0x4b100cd8, 0x00000000, 0xaf5b00fc },
+	{ 0x4b100cdc, 0x00000000, 0x0ac496fa },
+	{ 0x4b100ce0, 0x00000000, 0x00000000 },
+	{ 0x4b11a5a4, 0x0ec496fa, 0x0ec40334 },
+
+	/* Marker 65: unlock returned; enter setCPUReady's final log call. */
+	{ 0x4b100cf0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100cf4, 0x00000000, 0x341b0041 },
+	{ 0x4b100cf8, 0x00000000, 0xaf5b0100 },
+	{ 0x4b100cfc, 0x00000000, 0x0ac54252 },
+	{ 0x4b100d00, 0x00000000, 0x00000000 },
+	{ 0x4b11a5cc, 0x0ec54252, 0x0ec4033c },
+
+	/* Marker 66: setCPUReady returned to InitCommMem. */
+	{ 0x4b100d10, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100d14, 0x00000000, 0x341b0042 },
+	{ 0x4b100d18, 0x00000000, 0xaf5b0104 },
+	{ 0x4b100d1c, 0x00000000, 0x0ac49318 },
+	{ 0x4b100d20, 0x00000000, 0x00000000 },
+	{ 0x4b11b36c, 0x0ec49318, 0x0ec40344 },
+
+	/* Markers 67-71: calls after InitCommMem and before app-ready. */
+	{ 0x4b100d30, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100d34, 0x00000000, 0x341b0043 },
+	{ 0x4b100d38, 0x00000000, 0xaf5b0108 },
+	{ 0x4b100d3c, 0x00000000, 0x0ac5719d },
+	{ 0x4b100d40, 0x00000000, 0x00000000 },
+	{ 0x4b152ec8, 0x0ec5719d, 0x0ec4034c },
+
+	{ 0x4b100d50, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100d54, 0x00000000, 0x341b0044 },
+	{ 0x4b100d58, 0x00000000, 0xaf5b010c },
+	{ 0x4b100d5c, 0x00000000, 0x0ac42b6e },
+	{ 0x4b100d60, 0x00000000, 0x00000000 },
+	{ 0x4b152ed0, 0x0ec42b6e, 0x0ec40354 },
+
+	{ 0x4b100d70, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100d74, 0x00000000, 0x341b0045 },
+	{ 0x4b100d78, 0x00000000, 0xaf5b0110 },
+	{ 0x4b100d7c, 0x00000000, 0x0ac5719d },
+	{ 0x4b100d80, 0x00000000, 0x00000000 },
+	{ 0x4b152ed8, 0x0ec5719d, 0x0ec4035c },
+
+	{ 0x4b100d90, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100d94, 0x00000000, 0x341b0046 },
+	{ 0x4b100d98, 0x00000000, 0xaf5b0114 },
+	{ 0x4b100d9c, 0x00000000, 0x0ac52161 },
+	{ 0x4b100da0, 0x00000000, 0x00000000 },
+	{ 0x4b152ee4, 0x0ec52161, 0x0ec40364 },
+
+	{ 0x4b100db0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100db4, 0x00000000, 0x341b0047 },
+	{ 0x4b100db8, 0x00000000, 0xaf5b0118 },
+	{ 0x4b100dbc, 0x00000000, 0x0ac52132 },
+	{ 0x4b100dc0, 0x00000000, 0x00000000 },
+	{ 0x4b152eec, 0x0ec52132, 0x0ec4036c },
+
+	/* Marker 72: first registration group in hal_adapter_init(). */
+	{ 0x4b100dd0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100dd4, 0x00000000, 0x341b0048 },
+	{ 0x4b100dd8, 0x00000000, 0xaf5b011c },
+	{ 0x4b100ddc, 0x00000000, 0x0ac49246 },
+	{ 0x4b100de0, 0x00000000, 0x00000000 },
+	{ 0x4b10ade4, 0x0ec49246, 0x0ec40374 },
+
+	/* Marker 73: registration request enters the shared call-table insert. */
+	{ 0x4b100df0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100df4, 0x00000000, 0x341b0049 },
+	{ 0x4b100df8, 0x00000000, 0xaf5b0120 },
+	{ 0x4b100dfc, 0x00000000, 0x0ac4717c },
+	{ 0x4b100e00, 0x00000000, 0x00000000 },
+	{ 0x4b1225dc, 0x0ec4717c, 0x0ec4037c },
+
+	/* Marker 74: call-table insert returned; resolve its result object. */
+	{ 0x4b100e10, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100e14, 0x00000000, 0x341b004a },
+	{ 0x4b100e18, 0x00000000, 0xaf5b0124 },
+	{ 0x4b100e1c, 0x00000000, 0x0ac47382 },
+	{ 0x4b100e20, 0x00000000, 0x00000000 },
+	{ 0x4b122614, 0x0ec47382, 0x0ec40384 },
+
+	/* Marker 75: result absent; enter the alternate cleanup/removal call. */
+	{ 0x4b100e30, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100e34, 0x00000000, 0x341b004b },
+	{ 0x4b100e38, 0x00000000, 0xaf5b0128 },
+	{ 0x4b100e3c, 0x00000000, 0x0ac4738d },
+	{ 0x4b100e40, 0x00000000, 0x00000000 },
+	{ 0x4b122658, 0x0ec4738d, 0x0ec4038c },
+
+	/* Marker 76: call-table insert enters comm_SpinLock(2). */
+	{ 0x4b100e50, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100e54, 0x00000000, 0x341b004c },
+	{ 0x4b100e58, 0x00000000, 0xaf5b012c },
+	{ 0x4b100e5c, 0x00000000, 0x0ac496f1 },
+	{ 0x4b100e60, 0x00000000, 0x00000000 },
+	{ 0x4b11c7a8, 0x0ec496f1, 0x0ec40394 },
+
+	/* Marker 77: entry copied and counted; enter comm_SpinUnlock(2). */
+	{ 0x4b100e70, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100e74, 0x00000000, 0x341b004d },
+	{ 0x4b100e78, 0x00000000, 0xaf5b0130 },
+	{ 0x4b100e7c, 0x00000000, 0x0ac496fa },
+	{ 0x4b100e80, 0x00000000, 0x00000000 },
+	{ 0x4b11c838, 0x0ec496fa, 0x0ec4039c },
+
+	/* Markers 78-80: later registration groups in hal_adapter_init(). */
+	{ 0x4b100e90, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100e94, 0x00000000, 0x341b004e },
+	{ 0x4b100e98, 0x00000000, 0xaf5b0134 },
+	{ 0x4b100e9c, 0x00000000, 0x0ac49246 },
+	{ 0x4b100ea0, 0x00000000, 0x00000000 },
+	{ 0x4b10aeb4, 0x0ec49246, 0x0ec403a4 },
+
+	{ 0x4b100eb0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100eb4, 0x00000000, 0x341b004f },
+	{ 0x4b100eb8, 0x00000000, 0xaf5b0138 },
+	{ 0x4b100ebc, 0x00000000, 0x0ac49246 },
+	{ 0x4b100ec0, 0x00000000, 0x00000000 },
+	{ 0x4b10aee0, 0x0ec49246, 0x0ec403ac },
+
+	{ 0x4b100ed0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100ed4, 0x00000000, 0x341b0050 },
+	{ 0x4b100ed8, 0x00000000, 0xaf5b013c },
+	{ 0x4b100edc, 0x00000000, 0x0ac49246 },
+	{ 0x4b100ee0, 0x00000000, 0x00000000 },
+	{ 0x4b10af0c, 0x0ec49246, 0x0ec403b4 },
+
+	/* Markers 81-82: final registration and hal-adapter return log. */
+	{ 0x4b100ef0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100ef4, 0x00000000, 0x341b0051 },
+	{ 0x4b100ef8, 0x00000000, 0xaf5b0140 },
+	{ 0x4b100efc, 0x00000000, 0x0ac48de2 },
+	{ 0x4b100f00, 0x00000000, 0x00000000 },
+	{ 0x4b10af1c, 0x0ec48de2, 0x0ec403bc },
+
+	{ 0x4b100f10, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100f14, 0x00000000, 0x341b0052 },
+	{ 0x4b100f18, 0x00000000, 0xaf5b0144 },
+	{ 0x4b100f1c, 0x00000000, 0x0ac54252 },
+	{ 0x4b100f20, 0x00000000, 0x00000000 },
+	{ 0x4b10af5c, 0x0ec54252, 0x0ec403c4 },
+
+	/* Repeated helper entry: count calls and retain its latest arguments. */
+	{ 0x4b100f30, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100f34, 0x00000000, 0x8f5b0168 },
+	{ 0x4b100f38, 0x00000000, 0x277b0001 },
+	{ 0x4b100f3c, 0x00000000, 0xaf5b0168 },
+	{ 0x4b100f40, 0x00000000, 0xaf44016c },
+	{ 0x4b100f44, 0x00000000, 0xaf450170 },
+	{ 0x4b100f48, 0x00000000, 0x0ac489ed },
+	{ 0x4b100f4c, 0x00000000, 0x00000000 },
+	{ 0x4b124984, 0x0ec489ed, 0x0ec403cc },
+
+	/* Markers 84-86: format, construct, and submit a registration. */
+	{ 0x4b100f50, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100f54, 0x00000000, 0x341b0054 },
+	{ 0x4b100f58, 0x00000000, 0xaf5b014c },
+	{ 0x4b100f5c, 0x00000000, 0x0ac56cf3 },
+	{ 0x4b100f60, 0x00000000, 0x00000000 },
+	{ 0x4b1249a4, 0x0ec56cf3, 0x0ec403d4 },
+
+	{ 0x4b100f70, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100f74, 0x00000000, 0x341b0055 },
+	{ 0x4b100f78, 0x00000000, 0xaf5b0150 },
+	{ 0x4b100f7c, 0x00000000, 0x0ac491c1 },
+	{ 0x4b100f80, 0x00000000, 0x00000000 },
+	{ 0x4b1249b4, 0x0ec491c1, 0x0ec403dc },
+
+	{ 0x4b100f90, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100f94, 0x00000000, 0x341b0056 },
+	{ 0x4b100f98, 0x00000000, 0xaf5b0154 },
+	{ 0x4b100f9c, 0x00000000, 0x0ac48955 },
+	{ 0x4b100fa0, 0x00000000, 0x00000000 },
+	{ 0x4b12486c, 0x0ec48955, 0x0ec403e4 },
+
+	/* Marker 87: final hal-adapter registration enters spinlock 1. */
+	{ 0x4b100fb0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100fb4, 0x00000000, 0x341b0057 },
+	{ 0x4b100fb8, 0x00000000, 0xaf5b0158 },
+	{ 0x4b100fbc, 0x00000000, 0x0ac496f1 },
+	{ 0x4b100fc0, 0x00000000, 0x00000000 },
+	{ 0x4b123828, 0x0ec496f1, 0x0ec403ec },
+
+	/* Marker 88: enter the later setCPUAppReady() wrapper. */
+	{ 0x4b100fd0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100fd4, 0x00000000, 0x341b0058 },
+	{ 0x4b100fd8, 0x00000000, 0xaf5b015c },
+	{ 0x4b100fdc, 0x00000000, 0x0ac4912c },
+	{ 0x4b100fe0, 0x00000000, 0x00000000 },
+	{ 0x4b152ef4, 0x0ec4912c, 0x0ec403f4 },
+};
 
 static void h713_mips_print_digest(const u8 *digest)
 {
@@ -1152,7 +1943,45 @@ static u32 h713_mips_read_shmem(ulong offset)
 
 static void h713_mips_prepare_ready_probe(void)
 {
+	int i;
+
 	memset((void *)H713_MIPS_SHMEM_ADDR, 0, H713_MIPS_SHMEM_SIZE);
+
+	/*
+	 * InitCommMem takes the slave path when U-Boot publishes valid magic
+	 * words. That path assumes the ARM master has already run
+	 * comm_InitSpinLock(). Reproduce its exact 12-byte entry layout:
+	 * type=free, status=free, mutex=0, owner=free, refcount=0, and no
+	 * assigned thread. Leaving these bytes zero makes comm_SpinLock(3)
+	 * wait forever before setCPUReady(1) can publish the MIPS flag.
+	 */
+	for (i = 0; i < H713_MIPS_SHMEM_LOCK_COUNT; i++) {
+		u8 *lock = (u8 *)(H713_MIPS_SHMEM_ADDR +
+				 i * H713_MIPS_SHMEM_LOCK_SIZE);
+
+		lock[0] = H713_MIPS_SHMEM_LOCK_FREE;
+		lock[1] = H713_MIPS_SHMEM_LOCK_FREE;
+		lock[2] = 0;
+		lock[3] = H713_MIPS_SHMEM_LOCK_FREE;
+		*(u32 *)(lock + 4) = 0;
+		*(u32 *)(lock + 8) = H713_MIPS_SHMEM_LOCK_THREAD_NONE;
+	}
+
+	/*
+	 * The ARM master also clears the call-entry region, then seeds the
+	 * per-entry link field with -1. The exact image does this at raw
+	 * display.bin+0x1ae4c..0x1ae88: the table begins at shared+0x75c8,
+	 * entries are 0x60 bytes, and the loop writes -1 at entry+0x5c until
+	 * shared+0x240c4 (1224 entries). A zero link makes the MIPS insertion
+	 * routine reject the first free slot before it can queue a request.
+	 */
+	writel(0, H713_MIPS_SHMEM_ADDR + H713_MIPS_SHMEM_CALL_VERSION_OFF);
+	writel(0, H713_MIPS_SHMEM_ADDR + H713_MIPS_SHMEM_CALL_COUNT_OFF);
+	for (i = 0; i < H713_MIPS_SHMEM_CALL_ENTRY_COUNT; i++)
+		writel(~0U, H713_MIPS_SHMEM_ADDR +
+		       H713_MIPS_SHMEM_CALL_TABLE_OFF +
+		       i * H713_MIPS_SHMEM_CALL_ENTRY_SIZE +
+		       H713_MIPS_SHMEM_CALL_NEXT_OFF);
 
 	writel(3, H713_MIPS_SHMEM_ADDR + H713_MIPS_SHMEM_MAX_CPU_OFF);
 	writel(H713_MIPS_SHMEM_ARM_READY,
@@ -1170,7 +1999,8 @@ static void h713_mips_prepare_ready_probe(void)
 	       H713_MIPS_SHMEM_ADDR + H713_MIPS_SHMEM_MAGIC2_OFF);
 	flush_cache(H713_MIPS_SHMEM_ADDR, H713_MIPS_SHMEM_SIZE);
 
-	printf("H713 MIPS: readiness probe shared memory prepared\n");
+	printf("H713 MIPS: readiness probe shared memory prepared "
+	       "(12 spinlocks, 1224 call entries initialized)\n");
 }
 
 static int h713_mips_apply_trace(void)
@@ -1200,6 +2030,33 @@ static int h713_mips_apply_trace(void)
 	return 0;
 }
 
+static int h713_mips_apply_stability(void)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(h713_mips_stability_patches); i++) {
+		const struct h713_mips_patch *patch =
+			&h713_mips_stability_patches[i];
+
+		if (readl(patch->addr) != patch->expected) {
+			printf("H713 MIPS: stability site 0x%08lx is not pristine\n",
+			       patch->addr);
+			return -EINVAL;
+		}
+	}
+
+	for (i = 0; i < ARRAY_SIZE(h713_mips_stability_patches); i++) {
+		const struct h713_mips_patch *patch =
+			&h713_mips_stability_patches[i];
+
+		writel(patch->replacement, patch->addr);
+	}
+	flush_cache(H713_MIPS_FW_ADDR, H713_MIPS_FW_WINDOW_SIZE);
+	printf("H713 MIPS: uncached heartbeat/exception diagnostics installed\n");
+
+	return 0;
+}
+
 /*
  * Report every trace slot that changed since the previous scan, as it changes.
  * The firmware's stalls wedge the interconnect often enough that a dump taken
@@ -1224,7 +2081,20 @@ static void h713_mips_stream_trace(u32 *shadow)
 			continue;
 
 		shadow[i] = value;
-		printf("H713 MIPS: trace[%d]=%u\n", i, value);
+		if (i == H713_MIPS_TRACE_DBG_ADDR)
+			printf("H713 MIPS: sys:dbg_buf=0x%08x\n", value);
+		else if (i == H713_MIPS_TRACE_DBG_SIZE)
+			printf("H713 MIPS: sys:dbg_buf_size=0x%08x\n", value);
+		else if (i == H713_MIPS_TRACE_REG_COUNT)
+			printf("H713 MIPS: hal registration count=%u\n", value);
+		else if (i == H713_MIPS_TRACE_REG_OBJECT)
+			printf("H713 MIPS: hal registration object=0x%08x\n",
+			       value);
+		else if (i == H713_MIPS_TRACE_REG_CALLBACK)
+			printf("H713 MIPS: hal registration callback=0x%08x\n",
+			       value);
+		else
+			printf("H713 MIPS: trace[%d]=%u\n", i, value);
 	}
 }
 
@@ -1233,10 +2103,28 @@ static void h713_mips_print_trace(void)
 	int i;
 
 	printf("H713 MIPS: handshake trace");
-	for (i = 0; i < H713_MIPS_TRACE_COUNT; i++)
+	for (i = 0; i < H713_MIPS_TRACE_MARKER_COUNT; i++)
 		printf(" %u", h713_mips_read_shmem(H713_MIPS_TRACE_OFF +
 						   i * sizeof(u32)));
 	printf("\n");
+	printf("H713 MIPS: debug buffer addr=0x%08x size=0x%08x\n",
+	       h713_mips_read_shmem(H713_MIPS_TRACE_OFF +
+				   H713_MIPS_TRACE_DBG_ADDR * sizeof(u32)),
+	       h713_mips_read_shmem(H713_MIPS_TRACE_OFF +
+				   H713_MIPS_TRACE_DBG_SIZE * sizeof(u32)));
+	printf("H713 MIPS: hal registrations=%u object=0x%08x "
+	       "callback=0x%08x\n",
+	       h713_mips_read_shmem(H713_MIPS_TRACE_OFF +
+				   H713_MIPS_TRACE_REG_COUNT * sizeof(u32)),
+	       h713_mips_read_shmem(H713_MIPS_TRACE_OFF +
+				   H713_MIPS_TRACE_REG_OBJECT * sizeof(u32)),
+	       h713_mips_read_shmem(H713_MIPS_TRACE_OFF +
+				   H713_MIPS_TRACE_REG_CALLBACK * sizeof(u32)));
+	printf("H713 MIPS: call table version=%u count=%u first-next=0x%08x\n",
+	       h713_mips_read_shmem(H713_MIPS_SHMEM_CALL_VERSION_OFF),
+	       h713_mips_read_shmem(H713_MIPS_SHMEM_CALL_COUNT_OFF),
+	       h713_mips_read_shmem(H713_MIPS_SHMEM_CALL_TABLE_OFF +
+				   H713_MIPS_SHMEM_CALL_NEXT_OFF));
 }
 
 static int h713_mips_release_reset(bool publish_shmem)
@@ -1431,52 +2319,21 @@ static int h713_mips_start(void)
 #define H713_MIPS_HDCP_WAIT_ORIG	0x2c630033
 #define H713_MIPS_HDCP_WAIT_NONE	0x2c630000
 
-/*
- * The firmware's output timing is a hybrid: the geometry lives in the vendor
- * databases, but the selector that picks which record to use is compiled in.
- *
- * _LoadTFDPanelTiming builds the Output_Resolution selector 0x00060004 from an
- * immediate pair at file offset 0x88120 -- "lui v0, 6; addiu v0, v0, 4" --
- * where parameter 6 is Output_Resolution. Selector 0x00060004 resolves through
- * database.TSE's OUTPUT_TIMING_PROJECTOR to the 1080p record, whose fields are
- * copied verbatim into the LVDS timing registers: the u16 quad (2200, 1125,
- * 1920, 1080) is byte-identical to the 0x04650898 / 0x04380780 that
- * 0x05880020 / 0x05880024 read back on the bench. That overrides the 1280x720
- * the vendor's own register table writes for this panel.
- *
- * Rewriting the addiu's immediate to 3 asks for the adjacent resolution. The
- * mixer and DE already run 720p out of the same database -- both read
- * 0x02e4059f, which is the (1440, 741, 1280, 720) record in size-minus-one
- * form -- so the firmware is presently inconsistent with itself, and 3 should
- * bring the TCON into line with the rest of its own pipeline.
- *
- * Applied after the identity check, so the gate still verifies stock bytes.
- */
-#define H713_MIPS_RES_SEL_BYTE		(H713_MIPS_FW_ADDR + 0x88124)
-#define H713_MIPS_RES_SEL_1080P		0x04
-#define H713_MIPS_RES_SEL_720P		0x03
-
-static int h713_mips_release_raw(bool skip_hdcp_wait, bool force_720p)
+static int h713_mips_release_raw(bool skip_hdcp_wait, bool publish_shmem,
+				 bool trace, bool stability)
 {
 	u32 status, witness;
+	int elapsed;
 	int ret;
 
 	ret = h713_mips_verify();
 	if (ret)
 		return ret;
 
-	if (force_720p) {
-		u8 sel = readb(H713_MIPS_RES_SEL_BYTE);
-
-		if (sel != H713_MIPS_RES_SEL_1080P) {
-			printf("H713 MIPS: resolution selector is 0x%02x, expected 0x%02x\n",
-			       sel, H713_MIPS_RES_SEL_1080P);
-			return -EINVAL;
-		}
-		writeb(H713_MIPS_RES_SEL_720P, H713_MIPS_RES_SEL_BYTE);
-		printf("H713 MIPS: Output_Resolution selector forced to 0x%02x\n",
-		       H713_MIPS_RES_SEL_720P);
-	}
+	if ((trace || stability) && !publish_shmem)
+		return -EINVAL;
+	if (trace && stability)
+		return -EINVAL;
 
 	if (skip_hdcp_wait) {
 		u32 insn = readl(H713_MIPS_HDCP_WAIT_INSN);
@@ -1490,13 +2347,36 @@ static int h713_mips_release_raw(bool skip_hdcp_wait, bool force_720p)
 		printf("H713 MIPS: HDCP key-load wait defeated\n");
 	}
 
+	if (publish_shmem)
+		h713_mips_prepare_ready_probe();
+
+	if (trace) {
+		ret = h713_mips_apply_trace();
+		if (ret)
+			return ret;
+		memset(trace_shadow, 0, sizeof(trace_shadow));
+	}
+	if (stability) {
+		ret = h713_mips_apply_stability();
+		if (ret)
+			return ret;
+	}
+
 	flush_cache(H713_MIPS_FW_ADDR, H713_MIPS_FW_WINDOW_SIZE);
 	h713_mips_seed_witness();
 
-	ret = h713_mips_release_reset(false);
+	ret = h713_mips_release_reset(publish_shmem);
 	if (ret)
 		return ret;
-	mdelay(300);
+	if (trace) {
+		for (elapsed = 0; elapsed < 300000; elapsed += 1000) {
+			h713_mips_stream_trace(trace_shadow);
+			udelay(1000);
+		}
+		h713_mips_stream_trace(trace_shadow);
+	} else {
+		mdelay(300);
+	}
 
 	status = readl(H713_MIPS_STATUS_REG);
 	witness = h713_mips_read_witness();
@@ -1520,6 +2400,132 @@ static int h713_mips_release_raw(bool skip_hdcp_wait, bool force_720p)
 	}
 
 	printf("H713 MIPS: firmware execution proven (witness overwritten)\n");
+	return 0;
+}
+
+static int h713_mips_monitor_stability(void)
+{
+	u32 previous = h713_mips_read_shmem(H713_MIPS_DIAG_HEARTBEAT_OFF);
+	bool advanced = true;
+	int second;
+
+	printf("H713 MIPS: starting %d-second stability window, tick=%u\n",
+	       H713_MIPS_STABILITY_SECONDS, previous);
+	for (second = 1; second <= H713_MIPS_STABILITY_SECONDS; second++) {
+		u32 exception;
+		u32 heartbeat;
+		u32 mips_flag;
+		u32 status;
+
+		mdelay(1000);
+		heartbeat =
+			h713_mips_read_shmem(H713_MIPS_DIAG_HEARTBEAT_OFF);
+		exception =
+			h713_mips_read_shmem(H713_MIPS_DIAG_EXCEPTION_OFF);
+		mips_flag =
+			h713_mips_read_shmem(H713_MIPS_SHMEM_MIPS_FLAG_OFF);
+		status = readl(H713_MIPS_STATUS_REG);
+
+		printf("H713 MIPS: stability %2ds tick=%u delta=%u "
+		       "status=%08x MIPS=%08x exception=%u\n",
+		       second, heartbeat, heartbeat - previous, status,
+		       mips_flag, exception);
+
+		if (exception) {
+			printf("H713 MIPS: %s exception status=%08x cause=%08x "
+			       "epc=%08x badvaddr=%08x\n",
+			       exception == H713_MIPS_DIAG_EXCEPTION_CACHE ?
+			       "cache" : "general",
+			       h713_mips_read_shmem(H713_MIPS_DIAG_STATUS_OFF),
+			       h713_mips_read_shmem(H713_MIPS_DIAG_CAUSE_OFF),
+			       h713_mips_read_shmem(H713_MIPS_DIAG_EPC_OFF),
+			       h713_mips_read_shmem(H713_MIPS_DIAG_BADVADDR_OFF));
+			return -EFAULT;
+		}
+		if (heartbeat == previous)
+			advanced = false;
+		if (status != H713_MIPS_STATUS_RELEASED ||
+		    (mips_flag & (H713_MIPS_SHMEM_MIPS_READY |
+				  H713_MIPS_SHMEM_MIPS_APP_READY)) !=
+		    (H713_MIPS_SHMEM_MIPS_READY |
+		     H713_MIPS_SHMEM_MIPS_APP_READY)) {
+			printf("H713 MIPS: readiness/status changed during "
+			       "stability window\n");
+			return -EIO;
+		}
+		previous = heartbeat;
+	}
+
+	if (!advanced) {
+		printf("H713 MIPS: stability failed: heartbeat stalled during "
+		       "the observation window\n");
+		return -ETIMEDOUT;
+	}
+
+	printf("H713 MIPS: stability passed: heartbeat advanced for %d seconds "
+	       "with no recorded exception\n",
+	       H713_MIPS_STABILITY_SECONDS);
+	return 0;
+}
+
+static int h713_mips_wait_ready(int timeout_us, bool trace)
+{
+	u32 arm_flag;
+	u32 magic1;
+	u32 magic2;
+	u32 mips_flag = 0;
+	u32 status;
+	u32 witness;
+	int elapsed;
+
+	for (elapsed = 0; elapsed < timeout_us; elapsed += 1000) {
+		if (trace)
+			h713_mips_stream_trace(trace_shadow);
+		mips_flag =
+			h713_mips_read_shmem(H713_MIPS_SHMEM_MIPS_FLAG_OFF);
+		if ((mips_flag & (H713_MIPS_SHMEM_MIPS_READY |
+				 H713_MIPS_SHMEM_MIPS_APP_READY)) ==
+		    (H713_MIPS_SHMEM_MIPS_READY |
+		     H713_MIPS_SHMEM_MIPS_APP_READY))
+			break;
+		udelay(1000);
+	}
+
+	if (trace) {
+		h713_mips_stream_trace(trace_shadow);
+		h713_mips_print_trace();
+	}
+
+	status = readl(H713_MIPS_STATUS_REG);
+	witness = h713_mips_read_witness();
+	magic1 = h713_mips_read_shmem(H713_MIPS_SHMEM_MAGIC1_OFF);
+	magic2 = h713_mips_read_shmem(H713_MIPS_SHMEM_MAGIC2_OFF);
+	arm_flag = h713_mips_read_shmem(H713_MIPS_SHMEM_ARM_FLAG_OFF);
+	mips_flag = h713_mips_read_shmem(H713_MIPS_SHMEM_MIPS_FLAG_OFF);
+
+	printf("H713 MIPS: readiness status=0x%08x witness=0x%08x\n",
+	       status, witness);
+	printf("H713 MIPS: CPU_COMM magic=%08x/%08x ARM=%08x MIPS=%08x\n",
+	       magic1, magic2, arm_flag, mips_flag);
+
+	if (status != H713_MIPS_STATUS_RELEASED ||
+	    witness == H713_MIPS_WITNESS_SEED ||
+	    magic1 != H713_MIPS_SHMEM_MAGIC ||
+	    magic2 != H713_MIPS_SHMEM_MAGIC ||
+	    arm_flag != H713_MIPS_SHMEM_ARM_READY ||
+	    !(mips_flag & H713_MIPS_SHMEM_MIPS_READY)) {
+		printf("H713 MIPS: firmware readiness not proven; core left running\n");
+		return -ETIMEDOUT;
+	}
+
+	printf("H713 MIPS: firmware readiness proven by MIPS READY\n");
+	if (!(mips_flag & H713_MIPS_SHMEM_MIPS_APP_READY)) {
+		printf("H713 MIPS: application readiness not proven; "
+		       "core left running\n");
+		return -ETIMEDOUT;
+	}
+
+	printf("H713 MIPS: application readiness proven\n");
 	return 0;
 }
 
@@ -1603,10 +2609,6 @@ static int h713_mips_probe_ready(bool trace, bool release_tvcap,
 		mips_flag =
 			h713_mips_read_shmem(H713_MIPS_SHMEM_MIPS_FLAG_OFF);
 		if (mips_flag & H713_MIPS_SHMEM_MIPS_READY)
-			break;
-		if (trace &&
-		    h713_mips_read_shmem(H713_MIPS_TRACE_OFF +
-					 150 * sizeof(u32)))
 			break;
 		udelay(1000);
 	}
@@ -1777,7 +2779,7 @@ static int do_h713_mips(struct cmd_tbl *cmdtp, int flag, int argc,
 	}
 
 	if (!strcmp(argv[1], "release")) {
-		ret = h713_mips_release_raw(false, false);
+		ret = h713_mips_release_raw(false, false, false, false);
 		return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
@@ -2045,7 +3047,15 @@ U_BOOT_CMD(h713_logo, 5, 0, do_h713_logo,
  * layout. Take the stride from the header rather than restating it.
  */
 #define H713_PIO_BASE		0x02000000UL
+#define H713_PIO_BANK_B		1
+#define H713_PIO_BANK_F		5
 #define H713_PIO_BANK_H		7
+#define H713_PB_CFG0		(H713_PIO_BASE + \
+				 H713_PIO_BANK_B * SUNXI_PINCTRL_BANK_SIZE)
+#define H713_PB_DATA		(H713_PB_CFG0 + 0x10)
+#define H713_PF_CFG0		(H713_PIO_BASE + \
+				 H713_PIO_BANK_F * SUNXI_PINCTRL_BANK_SIZE)
+#define H713_PF_DATA		(H713_PF_CFG0 + 0x10)
 #define H713_PH_CFG0		(H713_PIO_BASE + \
 				 H713_PIO_BANK_H * SUNXI_PINCTRL_BANK_SIZE)
 #define H713_PH_DATA		(H713_PH_CFG0 + 0x10)
@@ -2386,21 +3396,278 @@ static void h713_disp_clocks(void)
 	writel(0x00000404, 0x06e00008);
 	writel(0x00111111, 0x06e00000);
 	mdelay(12);
+
+	/*
+	 * No module-clock writes here on purpose. h713_display_prepare() sets
+	 * PLL_VIDEO2 and the deint/panel/SVP-DTL/AFBD gates for the
+	 * h713_mips start path, but the vendor prologue block already does the
+	 * same work on this one -- prologue 3 writes 0x02001dc0 <- 0x80000005
+	 * and enables PLL_VIDEO2 across four masked records. Calling the
+	 * helper here would be redundant, not protective; the clock state is
+	 * reported in the post-readiness dump instead, which is the only place
+	 * it could still have changed.
+	 */
 }
 
 /* Stock's reset: pulse bit 8 of the FIFO control, then re-latch the config. */
 static void h713_disp_fifo_reset(void)
 {
-	u32 cfg = readl(0x0588000c);
-	u32 ctl = readl(0x05700088);
+	u32 status = readl(0x05880fe0);
+	u32 cfg;
+	u32 ctl;
 
+	if (!status) {
+		printf("H713 disp: FIFO status clear; reset skipped\n");
+		return;
+	}
+
+	cfg = readl(0x0588000c);
+	ctl = readl(0x05700088);
 	writel(ctl & ~0x100, 0x05700088);
 	writel(ctl | 0x100, 0x05700088);
 	writel(cfg, 0x0588000c);
+	printf("H713 disp: FIFO status 0x%08x; reset applied\n", status);
+}
+
+/*
+ * Stock fastlogo applies all LogoRegData groups, waits poweron_delay1
+ * (550 ms), then invokes its panel-power method. The board-B runtime TOC1 DT
+ * identifies panel_power_en as PF6, not the PH19 found in the older board-A
+ * dump. It identifies panel_gpio_0 as PH16. Enable PF6 and pulse PH16 low for
+ * 2 ms, then high for 5 ms. The state
+ * machine waits poweron_delay0 (20 ms) before continuing into the display
+ * clocks and MIPS release.
+ *
+ * Both GPIOs carry GPIO_PULL_DOWN in the stock DT. Set the data latch before
+ * selecting output mode so the power line cannot glitch low as it is enabled.
+ *
+ * Do not use the legacy gpio_set_value() compatibility wrapper here. This
+ * build uses DM_GPIO, whose compatibility wrapper reconstructs a descriptor
+ * without its previous output-direction flags; the second value change then
+ * does not reach this driver's set_flags() output path. Accessing the PF/PH
+ * data latches directly also lets the diagnostic verify the exact registers.
+ */
+static int h713_disp_stock_panel_power(void)
+{
+	const uint power = SUNXI_GPF(6);
+	const uint reset = SUNXI_GPH(16);
+	u32 pf_dat;
+	u32 ph_dat;
+
+	printf("H713 panel: stock power pre-delay 550 ms\n");
+	mdelay(550);
+
+	sunxi_gpio_set_pull(power, SUNXI_GPIO_PULL_DOWN);
+	sunxi_gpio_set_pull(reset, SUNXI_GPIO_PULL_DOWN);
+
+	setbits_le32((void *)H713_PF_DATA, BIT(6));
+	sunxi_gpio_set_cfgpin(power, SUNXI_GPIO_OUTPUT);
+
+	clrbits_le32((void *)H713_PH_DATA, BIT(16));
+	sunxi_gpio_set_cfgpin(reset, SUNXI_GPIO_OUTPUT);
+	mdelay(2);
+	setbits_le32((void *)H713_PH_DATA, BIT(16));
+	mdelay(5);
+
+	pf_dat = readl(H713_PF_DATA);
+	ph_dat = readl(H713_PH_DATA);
+	printf("H713 panel: stock GPIO phase complete: "
+	       "PF6 cfg=%x latch=%d, PH16 cfg=%x latch=%d, "
+	       "PF_DAT=%08x PH_DAT=%08x\n",
+	       sunxi_gpio_get_cfgpin(power), !!(pf_dat & BIT(6)),
+	       sunxi_gpio_get_cfgpin(reset), !!(ph_dat & BIT(16)),
+	       pf_dat, ph_dat);
+	mdelay(20);
+
+	return 0;
+}
+
+/*
+ * Board B's panel description, as stock assembles it.
+ *
+ * Stock parses its runtime DT into a flat 35-entry u32 array, then overwrites
+ * the same array from /panel_config.ini -- the two name tables at stock
+ * 0x4a05ae30 (DT) and 0x4a05a4fc (INI) are index-for-index parallel, which is
+ * what makes the override work. The values below are that merged result:
+ * panel_config.ini (Reserve0_a, sha256 7bffff88..., extracted to
+ * local/mips-display/board-b-mips/panel_config.ini) over the runtime TOC1 DT.
+ *
+ * Only two fields actually differ between the two sources -- dual_port and
+ * ssc_en -- and both are recorded here at their post-INI value.
+ *
+ * PanelLvds0Pol/PanelLvds1Pol are absent from *both* sources, so stock leaves
+ * their array slots untouched and its patch helper skips them. They are
+ * deliberately not modelled here.
+ */
+struct h713_panel_cfg {
+	u32 mapping;		/* DT panel_protocol      */
+	u32 odd_even;		/* DT panel_data_swap     */
+	u32 dual_port;		/* DT 1 -> INI 0          */
+	u32 mirror_mode;
+	u32 inv_de, inv_hsync, inv_vsync, inv_dclk;
+	u32 de_current, odd_current, even_current;
+	u32 ssc_en;		/* DT 1 -> INI 0          */
+	u32 htotal, vtotal, hsync, vsync, hbp, vbp, width;
+};
+
+static const struct h713_panel_cfg h713_panel_cfg_board_b = {
+	.mapping = 0, .odd_even = 0, .dual_port = 0, .mirror_mode = 0,
+	.inv_de = 0, .inv_hsync = 0, .inv_vsync = 0, .inv_dclk = 1,
+	.de_current = 47, .odd_current = 7, .even_current = 7,
+	.ssc_en = 0,
+	.htotal = 1360, .vtotal = 760, .hsync = 20, .vsync = 2,
+	.hbp = 40, .vbp = 20, .width = 1280,
+};
+
+struct h713_panel_patch {
+	u32 reg;
+	u8  shift;
+	u32 fieldmask;
+	u32 value;
+};
+
+/*
+ * The vendor tables carry another panel's defaults; stock rewrites these
+ * fields from the merged config before its applier touches hardware. Sites
+ * and bit positions are transcribed from stock U-Boot's patch function at
+ * 0x4a0248fc, whose helper at 0x4a024894 is a plain bitfield insert:
+ *
+ *     record.value = (record.value & ~(fieldmask << shift))
+ *                  | ((value & fieldmask) << shift)
+ *
+ * guarded by (fieldmask << shift) being a subset of the record's own mask.
+ *
+ * Two sites are deliberately omitted. Stock's 0x05280084[31:16] and
+ * 0x0528008c[15:0] both resolve to a literal zero in static analysis, which
+ * may be a decode artefact rather than a real store; writing a zero we cannot
+ * justify is worse than leaving the vendor default in place.
+ */
+static int h713_disp_panel_patch(ulong blob, const struct h713_disp_sel *sel)
+{
+	const struct h713_panel_cfg *c = &h713_panel_cfg_board_b;
+	const struct h713_panel_patch tbl[] = {
+		/* LVDS lane/map: two protocol fields plus the invert flags */
+		{ 0x05800000,  6, 0x3,    c->mapping },
+		{ 0x05800000,  3, 0x3,    c->mapping },
+		{ 0x05800000, 14, 0x1,    c->odd_even },
+		{ 0x05800000, 16, 0x1,    c->inv_hsync },
+		{ 0x05800000, 17, 0x1,    c->inv_vsync },
+		{ 0x05800000, 18, 0x1,    c->inv_de },
+		{ 0x05800000, 24, 0x1,    c->inv_dclk },
+		/* display PLL: LVDS drive currents and spread spectrum */
+		{ 0x058c0020, 24, 0x3f,   c->de_current },
+		{ 0x058c0020,  0, 0x7,    c->odd_current },
+		{ 0x058c0024, 24, 0x3f,   c->de_current },
+		{ 0x058c0024,  0, 0x7,    c->even_current },
+		{ 0x058c0014, 24, 0x1,    c->ssc_en },
+		/* TCON control: single/dual port */
+		{ 0x0588000c, 12, 0x3,    c->dual_port },
+		/* AFBD fetch: mirror mode */
+		{ 0x05600140,  2, 0x3,    c->mirror_mode },
+		/* mixer geometry and blanking */
+		{ 0x0525c000, 16, 0xffff, c->vtotal },
+		{ 0x0525c000,  0, 0xffff, c->htotal },
+		{ 0x0525c004,  8, 0xff,   c->hsync },
+		{ 0x0525c004,  0, 0xff,   c->vsync },
+		{ 0x0525c01c,  0, 0xffff, c->hsync + c->hbp },
+		{ 0x0525c020,  0, 0xffff, c->vsync + c->vbp },
+		{ 0x0525c030,  0, 0xffff, c->vsync + c->vbp },
+		{ 0x0525c034, 16, 0xffff, c->width },
+		{ 0x0525c034,  0, 0xffff, c->hsync + c->hbp },
+		/*
+		 * Stock's compare at +0x24e12/+0x24e26 matches *either*
+		 * 0x0524c010 or 0x0525c000 and patches whichever record it
+		 * found, so the DE's copy of the geometry takes the same
+		 * value as the mixer's. Omitting it left the DE composing
+		 * 1440x741 beneath a mixer at 1360x760 -- visible in a live
+		 * dump as de +0x10 holding the unpatched 0x02e4059f.
+		 */
+		{ 0x0524c010, 16, 0xffff, c->vtotal },
+		{ 0x0524c010,  0, 0xffff, c->htotal },
+		/* display engine */
+		{ 0x0524c004, 16, 0xffff, c->width },
+		{ 0x0524c004,  0, 0xffff, c->vsync + c->vbp },
+		{ 0x0524c014,  8, 0xff,   c->vsync },
+		{ 0x05280084,  0, 0xffff, c->width },
+		{ 0x05280088,  0, 0xffff, c->vsync + c->vbp },
+	};
+	const struct h713_disp_block *ranges[] = {
+		&h713_disp_prologue[sel->prologue - 1],
+		&h713_disp_timing[sel->timing],
+		&h713_disp_de[sel->de],
+	};
+	int patched = 0, guarded = 0;
+	uint i, r;
+
+	for (r = 0; r < ARRAY_SIZE(ranges); r++) {
+		ulong off;
+
+		for (off = ranges[r]->start;
+		     off + sizeof(struct h713_logo_rec) <= ranges[r]->end; ) {
+			struct h713_logo_rec rec;
+
+			rec.addr = readl(blob + off);
+			rec.val  = readl(blob + off + 4);
+			rec.mask = readl(blob + off + 8);
+			rec.type = readl(blob + off + 12);
+
+			/*
+			 * Record validity and the 4-byte resync step must
+			 * mirror h713_logo_walk() exactly. If this pass
+			 * framed the stream differently it would rewrite
+			 * bytes the walker then reads as a different record.
+			 */
+			bool is_delay = !rec.addr && rec.type == 0xff;
+			bool is_pulse = h713_logo_reg_sane(rec.addr) &&
+					rec.type == 0xfe;
+			bool is_write = h713_logo_reg_sane(rec.addr) &&
+					(rec.type == 1 || rec.type == 2 ||
+					 rec.type == 4);
+
+			if (!is_delay && !is_pulse && !is_write) {
+				off += 4;
+				continue;
+			}
+
+			for (i = 0; is_write && i < ARRAY_SIZE(tbl); i++) {
+				u32 window, updated;
+
+				if (tbl[i].reg != rec.addr)
+					continue;
+
+				window = tbl[i].fieldmask << tbl[i].shift;
+				if (window & ~rec.mask) {
+					guarded++;
+					continue;
+				}
+
+				updated = (rec.val & ~window) |
+					  ((tbl[i].value & tbl[i].fieldmask)
+					   << tbl[i].shift);
+				if (updated == rec.val)
+					continue;
+
+				printf("  +0x%04lx  %08x  %08x -> %08x  "
+				       "shift %u mask 0x%x\n", off, rec.addr,
+				       rec.val, updated, tbl[i].shift,
+				       tbl[i].fieldmask);
+				writel(updated, blob + off + 4);
+				rec.val = updated;
+				patched++;
+			}
+
+			off += sizeof(struct h713_logo_rec);
+		}
+	}
+
+	printf("H713 panel: config applied, %d record field(s) patched, "
+	       "%d guarded by record mask\n", patched, guarded);
+	return 0;
 }
 
 static int h713_disp_run(ulong blob, u32 project, bool skip_hdcp_wait,
-			 bool force_720p)
+			 bool prove_ready, bool trace, bool stability,
+			 bool stock_panel_power, bool release_mips)
 {
 	struct h713_disp_sel sel;
 	int ret;
@@ -2411,6 +3678,10 @@ static int h713_disp_run(ulong blob, u32 project, bool skip_hdcp_wait,
 
 	printf("H713 disp: project 0x%02x -> prologue %u, timing %u, de %u\n",
 	       sel.project, sel.prologue, sel.timing, sel.de);
+
+	ret = h713_disp_panel_patch(blob, &sel);
+	if (ret)
+		return ret;
 
 	ret = h713_logo_walk(blob, h713_disp_prologue[sel.prologue - 1].start,
 			     h713_disp_prologue[sel.prologue - 1].end, true);
@@ -2429,21 +3700,102 @@ static int h713_disp_run(ulong blob, u32 project, bool skip_hdcp_wait,
 	if (ret)
 		return ret;
 
+	if (stock_panel_power) {
+		ret = h713_disp_stock_panel_power();
+		if (ret)
+			return ret;
+	}
+
 	h713_disp_clocks();
+	if (stock_panel_power)
+		printf("H713 panel: post-stock GPIO mux: "
+		       "PF6 cfg=%x latch=%d, PH16 cfg=%x latch=%d\n",
+		       sunxi_gpio_get_cfgpin(SUNXI_GPF(6)),
+		       !!(readl(H713_PF_DATA) & BIT(6)),
+		       sunxi_gpio_get_cfgpin(SUNXI_GPH(16)),
+		       !!(readl(H713_PH_DATA) & BIT(16)));
 
 	writel(1, 0x06940000);			/* INCAP */
 	mdelay(12);
 	writel(0x01800045, 0x051c0010);		/* LVDS enable */
 	mdelay(12);
 
-	ret = h713_mips_release_raw(skip_hdcp_wait, force_720p);
-	if (ret)
-		return ret;
+	/*
+	 * Everything the display path needs -- TCON timing, TVTOP routing, the
+	 * display PLL, mixer, DE, AFBD, panel power, INCAP and LVDS -- comes
+	 * from the vendor tables and the ARM sequence above. The coprocessor
+	 * programs none of it; what it demonstrably does do is overwrite the
+	 * TCON timing with 1080p once it runs.
+	 *
+	 * So holding it in reset is a real experiment, not a degraded run: if
+	 * pixels appear without it, the firmware is what suppresses them and
+	 * the fault is composition ownership rather than our register
+	 * programming. It also leaves the panel on the tables' native 720p and
+	 * lifts the one-launch-per-power-cycle rule, since no launch happens.
+	 */
+	if (release_mips) {
+		ret = h713_mips_release_raw(skip_hdcp_wait, prove_ready, trace,
+					    stability);
+		if (ret)
+			return ret;
+	} else {
+		printf("H713 disp: MIPS held in reset (noboot); display driven "
+		       "by the ARM sequence alone\n");
+	}
 
 	writel(0x45, 0x051c0010);		/* LVDS finalise */
+
+	/*
+	 * The one register group stock's fastlogo writes and this replay never
+	 * did. Enumerating every MMIO literal in stock's fastlogo function
+	 * (0x4a0228d4) and diffing against our sequence leaves exactly one
+	 * omission: 0x051c00d4..0x051c00e0, written as a barriered group at
+	 * raw +0x22cca.
+	 *
+	 * Stock has two branches for it, selected on a config field at +0xf8.
+	 * When that field is unset it writes the constants below; otherwise it
+	 * read-modify-writes the same registers with values derived from
+	 * config +0xec/+0xf0. The fields sit past the 35-entry panel array and
+	 * neither the DT nor panel_config.ini supplies them, so the constant
+	 * path is the one this board takes. Either way stock writes this
+	 * group and we did not.
+	 *
+	 * These live in the LVDS PHY block alongside the firmware's
+	 * hardware-blue-screen source at +0xb0/+0xb4/+0xb8 -- which does reach
+	 * the panel -- so this is the right neighbourhood for a pixel path
+	 * that is configured, clocked, enabled and still delivering nothing.
+	 */
+	dmb();
+	writel(0, 0x051c00d4);
+	dmb();
+	writel(0, 0x051c00d8);
+	dmb();
+	writel(0x08000800, 0x051c00dc);
+	dmb();
+	writel(0x08000000, 0x051c00e0);
+	dmb();
+	printf("H713 disp: LVDS PHY tail applied: %08x %08x %08x %08x\n",
+	       readl(0x051c00d4), readl(0x051c00d8),
+	       readl(0x051c00dc), readl(0x051c00e0));
 	h713_disp_configured = true;
 	printf("H713 disp: sequence complete, LVDS FIFO status=0x%08x\n",
 	       readl(0x05880fe0));
+
+	/*
+	 * Readiness is a property of a released coprocessor. With the MIPS
+	 * held in reset there is nothing to wait for -- CPU_COMM was never
+	 * published, so the magic words read as uninitialised DRAM -- and
+	 * failing the run on that would abort the very test the flag exists
+	 * to perform.
+	 */
+	if (prove_ready && release_mips) {
+		ret = h713_mips_wait_ready(H713_MIPS_DISP_READY_TIMEOUT_US,
+					   trace);
+		if (ret)
+			return ret;
+		if (stability)
+			return h713_mips_monitor_stability();
+	}
 
 	return 0;
 }
@@ -2452,7 +3804,28 @@ static const struct { ulong base; uint words; const char *name; } h713_disp_regs
 	{ 0x05700000, 16, "tvtop"  }, { 0x05800000, 12, "lvds-lane" },
 	{ 0x05880000, 16, "lvds"   }, { 0x058c0000, 12, "disp-pll"  },
 	{ 0x051c0000,  8, "lvds-phy" }, { 0x0525c000, 16, "mixer"   },
+	/*
+	 * The firmware's blue-screen source lives at +0xb0/+0xb4/+0xb8 and the
+	 * group stock writes at the end of fastlogo at +0xd4..+0xe0. Neither
+	 * was ever dumped.
+	 */
+	{ 0x051c00b0, 16, "lvds-phy2" },
 	{ 0x0524c000, 32, "de"     }, { 0x05600140, 16, "afbd"      },
+	/*
+	 * DE block 5 writes 0x80000020 to 0x05600000, AFBD's top-level
+	 * control, but nothing has ever read it back. If the fetch unit is
+	 * globally disabled, that is where it shows.
+	 */
+	{ 0x05600000,  4, "afbd-top" },
+	/*
+	 * The vendor prologue enables PLL_VIDEO2 and the display module
+	 * clocks, so they are not gated going in. Read them back after the
+	 * coprocessor has run: it is the one actor that could since have
+	 * changed them, and an unclocked fetch datapath behind a clocked
+	 * register file would look exactly like the blank screen we have.
+	 */
+	{ 0x02001050,  4, "pll-video2" },
+	{ 0x02001db0,  8, "disp-modclk" },
 };
 
 /*
@@ -2566,6 +3939,13 @@ static int h713_disp_load_tse(u32 project)
 		return -ENOSPC;
 	}
 
+	/*
+	 * The MIPS reads this through its own uncached mapping. Filesystem reads
+	 * populate ARM cacheable DRAM, so publish both the payload and zero tail
+	 * before reset release instead of depending on incidental eviction.
+	 */
+	flush_cache(H713_MIPS_TSE_ADDR, H713_MIPS_TSE_SIZE);
+
 	return 0;
 }
 
@@ -2593,10 +3973,20 @@ static int h713_disp_load(u32 project)
 	ret = h713_disp_read("mips/display_cfg.xml", H713_MIPS_CFG_ADDR, &len);
 	if (ret)
 		return ret;
+	if (len > H713_MIPS_CFG_SIZE) {
+		printf("H713 disp: display_cfg.xml overruns its window\n");
+		return -ENOSPC;
+	}
+	/*
+	 * The firmware's early sys:* lookups run before its scheduler. Make the
+	 * XML and its zero-filled terminator visible to the non-coherent MIPS.
+	 */
+	flush_cache(H713_MIPS_CFG_ADDR, H713_MIPS_CFG_SIZE);
 
 	ret = h713_disp_load_tse(project);
 	if (ret)
 		return ret;
+	printf("H713 disp: config/TSE windows published for MIPS\n");
 
 	ret = h713_disp_read("mips/LogoRegData.bin", H713_DISP_LOGO_ADDR, &len);
 	if (ret)
@@ -2657,6 +4047,411 @@ static void h713_disp_sample(void)
 	}
 }
 
+#define H713_DISP_OSD_FB_ADDR		0x6c100000UL
+#define H713_DISP_OSD_WIDTH		1280
+#define H713_DISP_OSD_HEIGHT		720
+#define H713_DISP_OSD_STRIDE		(H713_DISP_OSD_WIDTH * sizeof(u32))
+#define H713_DISP_OSD_SIZE		(H713_DISP_OSD_STRIDE * \
+					 H713_DISP_OSD_HEIGHT)
+#define H713_DISP_PANEL_BLUE_RGB0	0x051c00b0UL
+#define H713_DISP_PANEL_BLUE_RGB1	0x051c00b4UL
+#define H713_DISP_PANEL_BLUE_CTRL	0x051c00b8UL
+
+/*
+ * Every visible phase holds for this long. One second per frame is not enough
+ * time to photograph by hand, and these runs are judged by eye: an image the
+ * operator cannot capture is not evidence.
+ *
+ * The bar pattern cycles eight colours, so its rotation repeats with period
+ * eight -- eight frames cover every distinct image and anything beyond that
+ * is a duplicate. The previous 15x1s run was therefore seven redundant frames,
+ * each too brief to catch.
+ */
+#define H713_DISP_OSD_FRAMES		8
+#define H713_DISP_OSD_DWELL_MS		5000
+
+/*
+ * LogoRegData.bin DE block 5 writes 0x6c100000 to AFBD +0x38
+ * (0x05600178), 0x1400 to +0x30, and 0x02cf04ff to +0x10. Together those
+ * identify a linear 1280x720, 32-bit OSD buffer with a 5120-byte stride.
+ * Stock U-Boot blits bootlogo.bmp into that buffer after applying the table;
+ * our register-only replay must provide pixels explicitly.
+ */
+static void h713_disp_fill_pattern(uint phase)
+{
+	static const u32 colours[] = {
+		0xffff0000,	/* red */
+		0xff00ff00,	/* green */
+		0xff0000ff,	/* blue */
+		0xffffffff,	/* white */
+		0xff00ffff,	/* cyan */
+		0xffff00ff,	/* magenta */
+		0xffffff00,	/* yellow */
+		0xff000000,	/* black */
+	};
+	u32 *fb = (u32 *)H713_DISP_OSD_FB_ADDR;
+	uint bar, x, y;
+
+	for (y = 0; y < H713_DISP_OSD_HEIGHT; y++) {
+		for (bar = 0; bar < ARRAY_SIZE(colours); bar++) {
+			u32 colour = colours[(bar + phase) %
+					     ARRAY_SIZE(colours)];
+
+			for (x = 0; x < H713_DISP_OSD_WIDTH /
+				     ARRAY_SIZE(colours); x++)
+				*fb++ = colour;
+		}
+	}
+
+	flush_cache(H713_DISP_OSD_FB_ADDR, H713_DISP_OSD_SIZE);
+	printf("H713 panel: pattern %u published at 0x%08lx "
+	       "(1280x720 ARGB8888, stride 0x%x)\n",
+	       phase, H713_DISP_OSD_FB_ADDR, (uint)H713_DISP_OSD_STRIDE);
+}
+
+/*
+ * The authenticated display.bin implements SetHWBlueScreenColorPanel at raw
+ * +0x17a68. It writes the same three 10-bit components to panel registers
+ * +0xb0 and +0xb4. EnableHWBlueScreenPanel at raw +0x16600 then sets
+ * +0xb8[6:0] to 0x7f; its disable peer clears +0xb8[5:0].
+ *
+ * Reproduce that firmware-owned test source only after application readiness,
+ * then restore all three registers exactly. This bypasses the OSD framebuffer,
+ * AFBD and DE, giving a software-only split between scanout and the
+ * panel/LVDS side of the pipeline.
+ */
+static u32 h713_disp_panel_blue_colour(u32 c0, u32 c1, u32 c2)
+{
+	return ((c0 & 0x3ff) << 20) |
+	       ((c2 & 0x3ff) << 10) |
+	       (c1 & 0x3ff);
+}
+
+static void h713_disp_panel_blue_test(void)
+{
+	static const u16 colours[][3] = {
+		{ 0x3ff, 0x000, 0x000 },
+		{ 0x000, 0x3ff, 0x000 },
+		{ 0x000, 0x000, 0x3ff },
+		{ 0x3ff, 0x3ff, 0x3ff },
+	};
+	u32 saved_rgb0 = readl(H713_DISP_PANEL_BLUE_RGB0);
+	u32 saved_rgb1 = readl(H713_DISP_PANEL_BLUE_RGB1);
+	u32 saved_ctrl = readl(H713_DISP_PANEL_BLUE_CTRL);
+	uint i;
+
+	printf("H713 panel: phase 1, 720p firmware hardware-blue-screen source, "
+	       "%u colours x %u ms\n",
+	       (uint)ARRAY_SIZE(colours), H713_DISP_OSD_DWELL_MS);
+	printf("H713 panel: blue-screen baseline: %08x %08x %08x\n",
+	       saved_rgb0, saved_rgb1, saved_ctrl);
+
+	for (i = 0; i < ARRAY_SIZE(colours); i++) {
+		u32 colour = h713_disp_panel_blue_colour(colours[i][0],
+							 colours[i][1],
+							 colours[i][2]);
+
+		writel(colour, H713_DISP_PANEL_BLUE_RGB0);
+		writel(colour, H713_DISP_PANEL_BLUE_RGB1);
+		writel((readl(H713_DISP_PANEL_BLUE_CTRL) & ~0x7f) | 0x7f,
+		       H713_DISP_PANEL_BLUE_CTRL);
+		printf("H713 panel: hardware colour %u/4: %08x %08x %08x\n",
+		       i + 1, readl(H713_DISP_PANEL_BLUE_RGB0),
+		       readl(H713_DISP_PANEL_BLUE_RGB1),
+		       readl(H713_DISP_PANEL_BLUE_CTRL));
+		mdelay(H713_DISP_OSD_DWELL_MS);
+	}
+
+	writel(saved_rgb0, H713_DISP_PANEL_BLUE_RGB0);
+	writel(saved_rgb1, H713_DISP_PANEL_BLUE_RGB1);
+	writel(saved_ctrl, H713_DISP_PANEL_BLUE_CTRL);
+	printf("H713 panel: blue-screen registers restored: %08x %08x %08x\n",
+	       readl(H713_DISP_PANEL_BLUE_RGB0),
+	       readl(H713_DISP_PANEL_BLUE_RGB1),
+	       readl(H713_DISP_PANEL_BLUE_CTRL));
+}
+
+static void h713_disp_print_panel_gpio(const char *phase)
+{
+	u32 pb = readl(H713_PB_DATA);
+	u32 pf = readl(H713_PF_DATA);
+	u32 ph = readl(H713_PH_DATA);
+
+	printf("H713 panel: %s: PB4 cfg=%x latch=%d, "
+	       "PB5 cfg=%x latch=%d; PH16 cfg=%x latch=%d, "
+	       "PF6 cfg=%x latch=%d\n",
+	       phase,
+	       sunxi_gpio_get_cfgpin(SUNXI_GPB(4)), !!(pb & BIT(4)),
+	       sunxi_gpio_get_cfgpin(SUNXI_GPB(5)), !!(pb & BIT(5)),
+	       sunxi_gpio_get_cfgpin(SUNXI_GPH(16)), !!(ph & BIT(16)),
+	       sunxi_gpio_get_cfgpin(SUNXI_GPF(6)), !!(pf & BIT(6)));
+}
+
+/*
+ * Exercise only controls identified by the stock DT, with the internal white
+ * source active and the panel timing already at 1280x720.
+ *
+ * PB5 is shared by the LED backlight and cooling fan. It is forced high and
+ * never toggled. PH16 is the active-high panel reset/enable and PF6 is panel
+ * power. Do not exercise PB4 as brightness here: it is PWM2 from the
+ * pre-override DT, while board B's panel_config.ini selects PWM5. The PWM5 pin
+ * route is not proven.
+ *
+ * The PF6 power cycle is performed with PH16 asserted low, then the stock
+ * low-to-high reset sequence is replayed after power returns. This makes a
+ * visible opacity/flash change useful evidence that the named GPIOs reach live
+ * panel hardware even if the LVDS image remains absent.
+ */
+static void h713_disp_panel_control_test(void)
+{
+	const uint fan_bl = SUNXI_GPB(5);
+	const uint reset = SUNXI_GPH(16);
+	const uint power = SUNXI_GPF(6);
+	u32 saved_rgb0 = readl(H713_DISP_PANEL_BLUE_RGB0);
+	u32 saved_rgb1 = readl(H713_DISP_PANEL_BLUE_RGB1);
+	u32 saved_ctrl = readl(H713_DISP_PANEL_BLUE_CTRL);
+	u32 white = h713_disp_panel_blue_colour(0x3ff, 0x3ff, 0x3ff);
+
+	/* Preserve the fan/backlight safety interlock throughout this test. */
+	setbits_le32((void *)H713_PB_DATA, BIT(5));
+	sunxi_gpio_set_cfgpin(fan_bl, SUNXI_GPIO_OUTPUT);
+	sunxi_gpio_set_cfgpin(reset, SUNXI_GPIO_OUTPUT);
+	sunxi_gpio_set_cfgpin(power, SUNXI_GPIO_OUTPUT);
+
+	writel(white, H713_DISP_PANEL_BLUE_RGB0);
+	writel(white, H713_DISP_PANEL_BLUE_RGB1);
+	writel((readl(H713_DISP_PANEL_BLUE_CTRL) & ~0x7f) | 0x7f,
+	       H713_DISP_PANEL_BLUE_CTRL);
+
+	printf("H713 panel: phase 2, power/enable readiness test; "
+	       "internal white remains selected\n");
+	h713_disp_print_panel_gpio("control baseline");
+	mdelay(2000);
+
+	printf("H713 panel: PH16 reset/enable LOW for 3 seconds\n");
+	clrbits_le32((void *)H713_PH_DATA, BIT(16));
+	h713_disp_print_panel_gpio("PH16 low");
+	mdelay(3000);
+
+	printf("H713 panel: PH16 reset/enable HIGH for 3 seconds\n");
+	setbits_le32((void *)H713_PH_DATA, BIT(16));
+	h713_disp_print_panel_gpio("PH16 high");
+	mdelay(3000);
+
+	printf("H713 panel: PF6 panel power OFF for 3 seconds; "
+	       "PH16 held LOW, PB5 stays HIGH\n");
+	clrbits_le32((void *)H713_PH_DATA, BIT(16));
+	mdelay(100);
+	clrbits_le32((void *)H713_PF_DATA, BIT(6));
+	h713_disp_print_panel_gpio("PF6 low");
+	mdelay(3000);
+
+	printf("H713 panel: PF6 panel power ON; replaying stock PH16 release\n");
+	setbits_le32((void *)H713_PF_DATA, BIT(6));
+	mdelay(2);
+	setbits_le32((void *)H713_PH_DATA, BIT(16));
+	mdelay(5);
+	h713_disp_print_panel_gpio("panel repowered");
+	mdelay(5000);
+
+	writel(saved_rgb0, H713_DISP_PANEL_BLUE_RGB0);
+	writel(saved_rgb1, H713_DISP_PANEL_BLUE_RGB1);
+	writel(saved_ctrl, H713_DISP_PANEL_BLUE_CTRL);
+	printf("H713 panel: control test complete; blue-screen registers "
+	       "restored: %08x %08x %08x\n",
+	       readl(H713_DISP_PANEL_BLUE_RGB0),
+	       readl(H713_DISP_PANEL_BLUE_RGB1),
+	       readl(H713_DISP_PANEL_BLUE_CTRL));
+}
+
+/*
+ * Restore the panel timing that project 0x33's timing block 6 programmed
+ * before the MIPS replaced it with 1080p. Carry the live bit-31 enables into
+ * +0x2c/+0x30, then pulse the same +0x0c latch used by the vendor table.
+ */
+static void h713_disp_latch_panel_timing(void)
+{
+	u32 ctl = readl(0x0588000c);
+	u32 mode = readl(0x0588001c);
+
+	writel((mode & ~0x7) | 0x4, 0x0588001c);
+	writel(0x02f80550, 0x05880020);	/* 1360x760 total */
+	writel(0x02d00500, 0x05880024);	/* 1280x720 active */
+	writel(0x00140028, 0x05880028);
+	writel(0x80000014, 0x0588002c);
+	writel(0x80010003, 0x05880030);
+	writel(ctl | BIT(0), 0x0588000c);
+	udelay(1);
+	writel(ctl & ~BIT(0), 0x0588000c);
+
+	printf("H713 panel: 720p timing latched: %08x %08x %08x "
+	       "%08x %08x %08x\n",
+	       readl(0x0588001c), readl(0x05880020),
+	       readl(0x05880024), readl(0x05880028),
+	       readl(0x0588002c), readl(0x05880030));
+}
+
+static void h713_disp_animate_pattern(uint frames, uint dwell_ms, uint phase)
+{
+	uint i;
+
+	for (i = 0; i < frames; i++) {
+		h713_disp_fill_pattern(phase + i);
+		printf("H713 panel: animation %u/%u, holding %u ms\n",
+		       i + 1, frames, dwell_ms);
+		mdelay(dwell_ms);
+	}
+}
+
+/*
+ * Re-apply the selected DE block after the coprocessor has settled.
+ *
+ * The firmware demonstrably reprograms display hardware after our replay: it
+ * rewrites the TCON timing to 1080p, and 0x05600168 -- written 0x000003b2 by
+ * DE block 5 -- reads back zero once it has run. Re-imposing the TCON timing
+ * post-readiness is already known to stick (h713_disp_latch_panel_timing), so
+ * the OSD path gets the same treatment: replay the block, which re-asserts
+ * AFBD's format, size, stride, buffer address and enable bit together with the
+ * mixer and DE registers the same block owns.
+ *
+ * The block is replayed rather than hand-written so it applies exactly what
+ * the records say, including the panel-config patches already made to them.
+ * DE block 5 touches only 0x0560xxxx, 0x0525cxxx, 0x0524cxxx and 0x05280xxx,
+ * so it cannot disturb the TCON timing latched just before it.
+ *
+ * This is a diagnostic. If the OSD appears only after the re-assert, the
+ * firmware owns the fetch path and the real work is in how ownership is handed
+ * over -- not in another framebuffer pattern.
+ */
+static int h713_disp_reassert_osd(ulong blob, u32 project)
+{
+	struct h713_disp_sel sel;
+	int ret;
+
+	ret = h713_disp_lookup(blob, project, &sel);
+	if (ret)
+		return ret;
+
+	printf("H713 panel: re-asserting DE block %u after MIPS readiness\n",
+	       sel.de);
+
+	/* Stock writes the mixer control ahead of the DE table; keep parity. */
+	writel(H713_DISPLAY_MIXER_CTRL_VALUE, H713_DISPLAY_MIXER_CTRL_REG);
+
+	ret = h713_logo_walk(blob, h713_disp_de[sel.de].start,
+			     h713_disp_de[sel.de].end, true);
+	if (ret)
+		return ret;
+
+	/* AFBD's buffer address was just rewritten; republish the pixels. */
+	h713_disp_fill_pattern(0);
+	return 0;
+}
+
+#define H713_DISP_AFBD_ENABLE_REG	0x05600144UL
+#define H713_DISP_AFBD_STATUS_REG	0x05600168UL
+#define H713_DISP_LVDS_SCAN_REG		0x05880000UL
+
+/*
+ * 0x05600144 is the last record DE block 5 applies -- a single-bit write under
+ * mask 1 -- and it reads back zero afterwards. That is either a self-clearing
+ * one-shot trigger, in which case the zero means nothing, or an enable that
+ * refuses to latch. Those need different fixes, so separate them.
+ *
+ * Write the bit and read it straight back, repeatedly. Sample two neighbours
+ * at the same time: 0x05600168, which holds a small changing value and behaves
+ * like AFBD status rather than the configuration word the table treats it as,
+ * and 0x05880000, whose two halves track the raster position within the
+ * programmed 1360x760 and therefore prove the TCON is still scanning.
+ *
+ * If the enable is briefly observable set, or either neighbour reacts, the
+ * write lands. If nothing anywhere moves, it is being swallowed.
+ */
+static void h713_disp_afbd_enable_probe(void)
+{
+	uint i;
+
+	printf("H713 panel: AFBD enable probe\n");
+	printf("  baseline    en=%08x status=%08x scan=%08x\n",
+	       readl(H713_DISP_AFBD_ENABLE_REG),
+	       readl(H713_DISP_AFBD_STATUS_REG),
+	       readl(H713_DISP_LVDS_SCAN_REG));
+
+	/* Masked read-modify-write, exactly as the record applier does it. */
+	writel((readl(H713_DISP_AFBD_ENABLE_REG) & ~1UL) | 1UL,
+	       H713_DISP_AFBD_ENABLE_REG);
+
+	for (i = 0; i < 4; i++)
+		printf("  read %u      en=%08x status=%08x scan=%08x\n", i,
+		       readl(H713_DISP_AFBD_ENABLE_REG),
+		       readl(H713_DISP_AFBD_STATUS_REG),
+		       readl(H713_DISP_LVDS_SCAN_REG));
+
+	mdelay(50);
+	printf("  +50ms       en=%08x status=%08x scan=%08x\n",
+	       readl(H713_DISP_AFBD_ENABLE_REG),
+	       readl(H713_DISP_AFBD_STATUS_REG),
+	       readl(H713_DISP_LVDS_SCAN_REG));
+}
+
+static int h713_disp_panel_test(u32 project, bool release_mips)
+{
+	int ret;
+
+	ret = h713_disp_load(project);
+	if (ret)
+		return ret;
+
+	/* Seed before AFBD is enabled, then republish after MIPS readiness. */
+	h713_disp_fill_pattern(0);
+	ret = h713_disp_run(H713_DISP_LOGO_ADDR, project, true, true, false,
+			    false, true, release_mips);
+	if (ret)
+		return ret;
+
+	h713_disp_latch_panel_timing();
+	printf("H713 panel: phase 0, panel timing established before "
+	       "downstream tests\n");
+	h713_disp_panel_blue_test();
+	h713_disp_panel_control_test();
+
+	/*
+	 * Capture the fetch path as the firmware left it, re-assert it, then
+	 * capture it again. The pair of dumps is the evidence: if the AFBD
+	 * words differ across the re-assert, the firmware had torn our OSD
+	 * layer down and the blank screen was never a scanout question.
+	 */
+	printf("H713 panel: OSD state %s\n",
+	       release_mips ? "as the firmware left it"
+			    : "from the ARM sequence alone (MIPS in reset)");
+	h713_disp_dump(false);
+
+	ret = h713_disp_reassert_osd(H713_DISP_LOGO_ADDR, project);
+	if (ret)
+		return ret;
+
+	printf("H713 panel: OSD state after re-assert\n");
+	h713_disp_dump(false);
+
+	h713_disp_afbd_enable_probe();
+
+	printf("H713 panel: phase 3, moving OSD at panel 720p timing, "
+	       "%u frames x %u ms\n",
+	       H713_DISP_OSD_FRAMES, H713_DISP_OSD_DWELL_MS);
+	h713_disp_animate_pattern(H713_DISP_OSD_FRAMES,
+				  H713_DISP_OSD_DWELL_MS, 1);
+
+	if (!release_mips) {
+		printf("H713 panel: pattern test complete; MIPS never released, "
+		       "so this run may be repeated without a power cycle\n");
+		return 0;
+	}
+
+	printf("H713 panel: pattern test complete; MIPS left running, "
+	       "power-cycle before another run\n");
+	return 0;
+}
+
 static int h713_disp_test(u32 project, u32 source_id, u32 level)
 {
 	int ret;
@@ -2671,7 +4466,8 @@ static int h713_disp_test(u32 project, u32 source_id, u32 level)
 	h713_cfg_set(H713_CFG_OFF_ELOG_ASYNC, '0', "elog async");
 	h713_cfg_set(H713_CFG_OFF_ELOG_LEVEL, '0' + level, "elog level");
 
-	ret = h713_disp_run(H713_DISP_LOGO_ADDR, project, false, false);
+	ret = h713_disp_run(H713_DISP_LOGO_ADDR, project, false, false, false,
+			    false, false, true);
 	if (ret)
 		return ret;
 
@@ -2709,6 +4505,20 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
+	/*
+	 * Reproduce stock's panel-power phase, publish cache-coherent pixels,
+	 * prove full firmware readiness, then compare the firmware-selected
+	 * timing with the panel's timing.
+	 */
+	if ((argc == 3 || argc == 4) && !strcmp(argv[1], "panel-test")) {
+		bool noboot = argc == 4 && !strcmp(argv[3], "noboot");
+
+		if (argc == 4 && !noboot)
+			return CMD_RET_USAGE;
+		return h713_disp_panel_test(hextoul(argv[2], NULL), !noboot) ?
+		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
+	}
+
 	/* Load only, so display_cfg.xml can be patched before the run. */
 	if (argc == 3 && !strcmp(argv[1], "load")) {
 		if (h713_disp_load(hextoul(argv[2], NULL)))
@@ -2718,18 +4528,37 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		return CMD_RET_SUCCESS;
 	}
 
+	/*
+	 * Full display launch plus the CPU_COMM handoff. The guarded HDCP wait
+	 * override takes the firmware's own timeout path so its startup can
+	 * reach the CPU_COMM thread while interrupts are still masked.
+	 */
+	if (argc == 3 && (!strcmp(argv[1], "mips-test") ||
+			  !strcmp(argv[1], "mips-trace") ||
+			  !strcmp(argv[1], "mips-stability"))) {
+		u32 project = hextoul(argv[2], NULL);
+		bool trace = !strcmp(argv[1], "mips-trace");
+		bool stability = !strcmp(argv[1], "mips-stability");
+		int ret;
+
+		if (h713_disp_load(project))
+			return CMD_RET_FAILURE;
+		ret = h713_disp_run(H713_DISP_LOGO_ADDR, project, true, true,
+				    trace, stability, false, true);
+		printf("H713 disp: MIPS test complete; power-cycle before "
+		       "another MIPS run\n");
+		return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
+	}
+
 	/* Load everything from eMMC, then run: one command from power-on. */
 	if (argc >= 3 && !strcmp(argv[1], "auto")) {
 		u32 project = hextoul(argv[2], NULL);
-		bool nowait = false, force_720p = false;
+		bool nowait = false;
 		int i;
 
-		/* Modifiers in any order, so neither has to be remembered. */
 		for (i = 3; i < argc; i++) {
 			if (!strcmp(argv[i], "nowait"))
 				nowait = true;
-			else if (!strcmp(argv[i], "720p"))
-				force_720p = true;
 			else
 				return CMD_RET_USAGE;
 		}
@@ -2737,7 +4566,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		if (h713_disp_load(project))
 			return CMD_RET_FAILURE;
 		return h713_disp_run(H713_DISP_LOGO_ADDR, project, nowait,
-				     force_720p) ?
+				     false, false, false, false, true) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
@@ -2753,14 +4582,21 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 
 	blob = hextoul(argv[1], NULL);
 
-	return h713_disp_run(blob, hextoul(argv[2], NULL), argc == 4, false) ?
+	return h713_disp_run(blob, hextoul(argv[2], NULL), argc == 4, false,
+			     false, false, false, true) ?
 	       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 }
 
 U_BOOT_CMD(h713_disp, 5, 0, do_h713_disp,
 	   "run stock's fastlogo display sequence for a project ID",
 	   "test <project-id> [source] [level]  - load, patch, run, sample, log\n"
-	   "h713_disp auto <project-id> [nowait] [720p] - load from eMMC and run\n"
+	   "h713_disp mips-test <project-id>    - run with CPU_COMM readiness proof\n"
+	   "h713_disp mips-trace <project-id>   - stream full-launch startup markers\n"
+	   "h713_disp mips-stability <project-id> - run 60s heartbeat/exception test\n"
+	   "h713_disp panel-test <project-id> [noboot]\n"
+	   "                                    - 720p colours, power controls, OSD\n"
+	   "                                      noboot: hold MIPS in reset, ARM only\n"
+	   "h713_disp auto <project-id> [nowait] - load from eMMC and run\n"
 	   "h713_disp load <project-id>         - load from eMMC only\n"
 	   "h713_disp <blob-addr> <project-id> [nowait] - run against a staged blob\n"
 	   "h713_disp list <blob-addr>          - show every project's tables\n"
