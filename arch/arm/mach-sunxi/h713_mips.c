@@ -4394,6 +4394,118 @@ static void h713_disp_afbd_enable_probe(void)
 	       readl(H713_DISP_LVDS_SCAN_REG));
 }
 
+/*
+ * CPU_COMM routine identities.
+ *
+ * The firmware registers its HAL routines by name and the transport addresses
+ * them by a hashed id. The hash is an Allwinner CRC32 variant over
+ * "<name>_<cpu_id>_<pid_low12>", seed 0x123456, cpu_id 1 for MIPS-side
+ * routines. Reproducing it against ten independently documented ids matched
+ * 10/10, and the 85 THal_Vp_ and MipsHalCallback_ name strings in the
+ * authenticated display.bin match the 82 registrations counted on hardware.
+ *
+ * These are the ids worth recognising in a live table. THal_Vp_*BlackScreen is
+ * first because a firmware that powers on with black-screen asserted would
+ * explain every observation to date: the raster runs, the LVDS PHY is
+ * configured, PHY-injected colours are visible because they inject downstream
+ * of composition -- and the composited output is forced black.
+ */
+static const struct { u32 id; const char *name; } h713_comm_routines[] = {
+	{ 0xb66041d8, "THal_Vp_DisableBlackScreen"  },
+	{ 0xa30d4c6b, "THal_Vp_EnableBlackScreen"   },
+	{ 0x143ffc87, "THal_Vp_DisableScreenCover"  },
+	{ 0x0152f134, "THal_Vp_EnableScreenCover"   },
+	{ 0x396f16bf, "THal_Vp_SetImageBufferAddr"  },
+	{ 0x2f02f7dd, "THal_Vp_GetImageBufferAddr"  },
+	{ 0xeaf13de5, "THal_Vp_SetSource"           },
+	{ 0x24efc7c9, "THal_Vp_GetSource"           },
+	{ 0x1c6ff747, "THal_Vp_Init"                },
+	{ 0x3ab1d1dc, "THal_Vp_DisableVideoFreeze"  },
+	{ 0x7bbd5772, "THal_Vp_Wce_GetActiveWindow" },
+	{ 0x51ad877e, "Thal_Vp_SetBacklightLevel"   },
+	{ 0xb46ce545, "Thal_Vp_SetBacklightPwmInfo" },
+};
+
+/*
+ * Read-only inspection of the live call table. This makes no writes and sends
+ * no messages, so it does not count as a second MIPS launch: run it at the
+ * prompt after panel-test or mips-test, on the same boot, while the firmware
+ * is still up.
+ *
+ * Two outputs. First, any entry word matching a known routine id, with the
+ * offset it was found at -- that locates the id field within the 0x60-byte
+ * entry and confirms the hash convention against this firmware. Second, raw
+ * hex for the first few populated entries, so the layout can be worked out
+ * offline even if nothing matches.
+ */
+static int h713_disp_call_table(uint raw_entries)
+{
+	u32 version, count;
+	uint i, w, shown = 0, populated = 0, matched = 0;
+
+	version = h713_mips_read_shmem(H713_MIPS_SHMEM_CALL_VERSION_OFF);
+	count   = h713_mips_read_shmem(H713_MIPS_SHMEM_CALL_COUNT_OFF);
+
+	printf("H713 comm: call table @0x%08lx  version=%u count=%u\n",
+	       H713_MIPS_SHMEM_ADDR + H713_MIPS_SHMEM_CALL_TABLE_OFF,
+	       version, count);
+
+	if (!count || count > H713_MIPS_SHMEM_CALL_ENTRY_COUNT) {
+		printf("H713 comm: table not populated -- run the firmware "
+		       "first, on this boot\n");
+		return -ENODEV;
+	}
+
+	for (i = 0; i < H713_MIPS_SHMEM_CALL_ENTRY_COUNT; i++) {
+		ulong off = H713_MIPS_SHMEM_CALL_TABLE_OFF +
+			    i * H713_MIPS_SHMEM_CALL_ENTRY_SIZE;
+		u32 word[H713_MIPS_SHMEM_CALL_ENTRY_SIZE / 4];
+		bool any = false;
+
+		for (w = 0; w < ARRAY_SIZE(word); w++) {
+			word[w] = h713_mips_read_shmem(off + w * 4);
+			/* The free sentinel is not content. */
+			if (word[w] && !(w * 4 == H713_MIPS_SHMEM_CALL_NEXT_OFF &&
+					 word[w] == ~0U))
+				any = true;
+		}
+		if (!any)
+			continue;
+		populated++;
+
+		for (w = 0; w < ARRAY_SIZE(word); w++) {
+			uint r;
+
+			for (r = 0; r < ARRAY_SIZE(h713_comm_routines); r++) {
+				if (word[w] != h713_comm_routines[r].id)
+					continue;
+				printf("  entry %4u  +0x%02x = %08x  %s\n",
+				       i, w * 4, word[w],
+				       h713_comm_routines[r].name);
+				matched++;
+			}
+		}
+
+		if (shown < raw_entries) {
+			printf("  entry %4u raw:", i);
+			for (w = 0; w < ARRAY_SIZE(word); w++) {
+				if (!(w % 8))
+					printf("\n    +0x%02x:", w * 4);
+				printf(" %08x", word[w]);
+			}
+			printf("\n");
+			shown++;
+		}
+	}
+
+	printf("H713 comm: %u populated entr%s, %u known routine id(s) matched\n",
+	       populated, populated == 1 ? "y" : "ies", matched);
+	if (!matched)
+		printf("H713 comm: no id matched -- the raw dumps above are the "
+		       "input for working out the entry layout offline\n");
+	return 0;
+}
+
 static int h713_disp_panel_test(u32 project, bool release_mips)
 {
 	int ret;
@@ -4510,6 +4622,13 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 	 * prove full firmware readiness, then compare the firmware-selected
 	 * timing with the panel's timing.
 	 */
+	if ((argc == 2 || argc == 3) && !strcmp(argv[1], "calltable")) {
+		uint n = argc == 3 ? dectoul(argv[2], NULL) : 4;
+
+		return h713_disp_call_table(n) ?
+		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
+	}
+
 	if ((argc == 3 || argc == 4) && !strcmp(argv[1], "panel-test")) {
 		bool noboot = argc == 4 && !strcmp(argv[3], "noboot");
 
@@ -4593,6 +4712,7 @@ U_BOOT_CMD(h713_disp, 5, 0, do_h713_disp,
 	   "h713_disp mips-test <project-id>    - run with CPU_COMM readiness proof\n"
 	   "h713_disp mips-trace <project-id>   - stream full-launch startup markers\n"
 	   "h713_disp mips-stability <project-id> - run 60s heartbeat/exception test\n"
+	   "h713_disp calltable [raw-entries]   - read the live CPU_COMM call table\n"
 	   "h713_disp panel-test <project-id> [noboot]\n"
 	   "                                    - 720p colours, power controls, OSD\n"
 	   "                                      noboot: hold MIPS in reset, ARM only\n"
