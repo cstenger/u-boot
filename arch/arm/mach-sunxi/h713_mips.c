@@ -4593,6 +4593,70 @@ static const struct { u32 id; const char *name; } h713_comm_routines[] = {
 };
 
 /*
+ * Read-only inspection of the eight share_seq transports.
+ *
+ * U-Boot builds each one with rd_idx=0 and wr_idx=20 -- a ring holding twenty
+ * free slots in a capacity of twenty-one. If the firmware has allocated or
+ * consumed any, those indices will have moved, which is the difference between
+ * "the firmware tolerated our structures" and "the firmware is using them".
+ *
+ * Makes no writes and sends no messages, so it does not consume the
+ * one-launch-per-power-cycle budget.
+ */
+static int h713_disp_comm_state(void)
+{
+	uint cpu, dir, idx, live = 0;
+
+	if (h713_mips_read_shmem(H713_MIPS_SHMEM_MAGIC1_OFF) !=
+	    H713_MIPS_SHMEM_MAGIC) {
+		printf("H713 comm: shared memory not published this boot\n");
+		return -ENODEV;
+	}
+
+	printf("H713 comm: share_seq transports "
+	       "(as built: rd=0 wr=%u cap=%u)\n",
+	       H713_MIPS_SEQ_SLOTS, H713_MIPS_SEQ_FIFO_CAPACITY);
+
+	for (cpu = 0; cpu < 2; cpu++)
+	for (dir = 0; dir < 2; dir++)
+	for (idx = 0; idx < 2; idx++) {
+		ulong off = H713_MIPS_SEQ_BASE_OFF +
+			    cpu * H713_MIPS_SEQ_PER_CPU +
+			    dir * H713_MIPS_SEQ_PER_DIR +
+			    idx * H713_MIPS_SEQ_STRIDE;
+		ulong f = off + H713_MIPS_SEQ_FIFO_OFF;
+		u32 rd = h713_mips_read_shmem(f + 0x00);
+		u32 wr = h713_mips_read_shmem(f + 0x04);
+		u32 peak = h713_mips_read_shmem(f + 0x08);
+		u32 cap = h713_mips_read_shmem(f + 0x10);
+		u32 base = h713_mips_read_shmem(f + 0x18);
+		char name[0x14];
+		uint i;
+		bool moved;
+
+		for (i = 0; i < sizeof(name) - 1; i++)
+			name[i] = (char)(h713_mips_read_shmem(off + 0x98 +
+					 (i & ~3)) >> ((i & 3) * 8));
+		name[sizeof(name) - 1] = 0;
+
+		moved = rd != 0 || wr != H713_MIPS_SEQ_SLOTS;
+		if (moved)
+			live++;
+
+		printf("  cpu=%u dir=%u idx=%u %-11s @+0x%05lx  "
+		       "rd=%-3u wr=%-3u peak=%-3u cap=%-3u base=%08x%s\n",
+		       cpu, dir, idx, name, off, rd, wr, peak, cap, base,
+		       moved ? "  <== MOVED" : "");
+	}
+
+	printf("H713 comm: %u of 8 transport(s) show movement\n", live);
+	if (!live)
+		printf("H713 comm: firmware accepted the structures but has not "
+		       "used them; a send would be the first traffic\n");
+	return 0;
+}
+
+/*
  * Read-only inspection of the live call table. This makes no writes and sends
  * no messages, so it does not count as a second MIPS launch: run it at the
  * prompt after panel-test or mips-test, on the same boot, while the firmware
@@ -4788,6 +4852,10 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 	 * prove full firmware readiness, then compare the firmware-selected
 	 * timing with the panel's timing.
 	 */
+	if (argc == 2 && !strcmp(argv[1], "commstate"))
+		return h713_disp_comm_state() ?
+		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
+
 	if ((argc == 2 || argc == 3) && !strcmp(argv[1], "calltable")) {
 		uint n = argc == 3 ? dectoul(argv[2], NULL) : 4;
 
@@ -4879,6 +4947,7 @@ U_BOOT_CMD(h713_disp, 5, 0, do_h713_disp,
 	   "h713_disp mips-trace <project-id>   - stream full-launch startup markers\n"
 	   "h713_disp mips-stability <project-id> - run 60s heartbeat/exception test\n"
 	   "h713_disp calltable [raw-entries]   - read the live CPU_COMM call table\n"
+	   "h713_disp commstate                 - read the CPU_COMM transports\n"
 	   "h713_disp panel-test <project-id> [noboot]\n"
 	   "                                    - 720p colours, power controls, OSD\n"
 	   "                                      noboot: hold MIPS in reset, ARM only\n"
