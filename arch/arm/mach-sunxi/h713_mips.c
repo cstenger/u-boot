@@ -1941,6 +1941,167 @@ static u32 h713_mips_read_shmem(ulong offset)
 	return readl(addr);
 }
 
+/*
+ * The rest of the CPU_COMM master init, transcribed from the firmware.
+ *
+ * display.bin carries the ARM master's init as well as its own slave path.
+ * getCurCPUID at 0x8b1227b4 hardcodes 1, so the master block at 0x8b11ace8 is
+ * compiled in but never executed by the firmware -- it is the vendor's
+ * specification of what the ARM must build. comm_InitSpinLock and the
+ * call-table sentinels above came from the same block and were both correct on
+ * hardware, which is the basis for trusting the rest of it.
+ *
+ * Three structures remain. Everything else the master path does either is
+ * already published above or touches only firmware BSS (0x8b124ba4,
+ * 0x8b119bb4) and imposes no obligation on the ARM.
+ */
+#define H713_MIPS_SEQ_BASE_OFF		0x00000098UL
+#define H713_MIPS_SEQ_STRIDE		2440
+#define H713_MIPS_SEQ_PER_DIR		4880
+#define H713_MIPS_SEQ_PER_CPU		9760
+#define H713_MIPS_SEQ_SLOTS		20
+#define H713_MIPS_SEQ_SLOT_SIZE		104
+#define H713_MIPS_SEQ_RING_OFF		0x0c0
+#define H713_MIPS_SEQ_SLOTS_OFF		0x168
+#define H713_MIPS_SEQ_FIFO_OFF		0x078
+#define H713_MIPS_SEQ_FIFO_CAPACITY	21
+
+/*
+ * 0x8b1197d4(cpu, dir), addressed by 0x8b1193d8 as
+ * shared + 0x98 + 9760*cpu + 4880*dir + 2440*idx. Eight structs of 0x988
+ * bytes; the array ends exactly where max_cpu begins at 0x4cd8, which is the
+ * check that the formula is right.
+ *
+ * The block at +0x78 is the vendor's comm_fifo, and the twenty 104-byte
+ * message slots at +0x168 end exactly at 0x988. Each slot is stamped with its
+ * index and an invalid session, then pushed onto the ring as its ARM-physical
+ * address -- so the ring starts full of free slots, twenty in a capacity of
+ * twenty-one, the spare being the full-detect slot.
+ */
+static void h713_mips_init_share_seq(uint cpu, uint dir, uint idx)
+{
+	ulong base = H713_MIPS_SHMEM_ADDR + H713_MIPS_SEQ_BASE_OFF +
+		     cpu * H713_MIPS_SEQ_PER_CPU + dir * H713_MIPS_SEQ_PER_DIR +
+		     idx * H713_MIPS_SEQ_STRIDE;
+	ulong slots = base + H713_MIPS_SEQ_SLOTS_OFF;
+	ulong ring = base + H713_MIPS_SEQ_RING_OFF;
+	ulong fifo = base + H713_MIPS_SEQ_FIFO_OFF;
+	uint i;
+
+	writeb(cpu, base + 0x00);
+	writeb(dir, base + 0x01);
+	writeb(idx, base + 0x02);
+	writeb(0,   base + 0x08);
+	writeb(H713_MIPS_SEQ_SLOTS, base + 0x10);
+	writel(~0U, base + 0x14);
+	writeb(H713_MIPS_SEQ_SLOTS, base + 0x68);
+	writeb(0,   base + 0x69);
+	writel(~0U, base + 0x6c);
+
+	writel(0, fifo + 0x00);				/* rd_idx     */
+	writel(H713_MIPS_SEQ_SLOTS, fifo + 0x04);	/* wr_idx     */
+	writel(0, fifo + 0x08);				/* peak_count */
+	writel(1, fifo + 0x0c);				/* track      */
+	writel(H713_MIPS_SEQ_FIFO_CAPACITY, fifo + 0x10);
+	writel(4, fifo + 0x14);				/* item_size  */
+	writel(ring, fifo + 0x18);			/* base_addr  */
+	writel(0, fifo + 0x1c);
+
+	/*
+	 * The name is selected by idx, not dir: 0x8b1197d4 runs its body twice
+	 * per (cpu, dir) -- idx 0 names the FIFO "FreeCall" at 0x8b119b84, then
+	 * the tail at 0x8b119bac sets idx to 1 and repeats for "FreeReturn".
+	 * That is why the addressing formula has an idx term and why all eight
+	 * structures are live.
+	 */
+	strncpy((char *)(base + 0x98), idx ? "FreeReturn" : "FreeCall", 0x20);
+	writel(0, base + 0xb8);
+
+	for (i = 0; i < H713_MIPS_SEQ_SLOTS; i++) {
+		ulong slot = slots + i * H713_MIPS_SEQ_SLOT_SIZE;
+
+		writew(i, slot + 0x04);		/* comm_msg.slot_index */
+		writel(~0U, slot + 0x0c);	/* comm_msg.session_id */
+		writel(slot, ring + i * 4);	/* free slot, ARM-physical */
+	}
+}
+
+static void h713_mips_init_share_seqs(void)
+{
+	uint cpu, dir, idx;
+
+	for (cpu = 0; cpu < 2; cpu++)
+		for (dir = 0; dir < 2; dir++)
+			for (idx = 0; idx < 2; idx++)
+				h713_mips_init_share_seq(cpu, dir, idx);
+}
+
+/*
+ * Five empty circular lists, each {self, 0, self, 0}, written at 0x8b11af1c
+ * onwards. The offsets are irregular because other state sits between them.
+ */
+static void h713_mips_init_lists(void)
+{
+	static const ulong off[] = {
+		0x4d10, 0x4d28, 0x4d58, 0x4d70, 0x4d88,
+	};
+	uint i;
+
+	for (i = 0; i < ARRAY_SIZE(off); i++) {
+		ulong l = H713_MIPS_SHMEM_ADDR + off[i];
+
+		writel(l, l + 0x00);
+		writel(0, l + 0x04);
+		writel(l, l + 0x08);
+		writel(0, l + 0x0c);
+	}
+}
+
+/*
+ * 256 records of 0x28 bytes from 0x4db0 to 0x75b0 -- the loop at 0x8b11af70,
+ * which lands exactly on magic2 at 0x75b8. Each gets the same self-referencing
+ * head, then 0x8b1234c8(2, 0, record) appends it to the free list rooted at
+ * 0x4d80: tail at +0x10, back link at record+0x20, anchor 0x4d88 at
+ * record+0x18, and a u16 count at 0x4d82.
+ */
+#define H713_MIPS_REC_BASE_OFF	0x4db0UL
+#define H713_MIPS_REC_END_OFF	0x75b0UL
+#define H713_MIPS_REC_STRIDE	0x28
+#define H713_MIPS_REC_LIST_OFF	0x4d80UL
+#define H713_MIPS_REC_ANCHOR	0x4d88UL
+
+static void h713_mips_init_record_pool(void)
+{
+	ulong list = H713_MIPS_SHMEM_ADDR + H713_MIPS_REC_LIST_OFF;
+	ulong anchor = H713_MIPS_SHMEM_ADDR + H713_MIPS_REC_ANCHOR;
+	ulong prev = 0;
+	ulong off;
+	u16 count = 0;
+
+	for (off = H713_MIPS_REC_BASE_OFF; off < H713_MIPS_REC_END_OFF;
+	     off += H713_MIPS_REC_STRIDE) {
+		ulong r = H713_MIPS_SHMEM_ADDR + off;
+
+		writel(r, r + 0x00);
+		writel(0, r + 0x04);
+		writel(r, r + 0x08);
+		writel(0, r + 0x0c);
+
+		writel(prev, r + 0x20);
+		writel(anchor, r + 0x18);
+		writel(0, r + 0x1c);
+		writel(0, r + 0x24);
+		if (prev)
+			writel(0, prev + 0x04);
+
+		prev = r + 0x18;
+		writel(prev, list + 0x10);
+		writel(0, list + 0x14);
+		count++;
+	}
+	writew(count, list + 0x02);
+}
+
 static void h713_mips_prepare_ready_probe(void)
 {
 	int i;
@@ -1988,6 +2149,10 @@ static void h713_mips_prepare_ready_probe(void)
 	       H713_MIPS_SHMEM_ADDR + H713_MIPS_SHMEM_ARM_FLAG_OFF);
 	writel(0, H713_MIPS_SHMEM_ADDR + H713_MIPS_SHMEM_MIPS_FLAG_OFF);
 
+	h713_mips_init_share_seqs();
+	h713_mips_init_lists();
+	h713_mips_init_record_pool();
+
 	/*
 	 * Publish the magic words last. The MIPS firmware treats both markers,
 	 * the ARM ready/app-ready flag, and an unlocked hardware spinlock 0 as
@@ -2000,7 +2165,8 @@ static void h713_mips_prepare_ready_probe(void)
 	flush_cache(H713_MIPS_SHMEM_ADDR, H713_MIPS_SHMEM_SIZE);
 
 	printf("H713 MIPS: readiness probe shared memory prepared "
-	       "(12 spinlocks, 1224 call entries initialized)\n");
+	       "(12 spinlocks, 1224 call entries, 8 share_seq, "
+	       "5 lists, 256 records)\n");
 }
 
 static int h713_mips_apply_trace(void)
