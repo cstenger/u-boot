@@ -4593,6 +4593,181 @@ static const struct { u32 id; const char *name; } h713_comm_routines[] = {
 };
 
 /*
+ * Send one CPU_COMM CALL and poll for its reply.
+ *
+ * Every step below is transcribed from display.bin rather than inferred:
+ *
+ *   queue      0x8b1195ec/0x8b1195b8 are mirrors of the share_seq addressing,
+ *              so a message from X to Y lives in share_seq(Y, X, idx). For
+ *              ARM(0) -> MIPS(1) CALL that is share_seq(1,0,0), and the reply
+ *              comes back in share_seq(0,1,1).
+ *   allocate   0x8b118be8 takes share_seq+0x78 and pops via 0x8b1180ec, which
+ *              returns base_addr + rd_idx*item_size and NULL when rd == wr.
+ *              The popped entry holds the slot's ARM-physical address, and the
+ *              slot carries its own index at +0x04, bounds-checked below 20.
+ *   fill       memcpy(slot, msg, 104) at 0x8b1201b8, then slot[+0x04] = index
+ *              and slot[+0x0A] = 2, then an assertion that the slot address is
+ *              exactly share_seq + 0x168 + 104*index.
+ *   publish    0x8b11f9ec writes share_seq[+0x10] = index, [+0x08] = flags,
+ *              [+0x14] = session, [+0x18] = wait pointer, bumps [+0x04].
+ *   doorbell   a single write to 0x03003874; the pulse workaround in the Linux
+ *              tree belongs to the ARISC path, not this one.
+ *
+ * The wait pointer is published as zero deliberately. The receiver stores it
+ * at share_seq[+0x70]/[+0x74] without dereferencing, and the signal primitive
+ * at 0x8b15c27c null-checks and returns an error rather than writing. U-Boot
+ * polls, so it does not need to be signalled. The residual risk is behavioural
+ * -- the firmware may log an error path -- not memory corruption.
+ *
+ * This is the first traffic in either direction. It writes into a live
+ * coprocessor's queues, so it is a separate opt-in command and never runs as
+ * part of panel-test.
+ */
+#define H713_COMM_CALL_SEQ_OFF	0x000026b8UL	/* share_seq(1,0,0) FreeCall  */
+#define H713_COMM_RET_SEQ_OFF	0x00001d30UL	/* share_seq(0,1,1) FreeReturn*/
+#define H713_COMM_MSG_SIZE	104
+#define H713_COMM_DOORBELL	0x03003874UL
+#define H713_COMM_DOORBELL_CALL	0x00000002	/* msg_type 0, intr_type 2    */
+
+static int h713_comm_call(u32 comp_id, const u32 *params, uint nparams)
+{
+	ulong seq = H713_MIPS_SHMEM_ADDR + H713_COMM_CALL_SEQ_OFF;
+	ulong ret_seq = H713_MIPS_SHMEM_ADDR + H713_COMM_RET_SEQ_OFF;
+	ulong fifo = seq + H713_MIPS_SEQ_FIFO_OFF;
+	u32 rd, wr, cap, isz, base;
+	ulong entry, slot, expect;
+	u8 msg[H713_COMM_MSG_SIZE];
+	uint index, i;
+	int waited;
+
+	if (nparams > 10) {
+		printf("H713 comm: at most 10 parameters\n");
+		return -EINVAL;
+	}
+	if (h713_mips_read_shmem(H713_MIPS_SHMEM_MAGIC1_OFF) !=
+	    H713_MIPS_SHMEM_MAGIC) {
+		printf("H713 comm: shared memory not published this boot\n");
+		return -ENODEV;
+	}
+
+	rd   = h713_mips_read_shmem(H713_COMM_CALL_SEQ_OFF +
+				    H713_MIPS_SEQ_FIFO_OFF + 0x00);
+	wr   = h713_mips_read_shmem(H713_COMM_CALL_SEQ_OFF +
+				    H713_MIPS_SEQ_FIFO_OFF + 0x04);
+	cap  = h713_mips_read_shmem(H713_COMM_CALL_SEQ_OFF +
+				    H713_MIPS_SEQ_FIFO_OFF + 0x10);
+	isz  = h713_mips_read_shmem(H713_COMM_CALL_SEQ_OFF +
+				    H713_MIPS_SEQ_FIFO_OFF + 0x14);
+	base = h713_mips_read_shmem(H713_COMM_CALL_SEQ_OFF +
+				    H713_MIPS_SEQ_FIFO_OFF + 0x18);
+
+	printf("H713 comm: FreeCall @+0x%05lx  rd=%u wr=%u cap=%u isz=%u "
+	       "base=%08x\n", H713_COMM_CALL_SEQ_OFF, rd, wr, cap, isz, base);
+
+	if (!cap || rd == wr) {
+		printf("H713 comm: no free slot (ring empty)\n");
+		return -EBUSY;
+	}
+
+	/* 0x8b1180ec: entry = base_addr + rd_idx * item_size */
+	entry = base + rd * isz;
+	invalidate_dcache_range(entry & ~(CONFIG_SYS_CACHELINE_SIZE - 1),
+				(entry & ~(CONFIG_SYS_CACHELINE_SIZE - 1)) +
+				CONFIG_SYS_CACHELINE_SIZE);
+	slot = readl(entry);
+
+	/* 0x8b118be8: the slot carries its own index, bounded by 20. */
+	invalidate_dcache_range(slot & ~(CONFIG_SYS_CACHELINE_SIZE - 1),
+				(slot & ~(CONFIG_SYS_CACHELINE_SIZE - 1)) +
+				CONFIG_SYS_CACHELINE_SIZE);
+	index = readw(slot + 0x04);
+
+	expect = seq + H713_MIPS_SEQ_SLOTS_OFF + index * H713_COMM_MSG_SIZE;
+	printf("H713 comm: slot %u @0x%08lx (index %u, expect 0x%08lx)\n",
+	       rd, slot, index, expect);
+
+	if (index >= H713_MIPS_SEQ_SLOTS || slot != expect) {
+		printf("H713 comm: slot inconsistent -- refusing to send\n");
+		return -EINVAL;
+	}
+
+	/*
+	 * Build the message. Layout confirmed from the consumer, command_action
+	 * at 0x8b120bc0: dst_cpu +0x02, slot_index +0x04, flags +0x06, parameter
+	 * count in cmd_type +0x08, session +0x0C, comp_id +0x28, params +0x2C.
+	 * flags stays zero -- the Linux driver clears its notify bit for a
+	 * synchronous call, and command_action tests bit 2 of the published
+	 * state to take an alternate path.
+	 */
+	memset(msg, 0, sizeof(msg));
+	*(u16 *)(msg + 0x02) = 1;			/* dst_cpu = MIPS   */
+	*(u16 *)(msg + 0x04) = (u16)index;
+	*(u16 *)(msg + 0x06) = 0;			/* flags            */
+	*(u16 *)(msg + 0x08) = (u16)nparams;		/* cmd_type = count */
+	*(u32 *)(msg + 0x0c) = 0x00000001;		/* session id       */
+	*(u32 *)(msg + 0x28) = comp_id;
+	for (i = 0; i < nparams; i++)
+		*(u32 *)(msg + 0x2c + i * 4) = params[i];
+
+	memcpy((void *)slot, msg, sizeof(msg));
+	writew((u16)index, slot + 0x04);
+	writew(2, slot + 0x0a);				/* CALL marker      */
+	flush_cache(slot & ~(CONFIG_SYS_CACHELINE_SIZE - 1),
+		    H713_COMM_MSG_SIZE + CONFIG_SYS_CACHELINE_SIZE);
+
+	/* Consume the ring entry. */
+	writel((rd + 1) % cap, fifo + 0x00);
+
+	/* 0x8b11f9ec, with the wait pointer deliberately zero. */
+	writeb((u8)index, seq + 0x10);
+	writeb(0, seq + 0x08);
+	writel(0x00000001, seq + 0x14);			/* session          */
+	writel(0, seq + 0x18);				/* wait ptr lo      */
+	writel(0, seq + 0x1c);				/* wait ptr hi      */
+	writel(h713_mips_read_shmem(H713_COMM_CALL_SEQ_OFF + 0x04) + 1,
+	       seq + 0x04);
+	flush_cache(seq, 0x80);
+
+	printf("H713 comm: published index %u, comp_id 0x%08x, %u param(s); "
+	       "ringing doorbell\n", index, comp_id, nparams);
+
+	writel(H713_COMM_DOORBELL_CALL, H713_COMM_DOORBELL);
+
+	/* Poll the return transport rather than waiting to be signalled. */
+	for (waited = 0; waited < 2000; waited++) {
+		u32 ridx = h713_mips_read_shmem(H713_COMM_RET_SEQ_OFF + 0x10) &
+			   0xff;
+
+		if (ridx < H713_MIPS_SEQ_SLOTS) {
+			ulong rslot = ret_seq + H713_MIPS_SEQ_SLOTS_OFF +
+				      ridx * H713_COMM_MSG_SIZE;
+
+			invalidate_dcache_range(rslot, rslot +
+						H713_COMM_MSG_SIZE);
+			printf("H713 comm: reply after %d ms, slot %u\n",
+			       waited, ridx);
+			printf("  session=%08x comp_id=%08x\n",
+			       readl(rslot + 0x0c), readl(rslot + 0x28));
+			for (i = 0; i < 6; i++)
+				printf("  ret[%u]=%08x\n", i,
+				       readl(rslot + 0x2c + i * 4));
+			return 0;
+		}
+		mdelay(1);
+	}
+
+	printf("H713 comm: no reply within 2000 ms\n");
+	printf("  FreeCall  rd=%u wr=%u  idx=%02x state=%02x\n",
+	       h713_mips_read_shmem(H713_COMM_CALL_SEQ_OFF +
+				    H713_MIPS_SEQ_FIFO_OFF + 0x00),
+	       h713_mips_read_shmem(H713_COMM_CALL_SEQ_OFF +
+				    H713_MIPS_SEQ_FIFO_OFF + 0x04),
+	       h713_mips_read_shmem(H713_COMM_CALL_SEQ_OFF + 0x10) & 0xff,
+	       h713_mips_read_shmem(H713_COMM_CALL_SEQ_OFF + 0x08) & 0xff);
+	return -ETIMEDOUT;
+}
+
+/*
  * Read-only inspection of the eight share_seq transports.
  *
  * U-Boot builds each one with rd_idx=0 and wr_idx=20 -- a ring holding twenty
@@ -4852,6 +5027,24 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 	 * prove full firmware readiness, then compare the firmware-selected
 	 * timing with the panel's timing.
 	 */
+	/*
+	 * Opt-in: this is the only command that writes into the live
+	 * coprocessor's queues. GetImageBufferAddr (0x2f02f7dd) is the safest
+	 * first target -- it takes no parameters and only reads firmware state.
+	 */
+	if (argc >= 3 && !strcmp(argv[1], "commcall")) {
+		u32 comp_id = hextoul(argv[2], NULL);
+		u32 p[10];
+		uint n = argc - 3, k;
+
+		if (n > ARRAY_SIZE(p))
+			return CMD_RET_USAGE;
+		for (k = 0; k < n; k++)
+			p[k] = hextoul(argv[3 + k], NULL);
+		return h713_comm_call(comp_id, p, n) ?
+		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
+	}
+
 	if (argc == 2 && !strcmp(argv[1], "commstate"))
 		return h713_disp_comm_state() ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
@@ -4948,6 +5141,7 @@ U_BOOT_CMD(h713_disp, 5, 0, do_h713_disp,
 	   "h713_disp mips-stability <project-id> - run 60s heartbeat/exception test\n"
 	   "h713_disp calltable [raw-entries]   - read the live CPU_COMM call table\n"
 	   "h713_disp commstate                 - read the CPU_COMM transports\n"
+	   "h713_disp commcall <id> [args..]    - send one CPU_COMM CALL (writes!)\n"
 	   "h713_disp panel-test <project-id> [noboot]\n"
 	   "                                    - 720p colours, power controls, OSD\n"
 	   "                                      noboot: hold MIPS in reset, ARM only\n"
