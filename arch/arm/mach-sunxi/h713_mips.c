@@ -4626,8 +4626,12 @@ static const struct { u32 id; const char *name; } h713_comm_routines[] = {
 #define H713_COMM_CALL_SEQ_OFF	0x000026b8UL	/* share_seq(1,0,0) FreeCall  */
 #define H713_COMM_RET_SEQ_OFF	0x00001d30UL	/* share_seq(0,1,1) FreeReturn*/
 #define H713_COMM_MSG_SIZE	104
-#define H713_COMM_DOORBELL	0x03003874UL
+#define H713_COMM_DOORBELL	0x03003874UL	/* User2 sub0 port1 MSG_DATA  */
 #define H713_COMM_DOORBELL_CALL	0x00000002	/* msg_type 0, intr_type 2    */
+#define H713_COMM_MSGBOX_VERSION 0x03003810UL	/* User2 sub0 +0x10           */
+#define H713_COMM_MSGBOX_COUNT	0x03003864UL	/* User2 sub0 +0x60 + 4*port  */
+#define H713_COMM_MSGBOX_BGR	0x0200171cUL	/* bit 0 gate, bit 16 reset   */
+#define H713_COMM_MSGBOX_TX_IRQ_EN 0x03003830UL	/* User2 sub0 +0x30           */
 
 static int h713_comm_call(u32 comp_id, const u32 *params, uint nparams)
 {
@@ -4639,6 +4643,7 @@ static int h713_comm_call(u32 comp_id, const u32 *params, uint nparams)
 	u8 msg[H713_COMM_MSG_SIZE];
 	uint index, i;
 	int waited;
+	bool drained = false;
 
 	if (nparams > 10) {
 		printf("H713 comm: at most 10 parameters\n");
@@ -4728,15 +4733,54 @@ static int h713_comm_call(u32 comp_id, const u32 *params, uint nparams)
 	       seq + 0x04);
 	flush_cache(seq, 0x80);
 
-	printf("H713 comm: published index %u, comp_id 0x%08x, %u param(s); "
-	       "ringing doorbell\n", index, comp_id, nparams);
+	printf("H713 comm: published index %u, comp_id 0x%08x, %u param(s)\n",
+	       index, comp_id, nparams);
 
+	/*
+	 * The msgbox has its own bus gate and reset, which Linux takes via
+	 * CLK_BUS_MSGBOX/RST_BUS_MSGBOX and U-Boot has never touched. An
+	 * unclocked block swallows the doorbell silently, so enable it and
+	 * prove it is alive before writing: the per-sub-block version register
+	 * reads 0x00020000 on a live msgbox.
+	 */
+	printf("H713 comm: msgbox BGR before %08x\n",
+	       readl(H713_COMM_MSGBOX_BGR));
+	setbits_le32((void *)H713_COMM_MSGBOX_BGR, BIT(0) | BIT(16));
+	udelay(20);
+	printf("H713 comm: msgbox BGR after  %08x, version %08x (expect "
+	       "00020000), fifo count %u\n",
+	       readl(H713_COMM_MSGBOX_BGR), readl(H713_COMM_MSGBOX_VERSION),
+	       readl(H713_COMM_MSGBOX_COUNT));
+
+	/*
+	 * H713's msgbox is edge-triggered, unlike H6's level-triggered one, so
+	 * writing MSG_DATA alone leaves the message sitting in the FIFO without
+	 * waking the receiver -- observed directly: the count went 0 -> 1 and
+	 * the MIPS never drained it. The receiver needs a TX_IRQ_EN pulse.
+	 *
+	 * TX_IRQ_EN is at sub-block +0x30 and the bit is BIT(2*port + 1); the
+	 * Linux tree's ARISC path pulses BIT(7) for port 3, which is the same
+	 * rule. MIPS is port 1, so BIT(3).
+	 */
 	writel(H713_COMM_DOORBELL_CALL, H713_COMM_DOORBELL);
+	writel(BIT(3), H713_COMM_MSGBOX_TX_IRQ_EN);
+	udelay(10);
+	writel(0, H713_COMM_MSGBOX_TX_IRQ_EN);
+	udelay(100);
+	printf("H713 comm: doorbell rung + IRQ pulsed; fifo count now %u\n",
+	       readl(H713_COMM_MSGBOX_COUNT));
 
 	/* Poll the return transport rather than waiting to be signalled. */
 	for (waited = 0; waited < 2000; waited++) {
 		u32 ridx = h713_mips_read_shmem(H713_COMM_RET_SEQ_OFF + 0x10) &
 			   0xff;
+		u32 fc = readl(H713_COMM_MSGBOX_COUNT);
+
+		if (!fc && !drained) {
+			printf("H713 comm: MIPS drained the FIFO after %d ms\n",
+			       waited);
+			drained = true;
+		}
 
 		if (ridx < H713_MIPS_SEQ_SLOTS) {
 			ulong rslot = ret_seq + H713_MIPS_SEQ_SLOTS_OFF +
@@ -4756,7 +4800,9 @@ static int h713_comm_call(u32 comp_id, const u32 *params, uint nparams)
 		mdelay(1);
 	}
 
-	printf("H713 comm: no reply within 2000 ms\n");
+	printf("H713 comm: no reply within 2000 ms (fifo count %u, %s)\n",
+	       readl(H713_COMM_MSGBOX_COUNT),
+	       drained ? "was drained" : "never drained");
 	printf("  FreeCall  rd=%u wr=%u  idx=%02x state=%02x\n",
 	       h713_mips_read_shmem(H713_COMM_CALL_SEQ_OFF +
 				    H713_MIPS_SEQ_FIFO_OFF + 0x00),
