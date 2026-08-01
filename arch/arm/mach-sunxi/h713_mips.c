@@ -4654,7 +4654,8 @@ static const struct { u32 id; const char *name; } h713_comm_routines[] = {
 #define H713_COMM_DOORBELL	0x03003874UL	/* User2 sub0 port1 MSG_DATA  */
 #define H713_COMM_DOORBELL_CALL	0x00000002	/* msg_type 0, intr_type 2    */
 
-static int h713_comm_call(u32 comp_id, const u32 *params, uint nparams)
+static int h713_comm_call(u32 comp_id, const u32 *params, uint nparams,
+			  u32 doorbell)
 {
 	ulong seq = H713_MIPS_SHMEM_ADDR + H713_COMM_CALL_SEQ_OFF;
 	ulong ret_seq = H713_MIPS_SHMEM_ADDR + H713_COMM_RET_SEQ_OFF;
@@ -4779,13 +4780,13 @@ static int h713_comm_call(u32 comp_id, const u32 *params, uint nparams)
 	 * Linux tree's ARISC path pulses BIT(7) for port 3, which is the same
 	 * rule. MIPS is port 1, so BIT(3).
 	 */
-	writel(H713_COMM_DOORBELL_CALL, H713_COMM_DOORBELL);
+	writel(doorbell, H713_COMM_DOORBELL);
 	writel(BIT(3), H713_COMM_MSGBOX_TX_IRQ_EN);
 	udelay(10);
 	writel(0, H713_COMM_MSGBOX_TX_IRQ_EN);
 	udelay(100);
-	printf("H713 comm: doorbell rung + IRQ pulsed; fifo count now %u\n",
-	       readl(H713_COMM_MSGBOX_COUNT));
+	printf("H713 comm: doorbell 0x%08x rung + IRQ pulsed; fifo count now "
+	       "%u\n", doorbell, readl(H713_COMM_MSGBOX_COUNT));
 
 	/* Poll the return transport rather than waiting to be signalled. */
 	for (waited = 0; waited < 2000; waited++) {
@@ -4817,9 +4818,17 @@ static int h713_comm_call(u32 comp_id, const u32 *params, uint nparams)
 		mdelay(1);
 	}
 
-	printf("H713 comm: no reply within 2000 ms (fifo count %u, %s)\n",
-	       readl(H713_COMM_MSGBOX_COUNT),
-	       drained ? "was drained" : "never drained");
+	{
+		u32 pidx = h713_mips_read_shmem(H713_COMM_CALL_SEQ_OFF + 0x10) &
+			   0xff;
+
+		printf("H713 comm: no reply within 2000 ms (fifo count %u, %s; "
+		       "published idx %s)\n",
+		       readl(H713_COMM_MSGBOX_COUNT),
+		       drained ? "was drained" : "never drained",
+		       pidx == index ? "still ours -- not consumed"
+				     : "changed -- consumed");
+	}
 	printf("  FreeCall  rd=%u wr=%u  idx=%02x state=%02x\n",
 	       h713_mips_read_shmem(H713_COMM_CALL_SEQ_OFF +
 				    H713_MIPS_SEQ_FIFO_OFF + 0x00),
@@ -5112,14 +5121,34 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 	 */
 	if (argc >= 3 && !strcmp(argv[1], "commcall")) {
 		u32 comp_id = hextoul(argv[2], NULL);
+		u32 db = H713_COMM_DOORBELL_CALL;
 		u32 p[10];
-		uint n = argc - 3, k;
+		uint n = 0, k;
 
-		if (n > ARRAY_SIZE(p))
-			return CMD_RET_USAGE;
-		for (k = 0; k < n; k++)
-			p[k] = hextoul(argv[3 + k], NULL);
-		return h713_comm_call(comp_id, p, n) ?
+		for (k = 3; k < (uint)argc; k++) {
+			if (!strncmp(argv[k], "db=", 3)) {
+				db = hextoul(argv[k] + 3, NULL);
+				continue;
+			}
+			if (n >= ARRAY_SIZE(p))
+				return CMD_RET_USAGE;
+			p[n++] = hextoul(argv[k], NULL);
+		}
+
+		/*
+		 * The receive dispatcher at 0x8b1212cc hangs in an assert loop
+		 * on any type outside 0..3, and which half of the doorbell word
+		 * it reads as the type is exactly what this override exists to
+		 * find out. So refuse anything where either half is out of
+		 * range -- a bad guess here costs a power cycle.
+		 */
+		if ((db >> 16) > 3 || (db & 0xffff) > 3) {
+			printf("H713 comm: refusing doorbell 0x%08x -- both "
+			       "halves must be 0..3 or the firmware asserts\n",
+			       db);
+			return CMD_RET_FAILURE;
+		}
+		return h713_comm_call(comp_id, p, n, db) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
@@ -5221,7 +5250,9 @@ U_BOOT_CMD(h713_disp, 5, 0, do_h713_disp,
 	   "h713_disp mips-stability <project-id> - run 60s heartbeat/exception test\n"
 	   "h713_disp calltable [raw-entries]   - read the live CPU_COMM call table\n"
 	   "h713_disp commstate                 - read the CPU_COMM transports\n"
-	   "h713_disp commcall <id> [args..]    - send one CPU_COMM CALL (writes!)\n"
+	   "h713_disp commcall <id> [db=<hex>] [args..]\n"
+	   "                                    - send one CPU_COMM CALL (writes!)\n"
+	   "                                      db= overrides the doorbell word\n"
 	   "h713_disp panel-test <project-id> [noboot|full]\n"
 	   "                                    - 720p colours, power controls, OSD\n"
 	   "                                      noboot: hold MIPS in reset, ARM only\n"
