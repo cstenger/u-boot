@@ -4974,7 +4974,7 @@ static int h713_disp_call_table(uint raw_entries)
 	return 0;
 }
 
-static int h713_disp_panel_test(u32 project, bool release_mips)
+static int h713_disp_panel_test(u32 project, bool release_mips, bool full)
 {
 	int ret;
 
@@ -4990,36 +4990,51 @@ static int h713_disp_panel_test(u32 project, bool release_mips)
 		return ret;
 
 	h713_disp_latch_panel_timing();
-	printf("H713 panel: phase 0, panel timing established before "
-	       "downstream tests\n");
-	h713_disp_panel_blue_test();
-	h713_disp_panel_control_test();
 
 	/*
-	 * Capture the fetch path as the firmware left it, re-assert it, then
-	 * capture it again. The pair of dumps is the evidence: if the AFBD
-	 * words differ across the re-assert, the firmware had torn our OSD
-	 * layer down and the blank screen was never a scanout question.
+	 * The long-form phases are opt-in. Each returned the same answer on
+	 * roughly eight consecutive runs, so by default they only cost MIPS
+	 * uptime -- which matters, because the late uncommanded shutdown is
+	 * uncharacterised and Gate 2 only ever validated sixty seconds.
+	 *
+	 *   blue-screen colours   settled: LVDS, panel power and backlight all
+	 *                         work; one colour is enough as a liveness check
+	 *   GPIO control test     settled: PF6 and PH16 are proven, and it
+	 *                         needlessly cycles panel power
+	 *   DE re-assert + 2nd dump
+	 *                         settled: the two dumps were byte-identical
+	 *                         every time, so the firmware does not tear the
+	 *                         OSD layer down
+	 *
+	 * `full` brings them all back if a result ever needs re-establishing.
 	 */
+	if (full) {
+		h713_disp_panel_blue_test();
+		h713_disp_panel_control_test();
+	}
+
 	printf("H713 panel: OSD state %s\n",
 	       release_mips ? "as the firmware left it"
 			    : "from the ARM sequence alone (MIPS in reset)");
 	h713_disp_dump(false);
 
-	ret = h713_disp_reassert_osd(H713_DISP_LOGO_ADDR, project);
-	if (ret)
-		return ret;
+	if (full) {
+		ret = h713_disp_reassert_osd(H713_DISP_LOGO_ADDR, project);
+		if (ret)
+			return ret;
+		printf("H713 panel: OSD state after re-assert\n");
+		h713_disp_dump(false);
+	}
 
-	printf("H713 panel: OSD state after re-assert\n");
-	h713_disp_dump(false);
-
+	/* Cheap, and its scan column is the only raster-liveness signal. */
 	h713_disp_afbd_enable_probe();
 
-	printf("H713 panel: phase 3, moving OSD at panel 720p timing, "
+	printf("H713 panel: moving OSD at panel 720p timing, "
 	       "%u frames x %u ms\n",
-	       H713_DISP_OSD_FRAMES, H713_DISP_OSD_DWELL_MS);
-	h713_disp_animate_pattern(H713_DISP_OSD_FRAMES,
-				  H713_DISP_OSD_DWELL_MS, 1);
+	       full ? H713_DISP_OSD_FRAMES : 4,
+	       full ? H713_DISP_OSD_DWELL_MS : 3000);
+	h713_disp_animate_pattern(full ? H713_DISP_OSD_FRAMES : 4,
+				  full ? H713_DISP_OSD_DWELL_MS : 3000, 1);
 
 	if (!release_mips) {
 		printf("H713 panel: pattern test complete; MIPS never released, "
@@ -5121,10 +5136,12 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 
 	if ((argc == 3 || argc == 4) && !strcmp(argv[1], "panel-test")) {
 		bool noboot = argc == 4 && !strcmp(argv[3], "noboot");
+		bool full   = argc == 4 && !strcmp(argv[3], "full");
 
-		if (argc == 4 && !noboot)
+		if (argc == 4 && !noboot && !full)
 			return CMD_RET_USAGE;
-		return h713_disp_panel_test(hextoul(argv[2], NULL), !noboot) ?
+		return h713_disp_panel_test(hextoul(argv[2], NULL), !noboot,
+					    full) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
@@ -5205,9 +5222,10 @@ U_BOOT_CMD(h713_disp, 5, 0, do_h713_disp,
 	   "h713_disp calltable [raw-entries]   - read the live CPU_COMM call table\n"
 	   "h713_disp commstate                 - read the CPU_COMM transports\n"
 	   "h713_disp commcall <id> [args..]    - send one CPU_COMM CALL (writes!)\n"
-	   "h713_disp panel-test <project-id> [noboot]\n"
+	   "h713_disp panel-test <project-id> [noboot|full]\n"
 	   "                                    - 720p colours, power controls, OSD\n"
 	   "                                      noboot: hold MIPS in reset, ARM only\n"
+	   "                                      full:   add the settled long-form phases\n"
 	   "h713_disp auto <project-id> [nowait] - load from eMMC and run\n"
 	   "h713_disp load <project-id>         - load from eMMC only\n"
 	   "h713_disp <blob-addr> <project-id> [nowait] - run against a staged blob\n"
