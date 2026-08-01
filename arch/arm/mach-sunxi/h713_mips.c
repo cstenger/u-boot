@@ -1955,6 +1955,11 @@ static u32 h713_mips_read_shmem(ulong offset)
  * already published above or touches only firmware BSS (0x8b124ba4,
  * 0x8b119bb4) and imposes no obligation on the ARM.
  */
+#define H713_COMM_MSGBOX_VERSION 0x03003810UL	/* User2 sub0 +0x10           */
+#define H713_COMM_MSGBOX_COUNT	0x03003864UL	/* User2 sub0 +0x60 + 4*port  */
+#define H713_COMM_MSGBOX_BGR	0x0200171cUL	/* bit 0 gate, bit 16 reset   */
+#define H713_COMM_MSGBOX_TX_IRQ_EN 0x03003830UL	/* User2 sub0 +0x30           */
+
 #define H713_MIPS_SEQ_BASE_OFF		0x00000098UL
 #define H713_MIPS_SEQ_STRIDE		2440
 #define H713_MIPS_SEQ_PER_DIR		4880
@@ -2152,6 +2157,20 @@ static void h713_mips_prepare_ready_probe(void)
 	h713_mips_init_share_seqs();
 	h713_mips_init_lists();
 	h713_mips_init_record_pool();
+
+	/*
+	 * Bring the msgbox up before the coprocessor starts, not when a message
+	 * is finally sent.
+	 *
+	 * Its bus gate and reset at 0x0200171c read zero from cold -- Linux
+	 * takes CLK_BUS_MSGBOX/RST_BUS_MSGBOX, U-Boot never did. Enabling it at
+	 * send time is too late: the firmware configures its own receive side
+	 * during startup, and with the block gated those writes went nowhere.
+	 * That is consistent with what the bench showed -- the doorbell reached
+	 * the FIFO, the count went to one, and the MIPS never drained it.
+	 */
+	setbits_le32((void *)H713_COMM_MSGBOX_BGR, BIT(0) | BIT(16));
+	udelay(20);
 
 	/*
 	 * Publish the magic words last. The MIPS firmware treats both markers,
@@ -3076,11 +3095,18 @@ static int h713_logo_walk(ulong base, ulong start, ulong end, bool apply)
 	 */
 	for (off = start; off + sizeof(struct h713_logo_rec) <= end; ) {
 		struct h713_logo_rec r;
+		ulong reg;
 
 		r.addr = readl(base + off);
 		r.val  = readl(base + off + 4);
 		r.mask = readl(base + off + 8);
 		r.type = readl(base + off + 12);
+
+		/*
+		 * Container addresses are 32-bit; widen once here so the MMIO
+		 * accessors are not handed a narrower-than-pointer integer.
+		 */
+		reg = r.addr;
 
 		if (!r.addr && r.type == 0xff) {
 			off += sizeof(struct h713_logo_rec);
@@ -3117,9 +3143,9 @@ static int h713_logo_walk(ulong base, ulong start, ulong end, bool apply)
 				continue;
 			}
 
-			cur = readl(r.addr);
-			writel(cur & ~r.mask, r.addr);
-			writel(cur | r.mask, r.addr);
+			cur = readl(reg);
+			writel(cur & ~r.mask, reg);
+			writel(cur | r.mask, reg);
 			pulsed++;
 			continue;
 		}
@@ -3143,16 +3169,15 @@ static int h713_logo_walk(ulong base, ulong start, ulong end, bool apply)
 		/* Masked read-modify-write at the record's access width. */
 		switch (r.type) {
 		case 1:
-			writeb((readb(r.addr) & ~(u8)r.mask) |
-			       ((u8)r.val & (u8)r.mask), r.addr);
+			writeb((readb(reg) & ~(u8)r.mask) |
+			       ((u8)r.val & (u8)r.mask), reg);
 			break;
 		case 2:
-			writew((readw(r.addr) & ~(u16)r.mask) |
-			       ((u16)r.val & (u16)r.mask), r.addr);
+			writew((readw(reg) & ~(u16)r.mask) |
+			       ((u16)r.val & (u16)r.mask), reg);
 			break;
 		default:
-			writel((readl(r.addr) & ~r.mask) | (r.val & r.mask),
-			       r.addr);
+			writel((readl(reg) & ~r.mask) | (r.val & r.mask), reg);
 			break;
 		}
 		written++;
@@ -4628,10 +4653,6 @@ static const struct { u32 id; const char *name; } h713_comm_routines[] = {
 #define H713_COMM_MSG_SIZE	104
 #define H713_COMM_DOORBELL	0x03003874UL	/* User2 sub0 port1 MSG_DATA  */
 #define H713_COMM_DOORBELL_CALL	0x00000002	/* msg_type 0, intr_type 2    */
-#define H713_COMM_MSGBOX_VERSION 0x03003810UL	/* User2 sub0 +0x10           */
-#define H713_COMM_MSGBOX_COUNT	0x03003864UL	/* User2 sub0 +0x60 + 4*port  */
-#define H713_COMM_MSGBOX_BGR	0x0200171cUL	/* bit 0 gate, bit 16 reset   */
-#define H713_COMM_MSGBOX_TX_IRQ_EN 0x03003830UL	/* User2 sub0 +0x30           */
 
 static int h713_comm_call(u32 comp_id, const u32 *params, uint nparams)
 {
@@ -4743,12 +4764,8 @@ static int h713_comm_call(u32 comp_id, const u32 *params, uint nparams)
 	 * prove it is alive before writing: the per-sub-block version register
 	 * reads 0x00020000 on a live msgbox.
 	 */
-	printf("H713 comm: msgbox BGR before %08x\n",
-	       readl(H713_COMM_MSGBOX_BGR));
-	setbits_le32((void *)H713_COMM_MSGBOX_BGR, BIT(0) | BIT(16));
-	udelay(20);
-	printf("H713 comm: msgbox BGR after  %08x, version %08x (expect "
-	       "00020000), fifo count %u\n",
+	printf("H713 comm: msgbox BGR %08x, version %08x (expect 00020000), "
+	       "fifo count %u\n",
 	       readl(H713_COMM_MSGBOX_BGR), readl(H713_COMM_MSGBOX_VERSION),
 	       readl(H713_COMM_MSGBOX_COUNT));
 
