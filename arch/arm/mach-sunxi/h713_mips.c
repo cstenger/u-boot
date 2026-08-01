@@ -1942,6 +1942,29 @@ static u32 h713_mips_read_shmem(ulong offset)
 }
 
 /*
+ * Read a word of the firmware's own memory through its MIPS virtual address.
+ *
+ * display.bin runs from KSEG0/KSEG1, so a VA maps to physical by masking the
+ * segment off, and the MIPS's physical 0 is the ARM's 0x40000000 -- the same
+ * conversion the firmware applies to itself when it publishes an ARM-visible
+ * pointer (0x8b1197d4 builds base_addr as (VA & 0x1fffffff) + 0x40000000).
+ *
+ * The invalidate is not optional. A plain `md` of firmware BSS returns the
+ * zeros U-Boot left there before the coprocessor started: that is why
+ * `md.l 0x4b253e24` read all zeros on a boot where the FIFO indices, read
+ * through this path, plainly showed the MIPS had written.
+ */
+static u32 h713_mips_read_fw(ulong va)
+{
+	ulong addr = (va & 0x1fffffffUL) + 0x40000000UL;
+	ulong start = addr & ~(CONFIG_SYS_CACHELINE_SIZE - 1);
+
+	invalidate_dcache_range(start, start + CONFIG_SYS_CACHELINE_SIZE);
+
+	return readl(addr);
+}
+
+/*
  * The rest of the CPU_COMM master init, transcribed from the firmware.
  *
  * display.bin carries the ARM master's init as well as its own slave path.
@@ -1957,6 +1980,15 @@ static u32 h713_mips_read_shmem(ulong offset)
  */
 #define H713_COMM_MSGBOX_VERSION 0x03003810UL	/* User2 sub0 +0x10           */
 #define H713_COMM_MSGBOX_COUNT	0x03003864UL	/* User2 sub0 +0x60 + 4*port  */
+/*
+ * The other direction. The firmware's msgbox send at 0x8b12199c forms its
+ * addresses as base + (chan << 2) + (field << 10) + (user << 8) from the
+ * handler registered by 0x8b121d98 (user 0, chan 1, dir 1), which lands on
+ * 0x03003164/0x03003174 -- verified live: after our first accepted CALL the
+ * count read 1 and the word read 0x00000002, a CALL_ACK.
+ */
+#define H713_COMM_MSGBOX_RX_COUNT 0x03003164UL	/* MIPS -> ARM, count         */
+#define H713_COMM_MSGBOX_RX_DATA  0x03003174UL	/* MIPS -> ARM, MSG_DATA      */
 #define H713_COMM_MSGBOX_BGR	0x0200171cUL	/* bit 0 gate, bit 16 reset   */
 #define H713_COMM_MSGBOX_TX_IRQ_EN 0x03003830UL	/* User2 sub0 +0x30           */
 
@@ -4635,8 +4667,37 @@ static const struct { u32 id; const char *name; } h713_comm_routines[] = {
  *              exactly share_seq + 0x168 + 104*index.
  *   publish    0x8b11f9ec writes share_seq[+0x10] = index, [+0x08] = flags,
  *              [+0x14] = session, [+0x18] = wait pointer, bumps [+0x04].
+ *              The call site at 0x8b12046c sources the state byte from
+ *              msg[+0x06] & 0xff, so the flags halfword is what lands there.
  *   doorbell   a single write to 0x03003874; the pulse workaround in the Linux
  *              tree belongs to the ARISC path, not this one.
+ *
+ * The doorbell word is the message type and nothing else. The msgbox LISR at
+ * 0x8b121698 drains the port-1 FIFO and calls the registered channel callback
+ * with the raw word in $a0; that callback (0x8b121d78) forwards it verbatim to
+ * cpu_comm_cb at 0x8b122678 with $a1 hardcoded to zero. cpu_comm_cb switches
+ * on the whole 32-bit value:
+ *
+ *      0 -> 0x8b11f0a4  CALL          2 -> 0x8b11f61c  CALL_ACK
+ *      1 -> 0x8b11f360  RETURN        3 -> 0x8b11f804  RETURN_ACK
+ *
+ * and silently drops anything else. Each handler then calls queueAction with
+ * the matching index, which activates HISR[cpu][index] -- the four records
+ * named "%s CALL HISR" .. "%s RETURN_ACK HISR" that Trid_CPUComm_Init builds
+ * at 0x8b1221e0. So a CALL is doorbell 0x00000000. There is no msg_type<<16
+ * field and no intr_type field; the Linux tree's packing is not what this
+ * firmware parses.
+ *
+ * The presence gate is share_seq[+0x08] bit 2. comm_handle_call resolves
+ * share_seq(1,0,0) at 0x8b11f18c, tests that bit at 0x8b11f19c, and returns
+ * immediately when it is clear -- which is every send this project has made.
+ * When it is set the handler clears it (0x8b11f2ec) and queues the HISR, so
+ * the bit going 4 -> 0 in shared memory is the on-hardware proof of receipt.
+ *
+ * Note the ordering hazard this implies: once bit 2 is set, share_seq[+0x10]
+ * must hold a slot index below 20, or the assert at 0x8b11f24c spins the
+ * firmware forever. The empty marker written by init is exactly 20, so the
+ * flag must never be raised without a matching published index.
  *
  * The wait pointer is published as zero deliberately. The receiver stores it
  * at share_seq[+0x70]/[+0x74] without dereferencing, and the signal primitive
@@ -4652,10 +4713,11 @@ static const struct { u32 id; const char *name; } h713_comm_routines[] = {
 #define H713_COMM_RET_SEQ_OFF	0x00001d30UL	/* share_seq(0,1,1) FreeReturn*/
 #define H713_COMM_MSG_SIZE	104
 #define H713_COMM_DOORBELL	0x03003874UL	/* User2 sub0 port1 MSG_DATA  */
-#define H713_COMM_DOORBELL_CALL	0x00000002	/* msg_type 0, intr_type 2    */
+#define H713_COMM_DOORBELL_CALL	0x00000000	/* cpu_comm_cb type 0 = CALL  */
+#define H713_COMM_MSG_FLAG_SENT	4		/* msg[+0x06] bit 2, the gate */
 
 static int h713_comm_call(u32 comp_id, const u32 *params, uint nparams,
-			  u32 doorbell)
+			  u32 doorbell, u32 chan, u32 pid)
 {
 	ulong seq = H713_MIPS_SHMEM_ADDR + H713_COMM_CALL_SEQ_OFF;
 	ulong ret_seq = H713_MIPS_SHMEM_ADDR + H713_COMM_RET_SEQ_OFF;
@@ -4665,7 +4727,9 @@ static int h713_comm_call(u32 comp_id, const u32 *params, uint nparams,
 	u8 msg[H713_COMM_MSG_SIZE];
 	uint index, i;
 	int waited;
+	uint rx = 0;
 	bool drained = false;
+	bool accepted = false;
 
 	if (nparams > 10) {
 		printf("H713 comm: at most 10 parameters\n");
@@ -4722,14 +4786,26 @@ static int h713_comm_call(u32 comp_id, const u32 *params, uint nparams,
 	 * Build the message. Layout confirmed from the consumer, command_action
 	 * at 0x8b120bc0: dst_cpu +0x02, slot_index +0x04, flags +0x06, parameter
 	 * count in cmd_type +0x08, session +0x0C, comp_id +0x28, params +0x2C.
-	 * flags stays zero -- the Linux driver clears its notify bit for a
-	 * synchronous call, and command_action tests bit 2 of the published
-	 * state to take an alternate path.
+	 *
+	 * flags carries bit 2 -- MSG_FLAG_SENT. The publish helper copies this
+	 * halfword's low byte into share_seq[+0x08], and comm_handle_call at
+	 * 0x8b11f0a4 returns without touching the queue unless that bit is set.
+	 * Every send before this one published zero here, which is why the
+	 * doorbell always drained and the message was never read.
 	 */
 	memset(msg, 0, sizeof(msg));
+	/*
+	 * chan is the full u16 at +0x00, not a byte. 0x8b11d544 compares this
+	 * halfword against the channel record's +0x02 at 0x8b11d63c, so a
+	 * stray 1 in the high byte fails the channel match and the CALL is
+	 * rejected before command_action can even complete -- tried on
+	 * hardware, and it regressed a working path.
+	 */
+	*(u16 *)(msg + 0x00) = (u16)chan;		/* chan / src_cpu   */
 	*(u16 *)(msg + 0x02) = 1;			/* dst_cpu = MIPS   */
 	*(u16 *)(msg + 0x04) = (u16)index;
-	*(u16 *)(msg + 0x06) = 0;			/* flags            */
+	*(u16 *)(msg + 0x06) = H713_COMM_MSG_FLAG_SENT;	/* flags            */
+	*(u32 *)(msg + 0x10) = pid;			/* pid              */
 	*(u16 *)(msg + 0x08) = (u16)nparams;		/* cmd_type = count */
 	*(u32 *)(msg + 0x0c) = 0x00000001;		/* session id       */
 	*(u32 *)(msg + 0x28) = comp_id;
@@ -4745,9 +4821,16 @@ static int h713_comm_call(u32 comp_id, const u32 *params, uint nparams,
 	/* Consume the ring entry. */
 	writel((rd + 1) % cap, fifo + 0x00);
 
-	/* 0x8b11f9ec, with the wait pointer deliberately zero. */
+	/*
+	 * 0x8b11f9ec, with the wait pointer deliberately zero. The index at
+	 * +0x10 must be in range before the flag at +0x08 goes up: the firmware
+	 * asserts and spins on an index of 20 or more, and 20 is exactly what
+	 * init leaves there. Both land in the same cache line and the flush
+	 * below precedes the doorbell, so the MIPS never observes a raised flag
+	 * over a stale index.
+	 */
 	writeb((u8)index, seq + 0x10);
-	writeb(0, seq + 0x08);
+	writeb(H713_COMM_MSG_FLAG_SENT, seq + 0x08);
 	writel(0x00000001, seq + 0x14);			/* session          */
 	writel(0, seq + 0x18);				/* wait ptr lo      */
 	writel(0, seq + 0x1c);				/* wait ptr hi      */
@@ -4755,8 +4838,11 @@ static int h713_comm_call(u32 comp_id, const u32 *params, uint nparams,
 	       seq + 0x04);
 	flush_cache(seq, 0x80);
 
-	printf("H713 comm: published index %u, comp_id 0x%08x, %u param(s)\n",
-	       index, comp_id, nparams);
+	printf("H713 comm: published index %u, comp_id 0x%08x, %u param(s), "
+	       "chan=0x%x pid=0x%08x (key 0x%08x, channel slot %u)\n",
+	       index, comp_id, nparams, chan, pid,
+	       (pid << 4) | (chan & 0xf),
+	       ((pid & 3) << 2) | (chan & 3));
 
 	/*
 	 * The msgbox has its own bus gate and reset, which Linux takes via
@@ -4793,11 +4879,46 @@ static int h713_comm_call(u32 comp_id, const u32 *params, uint nparams,
 		u32 ridx = h713_mips_read_shmem(H713_COMM_RET_SEQ_OFF + 0x10) &
 			   0xff;
 		u32 fc = readl(H713_COMM_MSGBOX_COUNT);
+		u32 state = h713_mips_read_shmem(H713_COMM_CALL_SEQ_OFF + 0x08) &
+			    0xff;
 
 		if (!fc && !drained) {
 			printf("H713 comm: MIPS drained the FIFO after %d ms\n",
 			       waited);
 			drained = true;
+		}
+
+		/*
+		 * comm_handle_call clears bit 2 at 0x8b11f2ec once it accepts
+		 * the message. That is the first thing the firmware does with
+		 * our shared memory, and it happens well before any reply, so
+		 * report it on its own -- a run that gets this far but never
+		 * replies has still proven the message was read.
+		 */
+		if (!accepted && !(state & H713_COMM_MSG_FLAG_SENT)) {
+			printf("H713 comm: firmware accepted the message after "
+			       "%d ms (state bit 2 cleared)\n", waited);
+			accepted = true;
+		}
+
+		/*
+		 * Drain the inbound mailbox. The firmware acknowledges over the
+		 * msgbox using the same bare-type encoding: 0x8b11eadc maps a
+		 * received CALL to 2 (CALL_ACK) and a RETURN to 3 (RETURN_ACK),
+		 * and sends it through 0x8b121ddc. Nothing on the ARM side ever
+		 * read this FIFO, so the first CALL_ACK sat here unnoticed.
+		 * It has capacity 8; leaving it full would eventually block the
+		 * firmware's sender, which polls for space at 0x8b121a68.
+		 */
+		while (readl(H713_COMM_MSGBOX_RX_COUNT)) {
+			u32 w = readl(H713_COMM_MSGBOX_RX_DATA);
+			static const char * const t[] = {
+				"CALL", "RETURN", "CALL_ACK", "RETURN_ACK"
+			};
+
+			printf("H713 comm: <- msgbox 0x%08x (%s) after %d ms\n",
+			       w, w < 4 ? t[w] : "unknown", waited);
+			rx++;
 		}
 
 		if (ridx < H713_MIPS_SEQ_SLOTS) {
@@ -4823,9 +4944,11 @@ static int h713_comm_call(u32 comp_id, const u32 *params, uint nparams,
 			   0xff;
 
 		printf("H713 comm: no reply within 2000 ms (fifo count %u, %s; "
+		       "message %s; %u inbound msgbox word(s); "
 		       "published idx %s)\n",
 		       readl(H713_COMM_MSGBOX_COUNT),
 		       drained ? "was drained" : "never drained",
+		       accepted ? "accepted" : "never accepted", rx,
 		       pidx == index ? "still ours -- not consumed"
 				     : "changed -- consumed");
 	}
@@ -4850,6 +4973,181 @@ static int h713_comm_call(u32 comp_id, const u32 *params, uint nparams,
  * Makes no writes and sends no messages, so it does not consume the
  * one-launch-per-power-cycle budget.
  */
+/*
+ * Read the firmware's channel table.
+ *
+ * A received CALL is looked up by Comm_GetCallbyChannel, 0x8b11ccec:
+ *
+ *   key  = (pid << 4) | (chan & 0xf)          pid = msg[+0x10], chan = msg[+0x00]
+ *   idx  = ((key >> 2) & 0xc) | (key & 3)     i.e. (pid & 3) << 2 | (chan & 3)
+ *   rec  = pcpu_comm_dev + 0x18 + 0x90 + 48*idx
+ *   hit  = rec[+0x0c] == key
+ *
+ * and 0x8b11d544 then re-checks rec[+0x02] against chan and rec[+0x08] against
+ * pid before accepting. Channels are created by 0x8b122554 from the routine
+ * registration path at 0x8b12486c, so the firmware's own 82 registrations
+ * should have populated this table -- with whatever chan/pid they chose. That
+ * is the value we cannot derive statically and can read here.
+ *
+ * Read-only, no messages, does not consume a launch.
+ */
+#define H713_COMM_DEV_PTR	0x8b22efe4UL	/* -> pcpu_comm_dev           */
+#define H713_COMM_CHAN_OFF	0xa8UL		/* dev + 0x18 + 0x90          */
+#define H713_COMM_CHAN_STRIDE	48
+#define H713_COMM_CHAN_SLOTS	16
+
+static int h713_disp_comm_dev(void)
+{
+	ulong dev, tbl;
+	uint i, live = 0;
+
+	if (h713_mips_read_shmem(H713_MIPS_SHMEM_MAGIC1_OFF) !=
+	    H713_MIPS_SHMEM_MAGIC) {
+		printf("H713 comm: shared memory not published this boot\n");
+		return -ENODEV;
+	}
+
+	/*
+	 * Prove the KSEG reader before trusting anything it says. getCurCPUID
+	 * at 0x8b1227b4 is two instructions we know byte for byte from the
+	 * authenticated display.bin: `jr $ra` then `addiu $v0, $zero, 1`. If
+	 * these do not match, every other number below is meaningless.
+	 */
+	{
+		u32 a = h713_mips_read_fw(0x8b1227b4UL);
+		u32 b = h713_mips_read_fw(0x8b1227b8UL);
+		bool ok = a == 0x03e00008 && b == 0x24020001;
+
+		printf("H713 comm: reader self-test @0x8b1227b4 -> %08x %08x "
+		       "(expect 03e00008 24020001) %s\n",
+		       a, b, ok ? "OK" : "*** FAILED ***");
+		if (!ok)
+			printf("H713 comm: KSEG reads are not landing where "
+			       "expected -- treat the dump below as void\n");
+	}
+
+	dev = h713_mips_read_fw(H713_COMM_DEV_PTR);
+	printf("H713 comm: pcpu_comm_dev = 0x%08lx (via 0x%08lx)\n",
+	       dev, H713_COMM_DEV_PTR);
+
+	if (dev < 0x80000000UL || dev >= 0xa0000000UL) {
+		printf("H713 comm: dev pointer not a KSEG address -- "
+		       "firmware not up?\n");
+		return -ENODEV;
+	}
+
+	tbl = dev + H713_COMM_CHAN_OFF;
+	printf("H713 comm: channel table at 0x%08lx (ARM 0x%08lx), "
+	       "%u slots x %u bytes\n", tbl,
+	       (tbl & 0x1fffffffUL) + 0x40000000UL,
+	       H713_COMM_CHAN_SLOTS, H713_COMM_CHAN_STRIDE);
+
+	for (i = 0; i < H713_COMM_CHAN_SLOTS; i++) {
+		ulong r = tbl + i * H713_COMM_CHAN_STRIDE;
+		u32 w0 = h713_mips_read_fw(r + 0x00);
+		u32 chan = (w0 >> 16) & 0xffff;
+		u32 pid = h713_mips_read_fw(r + 0x08);
+		u32 key = h713_mips_read_fw(r + 0x0c);
+		/* 0xffffffff is the free sentinel, same as the call table. */
+		bool used = key != 0xffffffff && (key || pid || w0);
+
+		if (used)
+			live++;
+
+		/*
+		 * Everything here prints as hex because `commcall chan=/pid=`
+		 * parses hex. They were decimal once and it cost a bench run:
+		 * pid 0x8b8f32b0 printed as 2341417648, which hextoul then
+		 * read back as 0x41417648.
+		 */
+		printf("  [%2u] key=%08x  chan=%04x pid=%08x  "
+		       "+00=%08x +04=%08x sem=%08x%s\n",
+		       i, key, chan, pid, w0,
+		       h713_mips_read_fw(r + 0x04),
+		       h713_mips_read_fw(r + 0x10),
+		       used ? "  <== LIVE" : "");
+
+		/*
+		 * record[+0x10] is the channel's call semaphore. 0x8b11d544
+		 * posts it via osal_semaphore_set (0x8b15c1d0) the moment the
+		 * channel lookup succeeds, and if that post returns non-zero
+		 * the caller spins forever at 0x8b11d850. So the object behind
+		 * this handle decides whether a correctly addressed CALL
+		 * completes or wedges the receive thread -- dump enough of it
+		 * to tell. ThreadX tags a semaphore with 'SEMA' at +0x00 and
+		 * keeps the count at +0x08.
+		 */
+		if (used) {
+			ulong sem = h713_mips_read_fw(r + 0x10);
+			uint k;
+
+			if (sem >= 0x80000000UL && sem < 0xa0000000UL) {
+				/*
+				 * Dump a window rather than three named fields.
+				 * The first attempt printed id/name/count as
+				 * three reads and got the pointer's own value
+				 * back from all of them, which is either a
+				 * bogus object or a broken read -- a window
+				 * tells those apart, because a broken read
+				 * repeats and a real structure varies.
+				 */
+				printf("       sem@%08lx:", sem);
+				for (k = 0; k < 12; k++) {
+					if (k && !(k % 6))
+						printf("\n                 ");
+					printf(" %08x",
+					       h713_mips_read_fw(sem + k * 4));
+				}
+				printf("\n");
+			} else {
+				printf("       sem handle 0x%08lx is not a "
+				       "KSEG address\n", sem);
+			}
+		}
+	}
+
+	printf("H713 comm: %u of %u channel slot(s) live "
+	       "(0xffffffff = free)\n", live, H713_COMM_CHAN_SLOTS);
+	printf("H713 comm: retry a CALL with "
+	       "'commcall <id> chan=<chan> pid=<pid>' using a LIVE row above; "
+	       "all values hex\n");
+	return 0;
+}
+
+/*
+ * Dump firmware memory by MIPS virtual address, with the cache invalidated.
+ *
+ * `md` cannot do this job: it reads through the ARM's cache and returns the
+ * zeros U-Boot left before the coprocessor started. This is the general form
+ * of what commdev does for one structure, so that chasing a pointer into the
+ * firmware does not cost a reflash each time.
+ *
+ * Read-only. Any KSEG0/KSEG1 address is accepted; nothing else is.
+ */
+static int h713_disp_fw_md(ulong va, uint words)
+{
+	uint i;
+
+	if (va < 0x80000000UL || va >= 0xa0000000UL) {
+		printf("H713 fw: 0x%08lx is not a KSEG address "
+		       "(expect 0x8xxxxxxx/0x9xxxxxxx)\n", va);
+		return -EINVAL;
+	}
+	if (!words || words > 256)
+		words = 16;
+
+	printf("H713 fw: %u word(s) at 0x%08lx (ARM 0x%08lx)\n",
+	       words, va, (va & 0x1fffffffUL) + 0x40000000UL);
+
+	for (i = 0; i < words; i++) {
+		if (!(i % 6))
+			printf("%s0x%08lx:", i ? "\n" : "", va + i * 4);
+		printf(" %08x", h713_mips_read_fw(va + i * 4));
+	}
+	printf("\n");
+	return 0;
+}
+
 static int h713_disp_comm_state(void)
 {
 	uint cpu, dir, idx, live = 0;
@@ -4894,6 +5192,40 @@ static int h713_disp_comm_state(void)
 		       "rd=%-3u wr=%-3u peak=%-3u cap=%-3u base=%08x%s\n",
 		       cpu, dir, idx, name, off, rd, wr, peak, cap, base,
 		       moved ? "  <== MOVED" : "");
+
+		/*
+		 * The staging FIFO at share_seq+0x20 -- "CallCmd" / "ReturnCmd"
+		 * in the Linux driver's terms, name at +0x40. This is the queue
+		 * 0x8b11d544 allocates from when command_action hands a received
+		 * CALL to the firmware's worker, and it is separate from the
+		 * FreeCall ring at +0x78. Its base_addr is the *receiver's* own
+		 * virtual address, so for share_seq(1,0,0) it should point into
+		 * MIPS memory and only the MIPS can populate it. A capacity of
+		 * zero means 0x8b11825c fails and the CALL is dropped -- and
+		 * 0x8b1212a0 never checks that return, so the CALL_ACK still
+		 * goes out. Print it so that case is visible instead of silent.
+		 */
+		{
+			ulong s = off + 0x20;
+			u32 srd = h713_mips_read_shmem(s + 0x00);
+			u32 swr = h713_mips_read_shmem(s + 0x04);
+			u32 scap = h713_mips_read_shmem(s + 0x10);
+			u32 sisz = h713_mips_read_shmem(s + 0x14);
+			u32 sbase = h713_mips_read_shmem(s + 0x18);
+			char sname[0x14];
+
+			for (i = 0; i < sizeof(sname) - 1; i++)
+				sname[i] = (char)(h713_mips_read_shmem(off +
+						  0x40 + (i & ~3)) >>
+						  ((i & 3) * 8));
+			sname[sizeof(sname) - 1] = 0;
+
+			printf("      staging +0x20 %-11s rd=%-3u wr=%-3u "
+			       "cap=%-3u isz=%-3u base=%08x%s\n",
+			       sname[0] ? sname : "(unnamed)",
+			       srd, swr, scap, sisz, sbase,
+			       scap ? "" : "  <== EMPTY, CALLs are dropped");
+		}
 	}
 
 	printf("H713 comm: %u of 8 transport(s) show movement\n", live);
@@ -5122,6 +5454,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 	if (argc >= 3 && !strcmp(argv[1], "commcall")) {
 		u32 comp_id = hextoul(argv[2], NULL);
 		u32 db = H713_COMM_DOORBELL_CALL;
+		u32 chan = 0, pid = 0;
 		u32 p[10];
 		uint n = 0, k;
 
@@ -5130,31 +5463,58 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 				db = hextoul(argv[k] + 3, NULL);
 				continue;
 			}
+			/*
+			 * chan/pid select the firmware channel the CALL is
+			 * addressed to. Comm_GetCallbyChannel rejects the
+			 * message outright when no channel matches, so these
+			 * have to agree with what `commdev` reports.
+			 */
+			if (!strncmp(argv[k], "chan=", 5)) {
+				chan = hextoul(argv[k] + 5, NULL);
+				continue;
+			}
+			if (!strncmp(argv[k], "pid=", 4)) {
+				pid = hextoul(argv[k] + 4, NULL);
+				continue;
+			}
 			if (n >= ARRAY_SIZE(p))
 				return CMD_RET_USAGE;
 			p[n++] = hextoul(argv[k], NULL);
 		}
 
 		/*
-		 * The receive dispatcher at 0x8b1212cc hangs in an assert loop
-		 * on any type outside 0..3, and which half of the doorbell word
-		 * it reads as the type is exactly what this override exists to
-		 * find out. So refuse anything where either half is out of
-		 * range -- a bad guess here costs a power cycle.
+		 * cpu_comm_cb at 0x8b122678 switches on the whole word and
+		 * drops anything outside 0..3 without dispatching, so a bad
+		 * value here is inert rather than fatal -- but it is also a
+		 * wasted launch. Refuse it. 0 is CALL; the override exists for
+		 * driving the other three types by hand.
 		 */
-		if ((db >> 16) > 3 || (db & 0xffff) > 3) {
-			printf("H713 comm: refusing doorbell 0x%08x -- both "
-			       "halves must be 0..3 or the firmware asserts\n",
+		if (db > 3) {
+			printf("H713 comm: refusing doorbell 0x%08x -- the "
+			       "word is the message type, 0..3 "
+			       "(0 CALL, 1 RETURN, 2 CALL_ACK, 3 RETURN_ACK)\n",
 			       db);
 			return CMD_RET_FAILURE;
 		}
-		return h713_comm_call(comp_id, p, n, db) ?
+		return h713_comm_call(comp_id, p, n, db, chan, pid) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
 	if (argc == 2 && !strcmp(argv[1], "commstate"))
 		return h713_disp_comm_state() ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
+
+	if (argc == 2 && !strcmp(argv[1], "commdev"))
+		return h713_disp_comm_dev() ?
+		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
+
+	if ((argc == 3 || argc == 4) && !strcmp(argv[1], "fwmd")) {
+		ulong va = hextoul(argv[2], NULL);
+		uint n = argc == 4 ? (uint)hextoul(argv[3], NULL) : 16;
+
+		return h713_disp_fw_md(va, n) ?
+		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
+	}
 
 	if ((argc == 2 || argc == 3) && !strcmp(argv[1], "calltable")) {
 		uint n = argc == 3 ? dectoul(argv[2], NULL) : 4;
@@ -5250,9 +5610,12 @@ U_BOOT_CMD(h713_disp, 5, 0, do_h713_disp,
 	   "h713_disp mips-stability <project-id> - run 60s heartbeat/exception test\n"
 	   "h713_disp calltable [raw-entries]   - read the live CPU_COMM call table\n"
 	   "h713_disp commstate                 - read the CPU_COMM transports\n"
-	   "h713_disp commcall <id> [db=<hex>] [args..]\n"
+	   "h713_disp commdev                   - read the firmware channel table\n"
+	   "h713_disp fwmd <mips-va> [words]    - dump firmware memory (cache-safe)\n"
+	   "h713_disp commcall <id> [db=<hex>] [chan=<hex>] [pid=<hex>] [args..]\n"
 	   "                                    - send one CPU_COMM CALL (writes!)\n"
 	   "                                      db= overrides the doorbell word\n"
+	   "                                      chan=/pid= select the channel\n"
 	   "h713_disp panel-test <project-id> [noboot|full]\n"
 	   "                                    - 720p colours, power controls, OSD\n"
 	   "                                      noboot: hold MIPS in reset, ARM only\n"
