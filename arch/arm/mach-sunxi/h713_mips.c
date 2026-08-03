@@ -4722,6 +4722,80 @@ static int h713_disp_panel_patch(ulong blob, const struct h713_disp_sel *sel)
 #define H713_DISP_SCAN_REG_RAW	0x05880000UL	/* == H713_DISP_LVDS_SCAN_REG */
 
 /*
+ * 0x05880000 holds one free-running 10-bit counter presented twice with a fixed
+ * offset -- three consecutive samples gave high-low = -642 every time, and a
+ * register sweep found nothing else in the block moving at all. It is not a
+ * raster position. It is, however, a usable clock witness: its wrap rate
+ * measured 18000 Hz, so the counter clock is 18000 * 1024 = 18.432 MHz, and
+ * 516/28 = 18.4286 MHz. That is 0.02% away, which independently confirms the
+ * 516 MHz panel clock computed from PLL_VIDEO2 and PANEL_CLK.
+ */
+#define H713_PLL_VIDEO2_REG	0x02001050UL
+#define H713_PLL_VIDEO2_LOCK	BIT(28)
+#define H713_PANEL_CLK_DIV	2	/* PANEL_CLK M+1, from 0x02001db4 */
+#define H713_LVDS_SER_RATIO	7	/* assumed 7:1 serialisation */
+#define H713_COUNTER_DIV	28	/* panel_clk / counter clock, measured */
+
+static ulong h713_disp_counter_khz(uint window_us)
+{
+	u32 prev, cur;
+	ulong t0, elapsed;
+	uint wraps = 0;
+
+	prev = readl(H713_DISP_SCAN_REG_RAW) >> 16;
+	t0 = timer_get_us();
+	do {
+		cur = readl(H713_DISP_SCAN_REG_RAW) >> 16;
+		if (cur < prev)
+			wraps++;
+		prev = cur;
+		elapsed = timer_get_us() - t0;
+	} while (elapsed < window_us);
+
+	if (!elapsed)
+		return 0;
+	/* Ten-bit counter, so each wrap is 1024 counter clocks. */
+	return (ulong)wraps * 1024 * 1000 / elapsed;
+}
+
+/*
+ * Retune PLL_VIDEO2 so the panel actually receives the DCLK it asks for.
+ *
+ * The vendor table leaves N+1 = 43, giving pll-video2-4x = 1032 MHz, a 516 MHz
+ * panel clock and -- at 7:1 -- 73.71 MHz of DCLK where panel_config.ini asks for
+ * 62. That is 18.9% high and a 71.3 Hz refresh instead of 60.
+ *
+ * Exact 62 MHz is not synthesisable here: DCLK = 24*(N+1)/((M+1)*7) and no
+ * integer solution exists within the PLL's rate limits. N+1 = 36 lands at
+ * 61.71 MHz, 0.46% low, which is well inside any panel's tolerance.
+ *
+ * The change verifies itself. If the counter really is panel_clk/28 its rate
+ * must fall from 18432 kHz to 864/(2*28) = 15428 kHz. If it does not move
+ * proportionally then the clock did not change the way this reasoning assumes,
+ * and no visual result from the run means anything.
+ */
+static int h713_disp_pll_video2_set_n(uint n_plus_1)
+{
+	u32 saved = readl(H713_PLL_VIDEO2_REG);
+	u32 val = (saved & ~(0xFFU << 8)) | (((n_plus_1 - 1) & 0xFF) << 8);
+	int i;
+
+	writel(val, H713_PLL_VIDEO2_REG);
+	dmb();
+	for (i = 0; i < 2000; i++) {
+		if (readl(H713_PLL_VIDEO2_REG) & H713_PLL_VIDEO2_LOCK)
+			break;
+		udelay(100);
+	}
+	printf("H713 pll: PLL_VIDEO2 %08x -> %08x (N+1=%u), lock %s after %d us\n",
+	       saved, readl(H713_PLL_VIDEO2_REG), n_plus_1,
+	       (readl(H713_PLL_VIDEO2_REG) & H713_PLL_VIDEO2_LOCK) ?
+	       "acquired" : "NOT acquired", i * 100);
+
+	return (readl(H713_PLL_VIDEO2_REG) & H713_PLL_VIDEO2_LOCK) ? 0 : -EIO;
+}
+
+/*
  * Find the registers that actually move, and what they count.
  *
  * 0x05880000 was long described as the raster position within the programmed
@@ -6267,6 +6341,60 @@ static void h713_disp_boardb_tcon_chroma_test(void)
 }
 
 /*
+ * Run the chroma sweep with the panel clock retuned to the DCLK the panel
+ * actually asks for, and prove the retune took effect before believing
+ * anything optical.
+ */
+#define H713_PLL_N_STOCK	43	/* 1032 MHz 4x -> 73.71 MHz DCLK */
+#define H713_PLL_N_62M		36	/*  864 MHz 4x -> 61.71 MHz DCLK */
+
+static void h713_disp_chroma_test_at_62m(void)
+{
+	u32 saved_pll = readl(H713_PLL_VIDEO2_REG);
+	ulong before, after, expect;
+	int ret;
+
+	before = h713_disp_counter_khz(100000);
+	printf("H713 pll: counter %lu kHz before retune "
+	       "(expect 18432 for the stock 516 MHz panel clock)\n", before);
+
+	ret = h713_disp_pll_video2_set_n(H713_PLL_N_62M);
+	mdelay(50);
+
+	expect = 24000UL * H713_PLL_N_62M / H713_PANEL_CLK_DIV /
+		 H713_COUNTER_DIV;
+	after = h713_disp_counter_khz(100000);
+	printf("H713 pll: counter %lu kHz after retune (expect %lu)\n",
+	       after, expect);
+	printf("H713 pll: implied DCLK %lu.%02lu MHz "
+	       "(panel_config asks 62.00)\n",
+	       after * H713_COUNTER_DIV / H713_LVDS_SER_RATIO / 1000,
+	       (after * H713_COUNTER_DIV / H713_LVDS_SER_RATIO / 10) % 100);
+
+	if (ret) {
+		printf("H713 pll: PLL did not relock; restoring and aborting\n");
+	} else if (!after || after > expect + expect / 20 ||
+		   after < expect - expect / 20) {
+		printf("H713 pll: WARNING: counter did not track the retune "
+		       "within 5%%. The clock did not change as modelled and no "
+		       "visual result from this run is meaningful.\n");
+		h713_disp_boardb_tcon_chroma_test();
+	} else {
+		printf("H713 pll: retune confirmed by the clock witness; "
+		       "running the chroma sweep at %lu.%02lu MHz DCLK\n",
+		       after * H713_COUNTER_DIV / H713_LVDS_SER_RATIO / 1000,
+		       (after * H713_COUNTER_DIV / H713_LVDS_SER_RATIO / 10) % 100);
+		h713_disp_boardb_tcon_chroma_test();
+	}
+
+	writel(saved_pll, H713_PLL_VIDEO2_REG);
+	dmb();
+	mdelay(50);
+	printf("H713 pll: PLL_VIDEO2 restored to %08x, counter %lu kHz\n",
+	       readl(H713_PLL_VIDEO2_REG), h713_disp_counter_khz(100000));
+}
+
+/*
  * The solid all-zero / all-one pair, each preceded by its own optical marker
  * so a recording can be scored without guessing where the phases fall. The
  * generator is switched off between the two codes: going zero -> off -> one
@@ -7709,7 +7837,9 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		h713_disp_boardb_plane_gate_test();
 	} else if (tcon_checker_style) {
 		/* Board-B hardware pattern; independent of the OSD pixel path. */
-		if (tcon_checker_style == 12)
+		if (tcon_checker_style == 13)
+			h713_disp_chroma_test_at_62m();
+		else if (tcon_checker_style == 12)
 			h713_disp_boardb_tcon_chroma_test();
 		else if (tcon_checker_style == 10)
 			h713_disp_boardb_tcon_dclk_test();
@@ -7943,11 +8073,13 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		bool tcon_solid_dclk_normal = argc == 4 &&
 				 !strcmp(argv[3], "tcon-solid-dclk-normal");
 		bool tcon_chroma = argc == 4 && !strcmp(argv[3], "tcon-chroma");
+		bool tcon_chroma_62m = argc == 4 &&
+				       !strcmp(argv[3], "tcon-chroma-62m");
 
 		if (argc == 4 && !noboot && !full && !quiesce && !vendor_logo &&
 		    !plane_gate && !tcon_checker && !tcon_checker_mono &&
 		    !tcon_solid && !tcon_solid_native && !tcon_dclk &&
-		    !tcon_solid_dclk_normal && !tcon_chroma)
+		    !tcon_solid_dclk_normal && !tcon_chroma && !tcon_chroma_62m)
 			return CMD_RET_USAGE;
 		return h713_disp_panel_test(hextoul(argv[2], NULL), !noboot,
 					    full,
@@ -7955,8 +8087,9 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    tcon_checker || tcon_checker_mono ||
 					    tcon_solid || tcon_solid_native ||
 					    tcon_dclk || tcon_solid_dclk_normal ||
-					    tcon_chroma,
+					    tcon_chroma || tcon_chroma_62m,
 					    vendor_logo, plane_gate,
+					    tcon_chroma_62m ? 13 :
 					    tcon_chroma ? 12 :
 					    tcon_solid_dclk_normal ? 11 :
 					    tcon_dclk ? 10 :
@@ -8070,6 +8203,7 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "                                      tcon-dclk: fixed zero source, DCLK edge A/B/A\n"
 	   "                                      tcon-solid-dclk-normal: zero/one under normal DCLK\n"
 	   "                                      tcon-chroma: RGB solids + red/blue checkers (128/32px)\n"
+	   "                                      tcon-chroma-62m: same, with DCLK retuned 73.7 -> 61.7 MHz\n"
 	   "h713_disp auto <project-id> [nowait] - load from eMMC and run\n"
 	   "h713_disp load <project-id>         - load from eMMC only\n"
 	   "h713_disp <blob-addr> <project-id> [nowait] - run against a staged blob\n"
