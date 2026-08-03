@@ -4721,6 +4721,70 @@ static int h713_disp_panel_patch(ulong blob, const struct h713_disp_sel *sel)
  */
 #define H713_DISP_SCAN_REG_RAW	0x05880000UL	/* == H713_DISP_LVDS_SCAN_REG */
 
+/*
+ * Find the registers that actually move, and what they count.
+ *
+ * 0x05880000 was long described as the raster position within the programmed
+ * 1360x760, and that reading is wrong. Measured, both of its 16-bit halves are
+ * 10-bit counters -- max exactly 1023 -- wrapping at the same ~18 kHz. A raster
+ * counter would max at HT-1 and VT-1 and its two rates would differ by a factor
+ * of VT. Everything in this project that cited "scan=..." as proof the raster
+ * was live was citing that misreading.
+ *
+ * This sweeps a register range, sampling each word over a short window, and
+ * reports the ones that change together with their observed minimum, maximum
+ * and change count. The real horizontal and vertical counters are identifiable
+ * by their maxima: HT-1 and VT-1 for the programmed timing, printed alongside.
+ * Anything maxing at a power of two minus one is a free-running counter, not a
+ * raster position.
+ *
+ * Read-only, so it is safe to run repeatedly and after any other mode.
+ */
+static int h713_disp_reg_scan(ulong base, uint words)
+{
+	u32 total = readl(0x05880020);
+	u32 vt = total >> 16, ht = total & 0xffff;
+	uint i;
+
+	printf("H713 regscan: %u word(s) from 0x%08lx, timing HT=%u VT=%u "
+	       "(raster counters would max at %u and %u)\n",
+	       words, base, ht, vt, ht ? ht - 1 : 0, vt ? vt - 1 : 0);
+
+	for (i = 0; i < words; i++) {
+		ulong reg = base + i * 4;
+		u32 first = readl(reg);
+		u32 lo = first, hi = first, prev = first;
+		uint changes = 0, n;
+
+		for (n = 0; n < 20000; n++) {
+			u32 v = readl(reg);
+
+			if (v != prev)
+				changes++;
+			if (v < lo)
+				lo = v;
+			if (v > hi)
+				hi = v;
+			prev = v;
+		}
+
+		if (!changes)
+			continue;
+
+		printf("  +0x%03x  min=%08x max=%08x changes=%-6u",
+		       i * 4, lo, hi, changes);
+		if ((hi & 0xffff) == ht - 1 || (hi >> 16) == ht - 1 ||
+		    (hi & 0xffff) == vt - 1 || (hi >> 16) == vt - 1)
+			printf("  <== matches a raster total");
+		else if (((hi & 0xffff) & ((hi & 0xffff) + 1)) == 0 ||
+			 ((hi >> 16) & ((hi >> 16) + 1)) == 0)
+			printf("  (free-running, 2^n-1)");
+		printf("\n");
+	}
+
+	return 0;
+}
+
 static int h713_disp_scan_rate(void)
 {
 	u32 total = readl(0x05880020);
@@ -7831,6 +7895,14 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		return h713_disp_scan_rate() ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 
+	if ((argc >= 2 && argc <= 4) && !strcmp(argv[1], "regscan")) {
+		ulong base = argc >= 3 ? hextoul(argv[2], NULL) : 0x05880000UL;
+		uint words = argc >= 4 ? dectoul(argv[3], NULL) : 32;
+
+		return h713_disp_reg_scan(base, words) ?
+		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
+	}
+
 	if (argc == 2 && !strcmp(argv[1], "commtrace")) {
 		h713_mips_print_comm_trace();
 		return CMD_RET_SUCCESS;
@@ -7976,6 +8048,7 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "h713_disp commstate                 - read the CPU_COMM transports\n"
 	   "h713_disp commtrace                 - read the CPU_COMM trace stage\n"
 	   "h713_disp scanrate                  - measure line/frame rate and real DCLK\n"
+	   "h713_disp regscan [base] [words]    - find which registers move, and what they count\n"
 	   "h713_disp commdev                   - read the firmware channel table\n"
 	   "h713_disp fwmd <mips-va> [words]    - dump firmware memory (cache-safe)\n"
 	   "h713_disp commcall <id> [chan=<hex>] [pid=<hex>] [args..]\n"
