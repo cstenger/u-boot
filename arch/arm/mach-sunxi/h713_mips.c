@@ -13,6 +13,7 @@
 #include <cpu_func.h>
 #include <fs.h>
 #include <linux/delay.h>
+#include <time.h>
 #include <linux/kernel.h>
 #include <vsprintf.h>
 #include <sunxi_gpio.h>
@@ -4694,6 +4695,94 @@ static int h713_disp_panel_patch(ulong blob, const struct h713_disp_sel *sel)
  * and the firmware is irrelevant to the clobber. If they appear only after
  * readiness, the firmware owns them.
  */
+/*
+ * Measure the real raster rate, and from it the real DCLK.
+ *
+ * The clock tree computes as follows. PLL_VIDEO2 at 0x02001050 reads
+ * 0xb9002a00: N+1 = 43, M+1 = 1, and the H616-compatible fixed post-divider of
+ * 4, giving pll-video2-4x = 1032 MHz. PANEL_CLK at 0x02001db4 reads 0x80000001:
+ * gated on, mux 0 (pll-video2-4x its only parent), M+1 = 2. So the panel clock
+ * is 516 MHz. Against a 7:1 LVDS serialiser that is 73.71 MHz of DCLK, where
+ * panel_config.ini asks for 62 MHz -- 18.9% high, and a 71.3 Hz refresh instead
+ * of 60.
+ *
+ * Worse, 62 MHz is not reachable through this tree at all: 1032/16 = 64.50 and
+ * 1032/17 = 60.71 bracket it, and no integer divider hits it. Either the
+ * requested value is not what the hardware targets, the serialisation ratio is
+ * not 7:1, or a divider exists that has not been located -- 0x058c0020 and
+ * 0x058c0024 are the candidates, since the panel config patches write both.
+ *
+ * Rather than pick between those, measure it. 0x05880000 carries two 16-bit
+ * raster counters; sampling it in a tight loop and counting the decreases in
+ * each half gives the line and frame rates directly, and DCLK = line_rate * HT.
+ * That also settles the register's semantics, which have never been pinned:
+ * observed samples put values above 760 in both halves, so the obvious
+ * "x in one, y in the other" reading of a 1360x760 raster cannot be right.
+ */
+#define H713_DISP_SCAN_REG_RAW	0x05880000UL	/* == H713_DISP_LVDS_SCAN_REG */
+
+static int h713_disp_scan_rate(void)
+{
+	u32 total = readl(0x05880020);
+	u32 vt = total >> 16, ht = total & 0xffff;
+	u32 prev, cur, hi_max = 0, lo_max = 0;
+	ulong t0, elapsed;
+	uint hi_wraps = 0, lo_wraps = 0, samples = 0;
+	u32 fast, slow;
+
+	if (!ht || !vt) {
+		printf("H713 scan: timing register reads %08x; no active raster\n",
+		       total);
+		return -ENODEV;
+	}
+
+	prev = readl(H713_DISP_SCAN_REG_RAW);
+	t0 = timer_get_us();
+	do {
+		cur = readl(H713_DISP_SCAN_REG_RAW);
+		if ((cur >> 16) < (prev >> 16))
+			hi_wraps++;
+		if ((cur & 0xffff) < (prev & 0xffff))
+			lo_wraps++;
+		if ((cur >> 16) > hi_max)
+			hi_max = cur >> 16;
+		if ((cur & 0xffff) > lo_max)
+			lo_max = cur & 0xffff;
+		prev = cur;
+		samples++;
+		elapsed = timer_get_us() - t0;
+	} while (elapsed < 200000);
+
+	printf("H713 scan: %u samples in %lu us (%lu kHz sampling), "
+	       "timing HT=%u VT=%u\n", samples, elapsed,
+	       (ulong)samples * 1000 / elapsed, ht, vt);
+	printf("H713 scan: high half max %u, %u wrap(s) -> %lu Hz\n",
+	       hi_max, hi_wraps, (ulong)hi_wraps * 1000000 / elapsed);
+	printf("H713 scan: low  half max %u, %u wrap(s) -> %lu Hz\n",
+	       lo_max, lo_wraps, (ulong)lo_wraps * 1000000 / elapsed);
+
+	fast = hi_wraps > lo_wraps ? hi_wraps : lo_wraps;
+	slow = hi_wraps > lo_wraps ? lo_wraps : hi_wraps;
+	if (!fast) {
+		printf("H713 scan: no counter movement; raster is not running\n");
+		return -EIO;
+	}
+
+	printf("H713 scan: line rate %lu Hz -> DCLK %lu.%02lu MHz "
+	       "(panel_config asks 62.00)\n",
+	       (ulong)fast * 1000000 / elapsed,
+	       (ulong)fast * ht / elapsed,
+	       ((ulong)fast * ht * 100 / elapsed) % 100);
+	if (slow)
+		printf("H713 scan: frame rate %lu Hz (line/VT would be %lu Hz)\n",
+		       (ulong)slow * 1000000 / elapsed,
+		       (ulong)fast * 1000000 / elapsed / vt);
+	else
+		printf("H713 scan: slower counter never wrapped in the window\n");
+
+	return 0;
+}
+
 static void h713_disp_probe_contested(const char *when)
 {
 	printf("H713 probe [%-22s] 051c0014=%08x 051c0028=%08x 05140054=%08x\n",
@@ -7738,6 +7827,10 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		return h713_disp_comm_state() ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 
+	if (argc == 2 && !strcmp(argv[1], "scanrate"))
+		return h713_disp_scan_rate() ?
+		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
+
 	if (argc == 2 && !strcmp(argv[1], "commtrace")) {
 		h713_mips_print_comm_trace();
 		return CMD_RET_SUCCESS;
@@ -7882,6 +7975,7 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "h713_disp calltable [raw-entries]   - read the live CPU_COMM call table\n"
 	   "h713_disp commstate                 - read the CPU_COMM transports\n"
 	   "h713_disp commtrace                 - read the CPU_COMM trace stage\n"
+	   "h713_disp scanrate                  - measure line/frame rate and real DCLK\n"
 	   "h713_disp commdev                   - read the firmware channel table\n"
 	   "h713_disp fwmd <mips-va> [words]    - dump firmware memory (cache-safe)\n"
 	   "h713_disp commcall <id> [chan=<hex>] [pid=<hex>] [args..]\n"
