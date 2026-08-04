@@ -7121,6 +7121,116 @@ static const u16 h713_stride_fix_sweep_px[] = {
 	1300, 1310, 1320, 1330, 1340, 1280,
 };
 
+/*
+ * The other fault: content starts ~110 px into every display line.
+ *
+ * Measured across all eleven photographs of test_30 and test_31: left pad 105
+ * +- 5 px, right pad 1.4, top pad **0.0**, bottom 5. So it is horizontal only,
+ * and it is at the head of the line -- not the tail, which is what "the fetch
+ * runs out" implied and what the old log assumed. It does not respond to the
+ * stride (24 px of sweep moved the band by 4) or to the pattern pitch.
+ *
+ * A zero top pad also kills the tidiest hypothesis: 0x05280088 and 0x0528008c
+ * hold 22 and 123, which read like a (y, x) origin, and 123 is within a few px
+ * of the band. But an origin with y = 22 would blank 22 rows at the top, and
+ * nothing is blank at the top. 0x0528008c stays on the list -- 123 is still the
+ * closest value in the dump -- but not as half of a pair.
+ *
+ * No candidate is convincing enough to sweep on its own, so screen several. A
+ * solid fill is the right pattern here: it is immune to the stride bug, so the
+ * band edge stands as one crisp vertical boundary with nothing else moving, and
+ * every step is scored by one number. Each step zeroes an offset-shaped field
+ * and restores it; the top candidate also gets a large positive value, so a
+ * register whose zero happens to sit near the current band cannot read as
+ * inert.
+ *
+ * Registers that hold the same value in pairs are written together. Changing
+ * one half of a producer/consumer pair can be a no-op that looks like a null.
+ *
+ * The control step is worth a photograph on its own account. If the band stays
+ * pale against a saturated fill it is not showing framebuffer content at all;
+ * if it turns red, it is, and this is a fetch or addressing fault rather than a
+ * geometry one. Nothing else in the run distinguishes those.
+ */
+struct h713_band_probe {
+	const char *what;
+	u32 addr[2];
+	u32 mask;
+	u32 value;
+};
+
+static const struct h713_band_probe h713_band_probes[] = {
+	{ "control, nothing written",
+	  { 0, 0 }, 0, 0 },
+	{ "de-layers 0x0528008c 123 -> 0",
+	  { 0x0528008c, 0 }, 0xffffffff, 0 },
+	{ "de-layers 0x0528008c 123 -> 400",
+	  { 0x0528008c, 0 }, 0xffffffff, 400 },
+	{ "mixer 0x0525c01c+034 low 60 -> 0",
+	  { 0x0525c01c, 0x0525c034 }, 0xffff, 0 },
+	{ "de 0x0524c004 low 22 -> 0",
+	  { 0x0524c004, 0 }, 0xffff, 0 },
+	{ "vblender 0x0520000c+024 low 49 -> 0",
+	  { 0x0520000c, 0x05200024 }, 0xffff, 0 },
+};
+
+static void h713_disp_fill_solid(u32 argb)
+{
+	u32 *fb = (u32 *)H713_DISP_OSD_FB_ADDR;
+	u32 total = H713_DISP_EDGE_SPAN_WORDS;
+	u32 i;
+
+	for (i = 0; i < total; i++)
+		fb[i] = argb;
+
+	flush_cache(H713_DISP_OSD_FB_ADDR, total * sizeof(u32));
+}
+
+static void h713_disp_band_sweep(void)
+{
+	uint i, j;
+
+	printf("H713 band: solid red fill, so the only thing to read is where "
+	       "content starts. Baseline is ~110 px of pale at the LEFT, 0 at "
+	       "the top. Score every step by that one number: a step whose band "
+	       "moves names the register. All six the same means none of these "
+	       "carries it, and the fault is not one of these offsets.\n");
+
+	h713_disp_fill_solid(0xffff0000);
+
+	for (i = 0; i < ARRAY_SIZE(h713_band_probes); i++) {
+		const struct h713_band_probe *p = &h713_band_probes[i];
+		u32 saved[2] = { 0, 0 };
+
+		for (j = 0; j < 2; j++) {
+			if (!p->addr[j])
+				continue;
+			saved[j] = readl(p->addr[j]);
+			writel((saved[j] & ~p->mask) | (p->value & p->mask),
+			       p->addr[j]);
+		}
+		dmb();
+
+		h713_disp_chroma_marker(i + 1);
+		h713_disp_commit_osd_frame();
+
+		printf("H713 band: step %u, %s", i + 1, p->what);
+		for (j = 0; j < 2; j++)
+			if (p->addr[j])
+				printf("; 0x%08x was %08x now %08x",
+				       p->addr[j], saved[j],
+				       readl(p->addr[j]));
+		printf("\n");
+		mdelay(H713_DISP_CHROMA_PHASE_MS);
+
+		for (j = 0; j < 2; j++)
+			if (p->addr[j])
+				writel(saved[j], p->addr[j]);
+		dmb();
+	}
+	printf("H713 band: sweep complete, all probed registers restored\n");
+}
+
 static void h713_disp_stride_fix_sweep(void)
 {
 	u32 saved = readl(H713_DISP_AFBD_STRIDE_REG);
@@ -8781,7 +8891,7 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 				bool grid, bool quads, bool vbands,
 				bool pitch, bool pitch_wide, bool hbp,
 				bool pitch_low, bool edge, bool edge_fine,
-				bool stride, bool stride_fix,
+				bool stride, bool stride_fix, bool band,
 				u32 stride_override)
 {
 	int ret;
@@ -8913,7 +9023,9 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		       readl(H713_DISP_AFBD_STRIDE_REG));
 	}
 
-	if (stride_fix) {
+	if (band) {
+		h713_disp_band_sweep();
+	} else if (stride_fix) {
 		h713_disp_stride_fix_sweep();
 	} else if (stride) {
 		h713_disp_stride_sweep();
@@ -9262,12 +9374,13 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		bool edge_fine = !strcmp(mode, "fb-edge-fine");
 		bool stride = !strcmp(mode, "fb-stride");
 		bool stride_fix = !strcmp(mode, "fb-fix");
+		bool band = !strcmp(mode, "fb-band");
 
 		if (argc >= 4 && !noboot && !full && !quiesce && !vendor_logo &&
 		    !plane_gate && !tcon_checker && !tcon_checker_mono &&
 		    !tcon_solid && !tcon_solid_native && !tcon_dclk &&
 		    !tcon_solid_dclk_normal && !tcon_chroma && !tcon_chroma_62m &&
-		    !tcon_nsweep && !tcon_nsweep_hi && !hbands && !grid && !quads && !vbands && !pitch && !pitch_wide && !hbp && !pitch_low && !edge && !edge_fine && !stride && !stride_fix)
+		    !tcon_nsweep && !tcon_nsweep_hi && !hbands && !grid && !quads && !vbands && !pitch && !pitch_wide && !hbp && !pitch_low && !edge && !edge_fine && !stride && !stride_fix && !band)
 			return CMD_RET_USAGE;
 		return h713_disp_panel_test(hextoul(argv[2], NULL), !noboot,
 					    full,
@@ -9276,7 +9389,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    tcon_solid || tcon_solid_native ||
 					    tcon_dclk || tcon_solid_dclk_normal ||
 					    tcon_chroma || tcon_chroma_62m ||
-					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads || vbands || pitch || pitch_wide || hbp || pitch_low || edge || edge_fine || stride || stride_fix,
+					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads || vbands || pitch || pitch_wide || hbp || pitch_low || edge || edge_fine || stride || stride_fix || band,
 					    vendor_logo, plane_gate,
 					    hbp ? 16 :
 					    tcon_nsweep_hi ? 15 :
@@ -9288,7 +9401,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    (tcon_solid || tcon_solid_native) ? 9 :
 					    tcon_checker_mono ? 1 :
 					    tcon_checker ? 8 : 0,
-					    tcon_solid_native, hbands, grid, quads, vbands, pitch, pitch_wide, hbp, pitch_low, edge, edge_fine, stride, stride_fix,
+					    tcon_solid_native, hbands, grid, quads, vbands, pitch, pitch_wide, hbp, pitch_low, edge, edge_fine, stride, stride_fix, band,
 					    stride_override) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
@@ -9415,6 +9528,7 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "                                      fb-edge-fine: 1232..1240, confirms the stride to the pixel\n"
 	   "                                      fb-stride: pattern fixed, sweep AFBD 0x05600170 -- LIVE, unit slope, S = V - 42\n"
 	   "                                      fb-fix: pattern at the natural 1280, sweep for the register that unshears it\n"
+	   "                                      fb-band: solid fill, screen offset registers for the ~110px left band\n"
 	   "       h713_disp panel-test <id> <mode> <stride>  - same, with AFBD 0x05600170 forced to <stride> bytes (hex)\n"
 	   "h713_disp auto <project-id> [nowait] - load from eMMC and run\n"
 	   "h713_disp load <project-id>         - load from eMMC only\n"
