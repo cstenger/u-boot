@@ -4519,6 +4519,7 @@ struct h713_panel_cfg {
 	u32 inv_de, inv_hsync, inv_vsync, inv_dclk;
 	u32 de_current, odd_current, even_current;
 	u32 ssc_en;		/* DT 1 -> INI 0          */
+	u32 pll_n_plus_1;	/* display PLL 0x058c0014[15:8] + 1 */
 	u32 htotal, vtotal, hsync, vsync, hbp, vbp, width;
 };
 
@@ -4528,6 +4529,16 @@ static const struct h713_panel_cfg h713_panel_cfg_board_b = {
 	.inv_de = 0, .inv_hsync = 0, .inv_vsync = 0, .inv_dclk = 1,
 	.de_current = 47, .odd_current = 7, .even_current = 7,
 	.ssc_en = 0,
+	/*
+	 * The vendor table leaves the display PLL at N+1 = 43, which is
+	 * 24 * 43 = 1032 MHz and, through the measured /14, 73.71 MHz of DCLK
+	 * against the 62 MHz panel_config.ini asks for -- 18.9% fast. Sweeping
+	 * the PLL with the chroma checker found the panel decodes cleanly at
+	 * N+1 = 36: 864 MHz, 61.71 MHz of DCLK, 0.46% low, 59.71 Hz. At 43 the
+	 * projected image is a uniform blur; at 36 it is a crisp checkerboard.
+	 * That sweep is also what established K = 14 in the first place.
+	 */
+	.pll_n_plus_1 = 36,
 	.htotal = 1360, .vtotal = 760, .hsync = 20, .vsync = 2,
 	.hbp = 40, .vbp = 20, .width = 1280,
 };
@@ -4560,6 +4571,8 @@ static int h713_disp_panel_patch(ulong blob, const struct h713_disp_sel *sel)
 	const struct h713_panel_cfg *c = &h713_panel_cfg_board_b;
 	const struct h713_panel_patch tbl[] = {
 		/* LVDS lane/map: protocol, bit width, swap and inversions */
+		/* Display PLL N: the panel decodes only near 864 MHz. */
+		{ 0x058c0014,  8, 0xff,   c->pll_n_plus_1 - 1 },
 		{ 0x05800000,  6, 0x3,    c->mapping },
 		{ 0x05800000,  3, 0x3,    c->color_depth },
 		{ 0x05800000, 14, 0x1,    c->odd_even },
