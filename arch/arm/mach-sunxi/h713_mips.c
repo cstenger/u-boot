@@ -5484,6 +5484,14 @@ static void h713_disp_sample(void)
 #define H713_DISP_AFBD_STRIDE_REG	0x05600170UL
 
 /*
+ * The layer's pixel X origin. Comes up holding 123, which is exactly the pale
+ * band that has been at the left of every framebuffer photograph in this
+ * bring-up. test_32 proved it 1:1: 0 puts content at column 0 across the full
+ * 1280, 400 puts it at 406.
+ */
+#define H713_DISP_LAYER_XOFF_REG	0x0528008cUL
+
+/*
  * The measured fetch stride, from test_30: the edge sweep's five photographed
  * steps put the source advance at 1237 px/row, and a search over every stride
  * from 2 to 4000 has no other solution -- a stripe count fixes S mod P, and the
@@ -9021,6 +9029,30 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		       "reads back %08x\n", stride_override,
 		       stride_override / 4,
 		       readl(H713_DISP_AFBD_STRIDE_REG));
+	}
+
+	/*
+	 * The left band, fixed. test_32 settled it in one run: 0x0528008c is a
+	 * plain pixel X origin for the layer, 1:1 and with nothing else in it.
+	 * Zeroed, content starts at column 0 and fills all 1280; set to 400,
+	 * it starts at 406. The four other candidates screened alongside moved
+	 * it by 1 px.
+	 *
+	 * Whatever writes 123 does so before this point -- it survives the DE
+	 * replay, so it is either LogoRegData or the firmware itself -- which
+	 * is why this is a write here rather than a patched record. Applied to
+	 * every mode except fb-band, which needs the untouched value for its
+	 * own control step.
+	 */
+	if (!band) {
+		u32 was = readl(H713_DISP_LAYER_XOFF_REG);
+
+		writel(0, H713_DISP_LAYER_XOFF_REG);
+		dmb();
+		printf("H713 panel: layer X origin 0x%08lx %08x -> %08x, so "
+		       "content starts at column 0\n",
+		       H713_DISP_LAYER_XOFF_REG, was,
+		       readl(H713_DISP_LAYER_XOFF_REG));
 	}
 
 	if (band) {
