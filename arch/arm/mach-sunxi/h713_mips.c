@@ -5588,6 +5588,34 @@ static const u16 h713_pitch_sweep_wide[] = {
 	1360, 1366, 1408, 1440, 1536, 1920,
 };
 
+/*
+ * Below 1280, which both earlier sweeps missed.
+ *
+ * The operator reports that the TCON generator patterns -- checkerboards and
+ * solids -- fill the whole screen, while the framebuffer patterns are truncated
+ * with a pale band at one side. That contradicts what this log claimed and what
+ * was repeated here: the band is NOT a panel or TCON artefact, it belongs to the
+ * framebuffer path, and it is part of this bug rather than a separate one.
+ *
+ * It also measures the fault directly. If the fetch supplies P pixels for a
+ * 1280-pixel display line, the content occupies P/1280 of the width and the
+ * remainder is the band. Two captures agree: content is 92.8% and 92.7% of the
+ * projection, so P is about 1187 -- below 1280, where neither sweep looked,
+ * because both were chasing an HTOTAL theory that had the sign wrong.
+ *
+ * P = 1187 also fits everything else: a -93 px/row slide gives ~52 rainbow
+ * cycles down the frame, and fb-vprobe stretches by only 1.08, which still reads
+ * as correct.
+ *
+ * The band gives a far better success criterion than band verticality: at the
+ * correct pitch the content fills the full width and the band disappears. That
+ * is unmistakable in a blurry photograph, where judging whether fine bands are
+ * quite vertical is not.
+ */
+static const u16 h713_pitch_sweep_low[] = {
+	1180, 1184, 1188, 1192, 1196, 1200,
+};
+
 static void h713_disp_fill_pitch(u32 pitch)
 {
 	static const u32 hues[] = {
@@ -8502,7 +8530,8 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 				uint tcon_checker_style,
 				bool preserve_mips_timing, bool hbands,
 				bool grid, bool quads, bool vbands,
-				bool pitch, bool pitch_wide, bool hbp)
+				bool pitch, bool pitch_wide, bool hbp,
+				bool pitch_low)
 {
 	int ret;
 
@@ -8618,7 +8647,10 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		h713_disp_dump(false);
 	}
 
-	if (pitch_wide) {
+	if (pitch_low) {
+		h713_disp_pitch_sweep(h713_pitch_sweep_low,
+				      ARRAY_SIZE(h713_pitch_sweep_low));
+	} else if (pitch_wide) {
 		h713_disp_pitch_sweep(h713_pitch_sweep_wide,
 				      ARRAY_SIZE(h713_pitch_sweep_wide));
 	} else if (pitch) {
@@ -8948,12 +8980,14 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		bool pitch_wide = argc == 4 &&
 				  !strcmp(argv[3], "fb-pitch-wide");
 		bool hbp = argc == 4 && !strcmp(argv[3], "tcon-hbp");
+		bool pitch_low = argc == 4 &&
+				 !strcmp(argv[3], "fb-pitch-low");
 
 		if (argc == 4 && !noboot && !full && !quiesce && !vendor_logo &&
 		    !plane_gate && !tcon_checker && !tcon_checker_mono &&
 		    !tcon_solid && !tcon_solid_native && !tcon_dclk &&
 		    !tcon_solid_dclk_normal && !tcon_chroma && !tcon_chroma_62m &&
-		    !tcon_nsweep && !tcon_nsweep_hi && !hbands && !grid && !quads && !vbands && !pitch && !pitch_wide && !hbp)
+		    !tcon_nsweep && !tcon_nsweep_hi && !hbands && !grid && !quads && !vbands && !pitch && !pitch_wide && !hbp && !pitch_low)
 			return CMD_RET_USAGE;
 		return h713_disp_panel_test(hextoul(argv[2], NULL), !noboot,
 					    full,
@@ -8962,7 +8996,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    tcon_solid || tcon_solid_native ||
 					    tcon_dclk || tcon_solid_dclk_normal ||
 					    tcon_chroma || tcon_chroma_62m ||
-					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads || vbands || pitch || pitch_wide || hbp,
+					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads || vbands || pitch || pitch_wide || hbp || pitch_low,
 					    vendor_logo, plane_gate,
 					    hbp ? 16 :
 					    tcon_nsweep_hi ? 15 :
@@ -8974,7 +9008,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    (tcon_solid || tcon_solid_native) ? 9 :
 					    tcon_checker_mono ? 1 :
 					    tcon_checker ? 8 : 0,
-					    tcon_solid_native, hbands, grid, quads, vbands, pitch, pitch_wide, hbp) ?
+					    tcon_solid_native, hbands, grid, quads, vbands, pitch, pitch_wide, hbp, pitch_low) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
@@ -9095,6 +9129,7 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "                                      fb-pitch: sweep the assumed line pitch 1280..1300\n"
 	   "                                      fb-pitch-wide: sweep 1360..1920 (HTOTAL and alignment roundings)\n"
 	   "                                      tcon-hbp: sweep the horizontal back porch to chase the edge band\n"
+	   "                                      fb-pitch-low: sweep 1180..1200; the band vanishing marks the answer\n"
 	   "h713_disp auto <project-id> [nowait] - load from eMMC and run\n"
 	   "h713_disp load <project-id>         - load from eMMC only\n"
 	   "h713_disp <blob-addr> <project-id> [nowait] - run against a staged blob\n"
