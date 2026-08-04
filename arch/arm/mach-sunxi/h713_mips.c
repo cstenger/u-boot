@@ -9137,6 +9137,21 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		ret = h713_disp_publish_vendor_bootlogo(false, vendor_chroma);
 		if (ret)
 			return ret;
+		/*
+		 * A positive control, and the thing this mode has always been
+		 * missing. Three runs came back "nothing on the panel" with a
+		 * framebuffer that fbcheck proves is correct, and none of them
+		 * could say whether the panel was lit at all -- every other
+		 * mode emits a marker before its frame and so answers that for
+		 * free. Two blinks off the TCON generator, which reaches the
+		 * panel without touching the framebuffer path:
+		 *
+		 *   blinks seen, logo absent -> panel and link are fine and the
+		 *     fault is specific to framebuffer scanout in this mode
+		 *   nothing seen at all      -> the panel is not lit in this
+		 *     mode, and the logo was never the question
+		 */
+		h713_disp_chroma_marker(2);
 		/* Bounds measured from the file: rows 343..378, cols 368..912. */
 		h713_disp_verify_fb(343, 378, 368, 912, vendor_chroma);
 		printf("H713 panel: EXACT VENDOR LOGO TEST at panel 720p timing; "
