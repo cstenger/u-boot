@@ -8927,7 +8927,7 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 				bool pitch, bool pitch_wide, bool hbp,
 				bool pitch_low, bool edge, bool edge_fine,
 				bool stride, bool stride_fix, bool band,
-				bool vendor_late, u32 stride_override)
+				bool vendor_early, u32 stride_override)
 {
 	int ret;
 
@@ -8959,27 +8959,27 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		return ret;
 
 	/*
-	 * Seed before AFBD is enabled, then republish after MIPS readiness.
+	 * Load the logo AFTER the display sequence, not before it.
 	 *
-	 * This seed is the one structural difference between vendor-logo, which
-	 * has never put anything on the panel, and every fb-* mode, which all
-	 * do. Those seed with a plain memory write; vendor-logo instead selects
-	 * a block device, reads 2.7 MB off FAT to 0x6d000000 and hashes it,
-	 * all before the display sequence runs.
+	 * Loading before was the whole reason vendor-logo never put anything
+	 * on the panel, across five runs. Every fb-* mode seeds with a plain
+	 * memory write and renders; vendor-logo instead selected a block
+	 * device, read 2.7 MB off FAT to 0x6d000000 and hashed it, all between
+	 * h713_disp_load() and h713_disp_run() -- and the panel then stayed
+	 * dark, with every register dump byte-identical to a run that worked
+	 * and the TCON marker equally absent. Moving that work after init, and
+	 * changing nothing else, renders the logo correctly.
 	 *
-	 * The failure is not visible anywhere in the register state: every dump
-	 * is identical to a run that renders, fbcheck proves the framebuffer
-	 * correct, the frame commits, and the TCON marker -- which does not
-	 * touch the framebuffer path at all -- is equally absent. Something
-	 * outside the dumped registers is being disturbed, so bisect the one
-	 * thing that differs instead of theorising about it.
+	 * Note h713_disp_load() already reads this same filesystem in every
+	 * mode, so FAT access before the sequence is not the problem by
+	 * itself. What is new here is the extra ~2.7 MB read plus a SHA-256
+	 * over it -- seconds of work, and a lot of cache traffic, in a window
+	 * where nothing else does any. The mechanism is not established.
 	 *
-	 * vendor-logo-late seeds like the working modes and loads the logo only
-	 * after init. If the panel lights, the pre-run load is the culprit and
-	 * the next question is which part of it; if it stays dark, the seed was
-	 * never the difference and this whole line of reasoning is wrong.
+	 * vendor-logo-early reproduces the broken ordering for whoever chases
+	 * it. Do not make it the default again without a photograph.
 	 */
-	if (vendor_logo && !vendor_late) {
+	if (vendor_logo && vendor_early) {
 		ret = h713_disp_publish_vendor_bootlogo(true, vendor_chroma);
 		if (ret)
 			return ret;
@@ -9183,9 +9183,8 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		 *
 		 *   1 then 2 blinks -> panel alive throughout; the fault is in
 		 *     the frame content or the commit
-		 *   1 blink only    -> publishing the logo kills it, and for
-		 *     vendor-logo-late that means the FAT read specifically,
-		 *     since that is all this variant moved
+		 *   1 blink only    -> publishing the logo kills it, which is
+		 *     what the pre-run ordering used to do
 		 *   neither         -> the panel never came up in this mode,
 		 *     and everything after init is beside the point
 		 *
@@ -9194,12 +9193,11 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		 */
 		h713_disp_chroma_marker(1);
 		/*
-		 * vendor-logo-late skipped the pre-run load, so it has to load
-		 * here. Publishing with load=false hashed whatever DRAM was
-		 * left at 0x6d000000 and was correctly refused -- which killed
-		 * the bisection run before it reached either marker.
+		 * Load here unless the early variant already did. Getting this
+		 * wrong once hashed whatever DRAM happened to sit at
+		 * 0x6d000000, refused it, and returned before either marker.
 		 */
-		ret = h713_disp_publish_vendor_bootlogo(vendor_late,
+		ret = h713_disp_publish_vendor_bootlogo(!vendor_early,
 						       vendor_chroma);
 		if (ret)
 			return ret;
@@ -9475,9 +9473,17 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		bool noboot = !strcmp(mode, "noboot");
 		bool full   = !strcmp(mode, "full");
 		bool quiesce = !strcmp(mode, "quiesce");
-		bool vendor_late = !strcmp(mode, "vendor-logo-late");
+		/*
+		 * Loading after the display sequence is the DEFAULT, because
+		 * loading before it does not work: see h713_disp_panel_test.
+		 * vendor-logo-late is kept as an alias of that default;
+		 * vendor-logo-early reproduces the broken ordering for anyone
+		 * chasing the mechanism.
+		 */
+		bool vendor_early = !strcmp(mode, "vendor-logo-early");
 		bool vendor_chroma = !strcmp(mode, "vendor-logo-chroma") ||
-				     vendor_late;
+				     !strcmp(mode, "vendor-logo-late") ||
+				     vendor_early;
 		bool vendor_logo = !strcmp(mode, "vendor-logo") ||
 				   vendor_chroma;
 		bool plane_gate = !strcmp(mode, "plane-gate");
@@ -9531,7 +9537,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    tcon_checker_mono ? 1 :
 					    tcon_checker ? 8 : 0,
 					    tcon_solid_native, hbands, grid, quads, vbands, pitch, pitch_wide, hbp, pitch_low, edge, edge_fine, stride, stride_fix, band,
-					    vendor_late, stride_override) ?
+					    vendor_early, stride_override) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
@@ -9659,7 +9665,8 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "                                      fb-fix: pattern at the natural 1280, sweep for the register that unshears it\n"
 	   "                                      fb-band: solid fill, screen offset registers for the ~110px left band\n"
 	   "                                      vendor-logo-chroma: the stock logo, lit->red unlit->blue (it is pure grey, which this path cannot show)\n"
-	   "                                      vendor-logo-late: same, but seeded like the fb-* modes -- bisects the pre-run BMP load\n"
+	   "                                      vendor-logo-late: alias of vendor-logo-chroma; loading late is now the default\n"
+	   "                                      vendor-logo-early: loads before the display sequence -- known broken, kept to chase why\n"
 	   "       h713_disp panel-test <id> <mode> <stride>  - same, with AFBD 0x05600170 forced to <stride> bytes (hex)\n"
 	   "h713_disp auto <project-id> [nowait] - load from eMMC and run\n"
 	   "h713_disp load <project-id>         - load from eMMC only\n"
