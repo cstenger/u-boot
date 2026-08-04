@@ -9349,7 +9349,25 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 	return 0;
 }
 
-static int h713_disp_test(u32 project, u32 source_id, u32 level)
+/*
+ * The elog buffer is a small ring and it wraps.
+ *
+ * The first capture proved it: the same TMpegNR error appears at both ends of
+ * the dumped region, and two truncated fragments ("...ionModuleID",
+ * "...30030008") sit between them. About 2.6 KB of ring, already overwritten
+ * by the time we read it -- so at BUF mode a raised level does not get us more
+ * history, it gets us the same tail flooded sooner.
+ *
+ * Hence the mode argument. Mode 0 is ELOG_OUTPUT_MODE_SYNC, which writes
+ * straight out through `route` (0 = uart) with no buffer to overflow. The
+ * formatter is fully present for every level -- the A/E/W/I/D/V tag table and
+ * its colour table are contiguous in the firmware -- so if call sites exist
+ * above ERROR, sync mode is what will show them.
+ *
+ * Default stays 2 (BUF), which is what has been used so far and is known to
+ * produce readable output.
+ */
+static int h713_disp_test(u32 project, u32 source_id, u32 level, u32 mode)
 {
 	int ret;
 
@@ -9359,7 +9377,7 @@ static int h713_disp_test(u32 project, u32 source_id, u32 level)
 
 	printf("H713 disp: config patches\n");
 	h713_cfg_set(H713_CFG_OFF_SOURCE_ID, '0' + source_id, "source_id");
-	h713_cfg_set(H713_CFG_OFF_ELOG_MODE, '2', "elog mode");
+	h713_cfg_set(H713_CFG_OFF_ELOG_MODE, '0' + mode, "elog mode");
 	h713_cfg_set(H713_CFG_OFF_ELOG_ASYNC, '0', "elog async");
 	h713_cfg_set(H713_CFG_OFF_ELOG_LEVEL, '0' + level, "elog level");
 
@@ -9395,10 +9413,11 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		u32 project = hextoul(argv[2], NULL);
 		u32 src = argc > 3 ? dectoul(argv[3], NULL) : 2;
 		u32 lvl = argc > 4 ? dectoul(argv[4], NULL) : 3;
+		u32 mode = argc > 5 ? dectoul(argv[5], NULL) : 2;
 
-		if (argc > 5 || src > 9 || lvl > 5)
+		if (argc > 6 || src > 9 || lvl > 5 || mode > 2)
 			return CMD_RET_USAGE;
-		return h713_disp_test(project, src, lvl) ?
+		return h713_disp_test(project, src, lvl, mode) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
