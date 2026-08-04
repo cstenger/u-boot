@@ -5517,6 +5517,64 @@ static void h713_disp_sample(void)
  * our register-only replay must provide pixels explicitly.
  */
 /*
+ * Eight vertical bands. The exact complement of fb-vprobe.
+ *
+ * fb-vprobe varies only down the frame and renders correctly. fb-quad varies on
+ * both axes and comes back as horizontal stripes, each a solid colour spanning
+ * the full width -- which no single source row can produce, since each quadrant
+ * colour occupies only half the width. So a display line is being drawn from
+ * part of a source line, and horizontal variation is being turned into vertical
+ * structure.
+ *
+ * That is as far as the quadrants go. The visible stripe period is ~38 display
+ * rows, far too coarse for a per-row effect, and at 1.8 display rows per photo
+ * pixel the capture is almost certainly showing moire rather than the true
+ * period. No stride ratio can honestly be read off it.
+ *
+ * These bands vary only ACROSS the frame, isolating the axis fb-vprobe could
+ * not test. 160 px each, wide enough to survive blur:
+ *
+ *   eight vertical bands, correct order   horizontal addressing is fine, and the
+ *                                         quad failure is an interaction effect
+ *   horizontal stripes instead            the axes are transposed or interleaved
+ *   more than eight bands                 the line is repeating; the count gives
+ *                                         the true pitch as a ratio, which is the
+ *                                         measurement the moire denied us
+ *   eight bands, wrong order              the line is being read out permuted
+ *
+ * Note the left/right column artefact is not this bug. It appears in the TCON
+ * generator tests too, which bypass the framebuffer entirely, so it belongs to
+ * the TCON/LVDS/panel layer -- most likely a horizontal offset or porch error --
+ * and will not be fixed by whatever is wrong here.
+ */
+static void h713_disp_fill_vbands(void)
+{
+	static const u32 hues[] = {
+		0xffff0000, 0xffff8000, 0xffffff00, 0xff00ff00,
+		0xff00ffff, 0xff0000ff, 0xff8000ff, 0xffff00ff,
+	};
+	u32 *fb = (u32 *)H713_DISP_OSD_FB_ADDR;
+	const u32 W = H713_DISP_OSD_WIDTH, H = H713_DISP_OSD_HEIGHT;
+	u32 band_w = W / ARRAY_SIZE(hues);
+	u32 x, y;
+
+	for (y = 0; y < H; y++) {
+		for (x = 0; x < W; x++) {
+			u32 band = x / band_w;
+
+			fb[y * W + x] = hues[band < ARRAY_SIZE(hues) ?
+					     band : ARRAY_SIZE(hues) - 1];
+		}
+	}
+
+	flush_cache(H713_DISP_OSD_FB_ADDR, H713_DISP_OSD_SIZE);
+	printf("H713 panel: %u vertical bands of %u px published at 0x%08lx "
+	       "(red orange yellow green cyan blue purple magenta, left to "
+	       "right)\n", (uint)ARRAY_SIZE(hues), band_w,
+	       H713_DISP_OSD_FB_ADDR);
+}
+
+/*
  * Four solid quadrants. The blur-proof geometry test.
  *
  * fb-grid showed the answer -- a dense repeating lattice where a sparse 10x6
@@ -8280,7 +8338,7 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 				bool quiesce, bool vendor_logo, bool plane_gate,
 				uint tcon_checker_style,
 				bool preserve_mips_timing, bool hbands,
-				bool grid, bool quads)
+				bool grid, bool quads, bool vbands)
 {
 	int ret;
 
@@ -8396,7 +8454,15 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		h713_disp_dump(false);
 	}
 
-	if (quads) {
+	if (vbands) {
+		h713_disp_fill_vbands();
+		printf("H713 panel: VERTICAL BAND PROBE at panel 720p timing; "
+		       "one frame, holding %u ms\n",
+		       H713_DISP_STATIC_FRAME_DWELL_MS);
+		h713_disp_commit_osd_frame();
+		printf("H713 panel: VERTICAL BANDS COMMITTED; photograph now\n");
+		mdelay(H713_DISP_STATIC_FRAME_DWELL_MS);
+	} else if (quads) {
 		h713_disp_fill_quads();
 		printf("H713 panel: QUADRANT TEST at panel 720p timing; one "
 		       "frame, holding %u ms\n", H713_DISP_STATIC_FRAME_DWELL_MS);
@@ -8705,12 +8771,13 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		bool hbands = argc == 4 && !strcmp(argv[3], "fb-vprobe");
 		bool grid = argc == 4 && !strcmp(argv[3], "fb-grid");
 		bool quads = argc == 4 && !strcmp(argv[3], "fb-quad");
+		bool vbands = argc == 4 && !strcmp(argv[3], "fb-hprobe");
 
 		if (argc == 4 && !noboot && !full && !quiesce && !vendor_logo &&
 		    !plane_gate && !tcon_checker && !tcon_checker_mono &&
 		    !tcon_solid && !tcon_solid_native && !tcon_dclk &&
 		    !tcon_solid_dclk_normal && !tcon_chroma && !tcon_chroma_62m &&
-		    !tcon_nsweep && !tcon_nsweep_hi && !hbands && !grid && !quads)
+		    !tcon_nsweep && !tcon_nsweep_hi && !hbands && !grid && !quads && !vbands)
 			return CMD_RET_USAGE;
 		return h713_disp_panel_test(hextoul(argv[2], NULL), !noboot,
 					    full,
@@ -8719,7 +8786,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    tcon_solid || tcon_solid_native ||
 					    tcon_dclk || tcon_solid_dclk_normal ||
 					    tcon_chroma || tcon_chroma_62m ||
-					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads,
+					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads || vbands,
 					    vendor_logo, plane_gate,
 					    tcon_nsweep_hi ? 15 :
 					    tcon_nsweep ? 14 :
@@ -8730,7 +8797,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    (tcon_solid || tcon_solid_native) ? 9 :
 					    tcon_checker_mono ? 1 :
 					    tcon_checker ? 8 : 0,
-					    tcon_solid_native, hbands, grid, quads) ?
+					    tcon_solid_native, hbands, grid, quads, vbands) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
@@ -8847,6 +8914,7 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "                                      fb-vprobe: 8 horizontal colour bands (vertical order only)\n"
 	   "                                      fb-grid: border+diagonals+corners (needs a sharp photo)\n"
 	   "                                      fb-quad: four solid quadrants; survives blur, counts the tiling\n"
+	   "                                      fb-hprobe: 8 vertical bands; isolates the horizontal axis\n"
 	   "h713_disp auto <project-id> [nowait] - load from eMMC and run\n"
 	   "h713_disp load <project-id>         - load from eMMC only\n"
 	   "h713_disp <blob-addr> <project-id> [nowait] - run against a staged blob\n"
