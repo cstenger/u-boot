@@ -5544,6 +5544,27 @@ static void h713_disp_sample(void)
  * The criterion is unambiguous and needs no register knowledge -- and once P is
  * known, d = P - 1280 says exactly how much a stride or width field is out.
  */
+/*
+ * Chase the edge artefact by sweeping the horizontal back porch.
+ *
+ * A pale vertical band has sat at one side of the projection in every capture in
+ * this log. It is not the framebuffer bug: it appears in the TCON generator
+ * tests too, which bypass framebuffer, AFBD, OSD and DE entirely, so it lives in
+ * the TCON timing or the panel. Worth removing on its own account -- one fewer
+ * variable before the pitch question is settled.
+ *
+ * 0x05880028 reads 00140028 against panel_config hsync=20 and hbp=40, so the
+ * halves are those fields. With HT=1360 and HA=1280 the front porch is
+ * 1360-1280-20-40 = 20. If the panel wants a different back porch the active
+ * window sits at the wrong offset and the remainder shows as a band at one edge.
+ *
+ * Sweep it with the style-8 checker running, which renders correctly, so any
+ * shift of the image is obvious. If the band moves with the value it is a porch
+ * error and the centring value is the answer; if it does not move at all, the
+ * band belongs to the panel and the timing is exonerated.
+ */
+static const u16 h713_hbp_sweep[] = { 40, 20, 30, 50, 60, 80 };
+
 static const u16 h713_pitch_sweep[] = { 1280, 1284, 1288, 1292, 1296, 1300 };
 
 /*
@@ -5574,7 +5595,15 @@ static void h713_disp_fill_pitch(u32 pitch)
 		0xff00ffff, 0xff0000ff, 0xff8000ff, 0xffff00ff,
 	};
 	u32 *fb = (u32 *)H713_DISP_OSD_FB_ADDR;
-	u32 total = H713_DISP_OSD_WIDTH * H713_DISP_OSD_HEIGHT;
+	/*
+	 * Cover pitch * height, not width * height. If the hardware walks P
+	 * pixels per row then row Y starts at Y*P, and a buffer of only
+	 * 1280*720 leaves the lower frame reading unwritten memory for every
+	 * P > 1280 -- 6% of the frame at 1360, a third of it at 1920. The first
+	 * sweep was testing garbage over exactly the region a larger pitch
+	 * pushes into.
+	 */
+	u32 total = pitch * H713_DISP_OSD_HEIGHT;
 	u32 band = pitch / ARRAY_SIZE(hues);
 	u32 i;
 
@@ -6810,6 +6839,48 @@ static void h713_disp_chroma_phase(const char *label, u32 ctrl, u32 size,
 	       readl(H713_DISP_LVDS_LANE_REG),
 	       readl(H713_DISP_LVDS_SCAN_REG));
 	mdelay(H713_DISP_CHROMA_PHASE_MS);
+}
+
+static void h713_disp_hbp_sweep(void)
+{
+	u32 saved_porch = readl(0x05880028);
+	u32 saved_ctrl = readl(H713_DISP_TCON_CTRL_REG);
+	u32 saved_mode = readl(H713_DISP_TCON_MODE_REG);
+	u32 saved_size = readl(H713_DISP_TCON_PATTERN_SIZE_REG);
+	u32 saved_rgb0 = readl(H713_DISP_TCON_PATTERN_RGB0_REG);
+	u32 saved_rgb1 = readl(H713_DISP_TCON_PATTERN_RGB1_REG);
+	uint i;
+
+	printf("H713 hbp: 0x05880028 = %08x (hsync %u, back porch %u); sweeping "
+	       "the back porch with the checker running\n",
+	       saved_porch, saved_porch >> 16, saved_porch & 0xffff);
+
+	for (i = 0; i < ARRAY_SIZE(h713_hbp_sweep); i++) {
+		u32 hbp_val = h713_hbp_sweep[i];
+		u32 val = (saved_porch & 0xffff0000) | hbp_val;
+
+		writel(val, 0x05880028);
+		dmb();
+		h713_disp_chroma_marker(i + 1);
+		h713_disp_tcon_pattern_apply(saved_ctrl, H713_TCON_CELL_STOCK,
+					     H713_TCON_RGB_RED,
+					     H713_TCON_RGB_BLUE);
+		printf("H713 hbp: step %u, back porch %u (0x05880028=%08x), "
+		       "front porch becomes %d; observe the band\n",
+		       i + 1, hbp_val, readl(0x05880028),
+		       1360 - 1280 - (int)(saved_porch >> 16) - (int)hbp_val);
+		mdelay(H713_DISP_CHROMA_PHASE_MS);
+		h713_disp_boardb_tcon_generator_off(saved_ctrl, saved_mode);
+	}
+
+	writel(saved_size, H713_DISP_TCON_PATTERN_SIZE_REG);
+	writel(saved_rgb0, H713_DISP_TCON_PATTERN_RGB0_REG);
+	writel(saved_rgb1, H713_DISP_TCON_PATTERN_RGB1_REG);
+	writel(saved_mode, H713_DISP_TCON_MODE_REG);
+	writel(saved_ctrl, H713_DISP_TCON_CTRL_REG);
+	writel(saved_porch, 0x05880028);
+	dmb();
+	printf("H713 hbp: restored 0x05880028=%08x\n", readl(0x05880028));
 }
 
 static void h713_disp_pitch_sweep(const u16 *list, uint count)
@@ -8431,7 +8502,7 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 				uint tcon_checker_style,
 				bool preserve_mips_timing, bool hbands,
 				bool grid, bool quads, bool vbands,
-				bool pitch, bool pitch_wide)
+				bool pitch, bool pitch_wide, bool hbp)
 {
 	int ret;
 
@@ -8547,7 +8618,9 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		h713_disp_dump(false);
 	}
 
-	if (pitch_wide) {
+	if (hbp) {
+		h713_disp_hbp_sweep();
+	} else if (pitch_wide) {
 		h713_disp_pitch_sweep(h713_pitch_sweep_wide,
 				      ARRAY_SIZE(h713_pitch_sweep_wide));
 	} else if (pitch) {
@@ -8874,12 +8947,13 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		bool pitch = argc == 4 && !strcmp(argv[3], "fb-pitch");
 		bool pitch_wide = argc == 4 &&
 				  !strcmp(argv[3], "fb-pitch-wide");
+		bool hbp = argc == 4 && !strcmp(argv[3], "tcon-hbp");
 
 		if (argc == 4 && !noboot && !full && !quiesce && !vendor_logo &&
 		    !plane_gate && !tcon_checker && !tcon_checker_mono &&
 		    !tcon_solid && !tcon_solid_native && !tcon_dclk &&
 		    !tcon_solid_dclk_normal && !tcon_chroma && !tcon_chroma_62m &&
-		    !tcon_nsweep && !tcon_nsweep_hi && !hbands && !grid && !quads && !vbands && !pitch && !pitch_wide)
+		    !tcon_nsweep && !tcon_nsweep_hi && !hbands && !grid && !quads && !vbands && !pitch && !pitch_wide && !hbp)
 			return CMD_RET_USAGE;
 		return h713_disp_panel_test(hextoul(argv[2], NULL), !noboot,
 					    full,
@@ -8888,7 +8962,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    tcon_solid || tcon_solid_native ||
 					    tcon_dclk || tcon_solid_dclk_normal ||
 					    tcon_chroma || tcon_chroma_62m ||
-					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads || vbands || pitch || pitch_wide,
+					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads || vbands || pitch || pitch_wide || hbp,
 					    vendor_logo, plane_gate,
 					    tcon_nsweep_hi ? 15 :
 					    tcon_nsweep ? 14 :
@@ -8899,7 +8973,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    (tcon_solid || tcon_solid_native) ? 9 :
 					    tcon_checker_mono ? 1 :
 					    tcon_checker ? 8 : 0,
-					    tcon_solid_native, hbands, grid, quads, vbands, pitch, pitch_wide) ?
+					    tcon_solid_native, hbands, grid, quads, vbands, pitch, pitch_wide, hbp) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
@@ -9019,6 +9093,7 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "                                      fb-hprobe: 8 vertical bands; isolates the horizontal axis\n"
 	   "                                      fb-pitch: sweep the assumed line pitch 1280..1300\n"
 	   "                                      fb-pitch-wide: sweep 1360..1920 (HTOTAL and alignment roundings)\n"
+	   "                                      tcon-hbp: sweep the horizontal back porch to chase the edge band\n"
 	   "h713_disp auto <project-id> [nowait] - load from eMMC and run\n"
 	   "h713_disp load <project-id>         - load from eMMC only\n"
 	   "h713_disp <blob-addr> <project-id> [nowait] - run against a staged blob\n"
