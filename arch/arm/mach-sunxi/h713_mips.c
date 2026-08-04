@@ -5491,12 +5491,13 @@ static void h713_disp_sample(void)
  *
  * Fill and sweep spans have to cover the largest stride any mode drives, not
  * 1280: the frame consumes stride * 720 words, so 1296 px/row reads 933120
- * words where the nominal buffer holds 921600. 1320 covers every value used
- * here and ends at 0x6c4c4000, clear of everything in the memory map -- the
- * next region down ends at 0x4e800000.
+ * words where the nominal buffer holds 921600. 1360 covers every register
+ * value fb-fix drives even if the unit slope turns out to be wrong and the
+ * stride tracks the register outright, and ends at 0x6c4ec000, clear of
+ * everything in the memory map -- the next region down ends at 0x4e800000.
  */
 #define H713_DISP_EDGE_PITCH		1237
-#define H713_DISP_EDGE_SPAN_PX		1320
+#define H713_DISP_EDGE_SPAN_PX		1360
 #define H713_DISP_EDGE_SPAN_WORDS	(H713_DISP_EDGE_SPAN_PX * \
 					 H713_DISP_OSD_HEIGHT)
 #define H713_DISP_LVDS_SCAN_REG		0x05880000UL
@@ -7087,6 +7088,75 @@ static void h713_disp_stride_sweep(void)
 	writel(saved, H713_DISP_AFBD_STRIDE_REG);
 	dmb();
 	printf("H713 stride: sweep complete, restored 0x%08lx=%08x\n",
+	       H713_DISP_AFBD_STRIDE_REG, readl(H713_DISP_AFBD_STRIDE_REG));
+}
+
+/*
+ * Drive the stride to 1280 and be done with it.
+ *
+ * test_31 answered the causality question: 0x05600170 is live, with unit slope.
+ * Four well-determined steps fit S = V - 42 to an rms of 0.04 stripes, and the
+ * default V = 1280 lands on S = 1238, which is the same number test_30 got from
+ * a completely different experiment. Two independent measurements agreeing on
+ * the stride is what makes this worth extrapolating from.
+ *
+ * So the framebuffer path should come right at V = 1322 px (0x14a8 bytes). This
+ * sweep writes the pattern at the natural 1280 -- what every other framebuffer
+ * client will use -- and looks for the register value that renders it with no
+ * shear at all:
+ *
+ *	1300 -> 12.4   1310 -> 6.8   1320 -> 1.1
+ *	1330 ->  4.5   1340 -> 10.1  1280 -> 23.6 (control, today's behaviour)
+ *
+ * Coarse 10 px steps rather than a tight bracket around 1322, because that
+ * figure is extrapolated 42 px beyond anything yet measured. A wide sweep still
+ * measures if the offset is off -- the V is locatable anywhere in the range --
+ * where a tight one would simply miss. The control is the same pattern at
+ * today's register value, so the run carries its own before-and-after.
+ *
+ * The pale band is a separate fault and will not close here. It is a content
+ * width, not a stride, and nothing in this sweep addresses it.
+ */
+static const u16 h713_stride_fix_sweep_px[] = {
+	1300, 1310, 1320, 1330, 1340, 1280,
+};
+
+static void h713_disp_stride_fix_sweep(void)
+{
+	u32 saved = readl(H713_DISP_AFBD_STRIDE_REG);
+	uint i;
+
+	printf("H713 fix: pattern written at the natural %u px. Sweeping AFBD "
+	       "stride for the value that renders it unsheared -- predicted "
+	       "12.4/6.8/1.1/4.5/10.1 stripes, minimum near 1320-1322, then a "
+	       "control at today's %u px that should show ~23.6. A step with ONE "
+	       "vertical edge is the framebuffer path fixed.\n",
+	       H713_DISP_OSD_WIDTH, saved / 4);
+
+	h713_disp_fill_edge(H713_DISP_OSD_WIDTH);
+
+	for (i = 0; i < ARRAY_SIZE(h713_stride_fix_sweep_px); i++) {
+		u32 px = h713_stride_fix_sweep_px[i];
+
+		writel(px * 4, H713_DISP_AFBD_STRIDE_REG);
+		dmb();
+		h713_disp_chroma_marker(i + 1);
+		h713_disp_commit_osd_frame();
+		printf("H713 fix: step %u, register %08x (%u px), reads back "
+		       "%08x; S = %u if the unit slope holds, so %u.%u stripe(s) "
+		       "expected\n",
+		       i + 1, px * 4, px,
+		       readl(H713_DISP_AFBD_STRIDE_REG), px - 42,
+		       720 * (px > 1322 ? px - 1322 : 1322 - px) /
+		       H713_DISP_OSD_WIDTH,
+		       (7200 * (px > 1322 ? px - 1322 : 1322 - px) /
+			H713_DISP_OSD_WIDTH) % 10);
+		mdelay(H713_DISP_CHROMA_PHASE_MS);
+	}
+
+	writel(saved, H713_DISP_AFBD_STRIDE_REG);
+	dmb();
+	printf("H713 fix: sweep complete, restored 0x%08lx=%08x\n",
 	       H713_DISP_AFBD_STRIDE_REG, readl(H713_DISP_AFBD_STRIDE_REG));
 }
 
@@ -8711,7 +8781,8 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 				bool grid, bool quads, bool vbands,
 				bool pitch, bool pitch_wide, bool hbp,
 				bool pitch_low, bool edge, bool edge_fine,
-				bool stride)
+				bool stride, bool stride_fix,
+				u32 stride_override)
 {
 	int ret;
 
@@ -8827,7 +8898,24 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		h713_disp_dump(false);
 	}
 
-	if (stride) {
+	/*
+	 * Applied after the DE replay, which rewrites the AFBD block, so the
+	 * override has to land here rather than during init or it is undone.
+	 * Lets the value the fix sweep picks be tried against vendor-logo the
+	 * same evening, without a rebuild between.
+	 */
+	if (stride_override) {
+		writel(stride_override, H713_DISP_AFBD_STRIDE_REG);
+		dmb();
+		printf("H713 panel: AFBD stride overridden to %08x (%u px), "
+		       "reads back %08x\n", stride_override,
+		       stride_override / 4,
+		       readl(H713_DISP_AFBD_STRIDE_REG));
+	}
+
+	if (stride_fix) {
+		h713_disp_stride_fix_sweep();
+	} else if (stride) {
 		h713_disp_stride_sweep();
 	} else if (edge_fine) {
 		h713_disp_edge_sweep(h713_pitch_sweep_fine,
@@ -9138,48 +9226,48 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
-	if ((argc == 3 || argc == 4) && !strcmp(argv[1], "panel-test")) {
-		bool noboot = argc == 4 && !strcmp(argv[3], "noboot");
-		bool full   = argc == 4 && !strcmp(argv[3], "full");
-		bool quiesce = argc == 4 && !strcmp(argv[3], "quiesce");
-		bool vendor_logo = argc == 4 && !strcmp(argv[3], "vendor-logo");
-		bool plane_gate = argc == 4 && !strcmp(argv[3], "plane-gate");
-		bool tcon_checker = argc == 4 && !strcmp(argv[3], "tcon-checker");
-		bool tcon_checker_mono = argc == 4 &&
-					 !strcmp(argv[3], "tcon-checker-mono");
-		bool tcon_solid = argc == 4 && !strcmp(argv[3], "tcon-solid");
-		bool tcon_solid_native = argc == 4 &&
-					 !strcmp(argv[3], "tcon-solid-native");
-		bool tcon_dclk = argc == 4 && !strcmp(argv[3], "tcon-dclk");
-		bool tcon_solid_dclk_normal = argc == 4 &&
-				 !strcmp(argv[3], "tcon-solid-dclk-normal");
-		bool tcon_chroma = argc == 4 && !strcmp(argv[3], "tcon-chroma");
-		bool tcon_chroma_62m = argc == 4 &&
-				       !strcmp(argv[3], "tcon-chroma-62m");
-		bool tcon_nsweep = argc == 4 &&
-				   !strcmp(argv[3], "tcon-nsweep");
-		bool tcon_nsweep_hi = argc == 4 &&
-				      !strcmp(argv[3], "tcon-nsweep-hi");
-		bool hbands = argc == 4 && !strcmp(argv[3], "fb-vprobe");
-		bool grid = argc == 4 && !strcmp(argv[3], "fb-grid");
-		bool quads = argc == 4 && !strcmp(argv[3], "fb-quad");
-		bool vbands = argc == 4 && !strcmp(argv[3], "fb-hprobe");
-		bool pitch = argc == 4 && !strcmp(argv[3], "fb-pitch");
-		bool pitch_wide = argc == 4 &&
-				  !strcmp(argv[3], "fb-pitch-wide");
-		bool hbp = argc == 4 && !strcmp(argv[3], "tcon-hbp");
-		bool pitch_low = argc == 4 &&
-				 !strcmp(argv[3], "fb-pitch-low");
-		bool edge = argc == 4 && !strcmp(argv[3], "fb-edge");
-		bool edge_fine = argc == 4 &&
-				 !strcmp(argv[3], "fb-edge-fine");
-		bool stride = argc == 4 && !strcmp(argv[3], "fb-stride");
+	if ((argc >= 3 && argc <= 5) && !strcmp(argv[1], "panel-test")) {
+		/*
+		 * Optional argv[4] is a raw AFBD stride, in bytes, applied
+		 * for the whole run. Keeps a value the fix sweep picks
+		 * testable against any mode without a rebuild.
+		 */
+		const char *mode = argc >= 4 ? argv[3] : "";
+		u32 stride_override = argc == 5 ?
+				       hextoul(argv[4], NULL) : 0;
+		bool noboot = !strcmp(mode, "noboot");
+		bool full   = !strcmp(mode, "full");
+		bool quiesce = !strcmp(mode, "quiesce");
+		bool vendor_logo = !strcmp(mode, "vendor-logo");
+		bool plane_gate = !strcmp(mode, "plane-gate");
+		bool tcon_checker = !strcmp(mode, "tcon-checker");
+		bool tcon_checker_mono = !strcmp(mode, "tcon-checker-mono");
+		bool tcon_solid = !strcmp(mode, "tcon-solid");
+		bool tcon_solid_native = !strcmp(mode, "tcon-solid-native");
+		bool tcon_dclk = !strcmp(mode, "tcon-dclk");
+		bool tcon_solid_dclk_normal = !strcmp(mode, "tcon-solid-dclk-normal");
+		bool tcon_chroma = !strcmp(mode, "tcon-chroma");
+		bool tcon_chroma_62m = !strcmp(mode, "tcon-chroma-62m");
+		bool tcon_nsweep = !strcmp(mode, "tcon-nsweep");
+		bool tcon_nsweep_hi = !strcmp(mode, "tcon-nsweep-hi");
+		bool hbands = !strcmp(mode, "fb-vprobe");
+		bool grid = !strcmp(mode, "fb-grid");
+		bool quads = !strcmp(mode, "fb-quad");
+		bool vbands = !strcmp(mode, "fb-hprobe");
+		bool pitch = !strcmp(mode, "fb-pitch");
+		bool pitch_wide = !strcmp(mode, "fb-pitch-wide");
+		bool hbp = !strcmp(mode, "tcon-hbp");
+		bool pitch_low = !strcmp(mode, "fb-pitch-low");
+		bool edge = !strcmp(mode, "fb-edge");
+		bool edge_fine = !strcmp(mode, "fb-edge-fine");
+		bool stride = !strcmp(mode, "fb-stride");
+		bool stride_fix = !strcmp(mode, "fb-fix");
 
-		if (argc == 4 && !noboot && !full && !quiesce && !vendor_logo &&
+		if (argc >= 4 && !noboot && !full && !quiesce && !vendor_logo &&
 		    !plane_gate && !tcon_checker && !tcon_checker_mono &&
 		    !tcon_solid && !tcon_solid_native && !tcon_dclk &&
 		    !tcon_solid_dclk_normal && !tcon_chroma && !tcon_chroma_62m &&
-		    !tcon_nsweep && !tcon_nsweep_hi && !hbands && !grid && !quads && !vbands && !pitch && !pitch_wide && !hbp && !pitch_low && !edge && !edge_fine && !stride)
+		    !tcon_nsweep && !tcon_nsweep_hi && !hbands && !grid && !quads && !vbands && !pitch && !pitch_wide && !hbp && !pitch_low && !edge && !edge_fine && !stride && !stride_fix)
 			return CMD_RET_USAGE;
 		return h713_disp_panel_test(hextoul(argv[2], NULL), !noboot,
 					    full,
@@ -9188,7 +9276,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    tcon_solid || tcon_solid_native ||
 					    tcon_dclk || tcon_solid_dclk_normal ||
 					    tcon_chroma || tcon_chroma_62m ||
-					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads || vbands || pitch || pitch_wide || hbp || pitch_low || edge || edge_fine || stride,
+					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads || vbands || pitch || pitch_wide || hbp || pitch_low || edge || edge_fine || stride || stride_fix,
 					    vendor_logo, plane_gate,
 					    hbp ? 16 :
 					    tcon_nsweep_hi ? 15 :
@@ -9200,7 +9288,8 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    (tcon_solid || tcon_solid_native) ? 9 :
 					    tcon_checker_mono ? 1 :
 					    tcon_checker ? 8 : 0,
-					    tcon_solid_native, hbands, grid, quads, vbands, pitch, pitch_wide, hbp, pitch_low, edge, edge_fine, stride) ?
+					    tcon_solid_native, hbands, grid, quads, vbands, pitch, pitch_wide, hbp, pitch_low, edge, edge_fine, stride, stride_fix,
+					    stride_override) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
@@ -9324,7 +9413,9 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "                                      fb-pitch-low: sweep 1180..1200 with eight bands\n"
 	   "                                      fb-edge: 1180..1200 red/blue edge; stripe count gives the stride (measured 1237)\n"
 	   "                                      fb-edge-fine: 1232..1240, confirms the stride to the pixel\n"
-	   "                                      fb-stride: pattern fixed, sweep AFBD 0x05600170 -- is it consulted at all?\n"
+	   "                                      fb-stride: pattern fixed, sweep AFBD 0x05600170 -- LIVE, unit slope, S = V - 42\n"
+	   "                                      fb-fix: pattern at the natural 1280, sweep for the register that unshears it\n"
+	   "       h713_disp panel-test <id> <mode> <stride>  - same, with AFBD 0x05600170 forced to <stride> bytes (hex)\n"
 	   "h713_disp auto <project-id> [nowait] - load from eMMC and run\n"
 	   "h713_disp load <project-id>         - load from eMMC only\n"
 	   "h713_disp <blob-addr> <project-id> [nowait] - run against a staged blob\n"
