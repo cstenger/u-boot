@@ -5481,6 +5481,24 @@ static void h713_disp_sample(void)
 #define H713_DISP_AFBD_CTRL_REG		0x05600140UL
 #define H713_DISP_AFBD_READY_REG	0x05600144UL
 #define H713_DISP_AFBD_STATUS_REG	0x05600168UL
+#define H713_DISP_AFBD_STRIDE_REG	0x05600170UL
+
+/*
+ * The measured fetch stride, from test_30: the edge sweep's five photographed
+ * steps put the source advance at 1237 px/row, and a search over every stride
+ * from 2 to 4000 has no other solution -- a stripe count fixes S mod P, and the
+ * five pitches together leave one candidate. See docs/claude-display-handoff.md.
+ *
+ * Fill and sweep spans have to cover the largest stride any mode drives, not
+ * 1280: the frame consumes stride * 720 words, so 1296 px/row reads 933120
+ * words where the nominal buffer holds 921600. 1320 covers every value used
+ * here and ends at 0x6c4c4000, clear of everything in the memory map -- the
+ * next region down ends at 0x4e800000.
+ */
+#define H713_DISP_EDGE_PITCH		1237
+#define H713_DISP_EDGE_SPAN_PX		1320
+#define H713_DISP_EDGE_SPAN_WORDS	(H713_DISP_EDGE_SPAN_PX * \
+					 H713_DISP_OSD_HEIGHT)
 #define H713_DISP_LVDS_SCAN_REG		0x05880000UL
 #define H713_DISP_LVDS_LANE_REG		0x05800000UL
 #define H713_DISP_VENDOR_BMP_ADDR	0x6d000000UL
@@ -6947,22 +6965,22 @@ static void h713_disp_fill_edge(u32 pitch)
 {
 	u32 *fb = (u32 *)H713_DISP_OSD_FB_ADDR;
 	/*
-	 * Fill the whole allocation, not pitch * height. The hardware walks its
-	 * own pitch, so a 720-row frame consumes P_hw * 720 words, and every
-	 * assumed pitch below P_hw leaves the bottom of the frame fetching
-	 * unwritten memory. At 1180 assumed against ~1187 actual that is only
-	 * the last four rows -- but an unexplained artefact at a frame edge has
-	 * cost this bring-up a session before, and the pattern is periodic, so
-	 * covering the full 1280*720 costs one short loop and leaves nothing at
-	 * any edge that needs explaining.
+	 * Fill the full span, not pitch * height and not even the nominal
+	 * allocation. The hardware walks its own stride, so a 720-row frame
+	 * consumes stride * 720 words; at the measured 1237 that is 890640,
+	 * and the stride sweep drives it to 1296, which needs 933120 against
+	 * the 921600 the buffer nominally holds. Anything short leaves the
+	 * bottom of the frame fetching unwritten memory -- and an unexplained
+	 * artefact at a frame edge has cost this bring-up a session before.
+	 * The pattern is periodic, so covering the span costs one short loop.
 	 */
-	u32 total = H713_DISP_OSD_SIZE / sizeof(u32);
+	u32 total = H713_DISP_EDGE_SPAN_WORDS;
 	u32 i;
 
 	for (i = 0; i < total; i++)
 		fb[i] = (i % pitch) < pitch / 2 ? 0xffff0000 : 0xff0000ff;
 
-	flush_cache(H713_DISP_OSD_FB_ADDR, H713_DISP_OSD_SIZE);
+	flush_cache(H713_DISP_OSD_FB_ADDR, total * sizeof(u32));
 }
 
 static void h713_disp_edge_sweep(const u16 *list, uint count)
@@ -6988,6 +7006,88 @@ static void h713_disp_edge_sweep(const u16 *list, uint count)
 		mdelay(H713_DISP_CHROMA_PHASE_MS);
 	}
 	printf("H713 edge: sweep complete\n");
+}
+
+/*
+ * Confirm the stride to the pixel.
+ *
+ * test_30 put it at 1237 from five steps that were all 37..57 px away, so the
+ * value comes from a slope, not from a step that matched. These six sit within
+ * 5 px of it, and at S = 1237 the predicted counts are
+ *
+ *	1232 -> 2.9   1234 -> 1.7   1236 -> 0.58
+ *	1237 -> 0     1238 -> 0.58  1240 -> 1.7
+ *
+ * a V with one minimum. The 1237 step is the only one that can show a single
+ * edge standing truly vertical; +-1 px still traverses 58% of the width and
+ * reads as clearly slanted. If the minimum lands anywhere but step 4, the
+ * stride is whatever that step says and 1237 was wrong.
+ */
+static const u16 h713_pitch_sweep_fine[] = {
+	1232, 1234, 1236, 1237, 1238, 1240,
+};
+
+/*
+ * Does anything actually read the AFBD line-stride register?
+ *
+ * 0x05600170 holds 0x1400 -- 5120 bytes, 1280 px -- while the hardware fetches
+ * 1237. So either it is not consulted, or it is consulted through something
+ * that is not the identity. A pitch sweep cannot tell those apart; only writing
+ * it can.
+ *
+ * Hold the pattern at 1237, where the unmodified register gives a single
+ * vertical edge, and step the register instead. If it is live with unit slope,
+ * driving it to 1280+k px moves the fetch to 1237+k and the frame picks up
+ * 720*k/1237 stripes:
+ *
+ *	1280 -> 0    1284 -> 2.3   1288 -> 4.7
+ *	1292 -> 7.0  1296 -> 9.3   1272 -> 4.7, leaning the other way
+ *
+ * If it is inert, all six steps are the same single vertical edge. Those two
+ * outcomes are not subtle and neither needs a register read to score.
+ *
+ * The last step is the tilt control: it predicts the same count as 1288 with
+ * the opposite lean, so it separates a real response from a count that happens
+ * to grow.
+ */
+static const u16 h713_stride_sweep_px[] = {
+	1280, 1284, 1288, 1292, 1296, 1272,
+};
+
+static void h713_disp_stride_sweep(void)
+{
+	u32 saved = readl(H713_DISP_AFBD_STRIDE_REG);
+	uint i;
+
+	printf("H713 stride: pattern held at %u px, AFBD stride 0x%08lx swept. "
+	       "Register reads %08x (%u px) while the fetch measures %u, so "
+	       "this asks whether the register is consulted at all. LIVE: the "
+	       "steps pick up 0/2.3/4.7/7.0/9.3 stripes and the last leans the "
+	       "other way. INERT: six identical single vertical edges.\n",
+	       H713_DISP_EDGE_PITCH, H713_DISP_AFBD_STRIDE_REG,
+	       saved, saved / 4, H713_DISP_EDGE_PITCH);
+
+	h713_disp_fill_edge(H713_DISP_EDGE_PITCH);
+
+	for (i = 0; i < ARRAY_SIZE(h713_stride_sweep_px); i++) {
+		u32 px = h713_stride_sweep_px[i];
+
+		writel(px * 4, H713_DISP_AFBD_STRIDE_REG);
+		dmb();
+		h713_disp_chroma_marker(i + 1);
+		h713_disp_commit_osd_frame();
+		printf("H713 stride: step %u, register %08x (%u px), reads back "
+		       "%08x; predicted %u stripe(s) if live, 0 if inert\n",
+		       i + 1, px * 4, px, readl(H713_DISP_AFBD_STRIDE_REG),
+		       720 * (px > 1280 ? px - 1280 : 1280 - px) /
+		       H713_DISP_EDGE_PITCH);
+		mdelay(H713_DISP_CHROMA_PHASE_MS);
+	}
+
+	writel(saved, H713_DISP_AFBD_STRIDE_REG);
+	dmb();
+	printf("H713 stride: sweep complete, restored 0x%08lx=%08x\n",
+	       H713_DISP_AFBD_STRIDE_REG, readl(H713_DISP_AFBD_STRIDE_REG));
 }
 
 static void h713_disp_pitch_sweep(const u16 *list, uint count)
@@ -8610,7 +8710,8 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 				bool preserve_mips_timing, bool hbands,
 				bool grid, bool quads, bool vbands,
 				bool pitch, bool pitch_wide, bool hbp,
-				bool pitch_low, bool edge)
+				bool pitch_low, bool edge, bool edge_fine,
+				bool stride)
 {
 	int ret;
 
@@ -8726,7 +8827,12 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		h713_disp_dump(false);
 	}
 
-	if (edge) {
+	if (stride) {
+		h713_disp_stride_sweep();
+	} else if (edge_fine) {
+		h713_disp_edge_sweep(h713_pitch_sweep_fine,
+				     ARRAY_SIZE(h713_pitch_sweep_fine));
+	} else if (edge) {
 		h713_disp_edge_sweep(h713_pitch_sweep_low,
 				     ARRAY_SIZE(h713_pitch_sweep_low));
 	} else if (pitch_low) {
@@ -9065,12 +9171,15 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		bool pitch_low = argc == 4 &&
 				 !strcmp(argv[3], "fb-pitch-low");
 		bool edge = argc == 4 && !strcmp(argv[3], "fb-edge");
+		bool edge_fine = argc == 4 &&
+				 !strcmp(argv[3], "fb-edge-fine");
+		bool stride = argc == 4 && !strcmp(argv[3], "fb-stride");
 
 		if (argc == 4 && !noboot && !full && !quiesce && !vendor_logo &&
 		    !plane_gate && !tcon_checker && !tcon_checker_mono &&
 		    !tcon_solid && !tcon_solid_native && !tcon_dclk &&
 		    !tcon_solid_dclk_normal && !tcon_chroma && !tcon_chroma_62m &&
-		    !tcon_nsweep && !tcon_nsweep_hi && !hbands && !grid && !quads && !vbands && !pitch && !pitch_wide && !hbp && !pitch_low && !edge)
+		    !tcon_nsweep && !tcon_nsweep_hi && !hbands && !grid && !quads && !vbands && !pitch && !pitch_wide && !hbp && !pitch_low && !edge && !edge_fine && !stride)
 			return CMD_RET_USAGE;
 		return h713_disp_panel_test(hextoul(argv[2], NULL), !noboot,
 					    full,
@@ -9079,7 +9188,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    tcon_solid || tcon_solid_native ||
 					    tcon_dclk || tcon_solid_dclk_normal ||
 					    tcon_chroma || tcon_chroma_62m ||
-					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads || vbands || pitch || pitch_wide || hbp || pitch_low || edge,
+					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads || vbands || pitch || pitch_wide || hbp || pitch_low || edge || edge_fine || stride,
 					    vendor_logo, plane_gate,
 					    hbp ? 16 :
 					    tcon_nsweep_hi ? 15 :
@@ -9091,7 +9200,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    (tcon_solid || tcon_solid_native) ? 9 :
 					    tcon_checker_mono ? 1 :
 					    tcon_checker ? 8 : 0,
-					    tcon_solid_native, hbands, grid, quads, vbands, pitch, pitch_wide, hbp, pitch_low, edge) ?
+					    tcon_solid_native, hbands, grid, quads, vbands, pitch, pitch_wide, hbp, pitch_low, edge, edge_fine, stride) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
@@ -9213,7 +9322,9 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "                                      fb-pitch-wide: sweep 1360..1920 (HTOTAL and alignment roundings)\n"
 	   "                                      tcon-hbp: sweep the horizontal back porch to chase the edge band\n"
 	   "                                      fb-pitch-low: sweep 1180..1200 with eight bands\n"
-	   "                                      fb-edge: same sweep, ONE red/blue edge -- slope gives the pitch\n"
+	   "                                      fb-edge: 1180..1200 red/blue edge; stripe count gives the stride (measured 1237)\n"
+	   "                                      fb-edge-fine: 1232..1240, confirms the stride to the pixel\n"
+	   "                                      fb-stride: pattern fixed, sweep AFBD 0x05600170 -- is it consulted at all?\n"
 	   "h713_disp auto <project-id> [nowait] - load from eMMC and run\n"
 	   "h713_disp load <project-id>         - load from eMMC only\n"
 	   "h713_disp <blob-addr> <project-id> [nowait] - run against a staged blob\n"
