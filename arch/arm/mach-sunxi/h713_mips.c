@@ -5517,6 +5517,60 @@ static void h713_disp_sample(void)
  * our register-only replay must provide pixels explicitly.
  */
 /*
+ * Four solid quadrants. The blur-proof geometry test.
+ *
+ * fb-grid showed the answer -- a dense repeating lattice where a sparse 10x6
+ * grid was drawn, and 80x80 corner squares arriving as full-width bands, which
+ * is the image tiling rather than scaling. But its fine features could not be
+ * measured from a handheld photograph: autocorrelation on the capture decayed
+ * monotonically from the shortest lag, reading camera blur rather than any
+ * period. A pattern is only as good as the photograph it has to survive.
+ *
+ * So: four quadrants, each a solid 640x360 block. Red top-left, green
+ * top-right, blue bottom-left, yellow bottom-right. Nothing else. These stay
+ * legible through blur, defocus and keystone, and the colour sequence encodes
+ * the addressing directly:
+ *
+ *   four quadrants, correct colours    geometry is right
+ *   quadrants present but transposed   flip, mirror or rotation
+ *   horizontal stripes cycling
+ *     red green red green ...          each output row is drawing from a
+ *                                      different source row -- a row-pitch
+ *                                      mismatch, and the number of complete
+ *                                      colour cycles down the frame gives the
+ *                                      ratio between the true pitch and the
+ *                                      5120 bytes written
+ *   vertical stripes                   pixel-size or per-pixel stride error
+ *
+ * The stripe count is the measurement fb-grid could not deliver: counting four
+ * or five wide bands in a blurry photo is reliable in a way that counting
+ * lattice dots is not.
+ */
+static void h713_disp_fill_quads(void)
+{
+	u32 *fb = (u32 *)H713_DISP_OSD_FB_ADDR;
+	const u32 W = H713_DISP_OSD_WIDTH, H = H713_DISP_OSD_HEIGHT;
+	u32 x, y;
+
+	for (y = 0; y < H; y++) {
+		for (x = 0; x < W; x++) {
+			u32 c;
+
+			if (y < H / 2)
+				c = (x < W / 2) ? 0xffff0000 : 0xff00ff00;
+			else
+				c = (x < W / 2) ? 0xff0000ff : 0xffffff00;
+			fb[y * W + x] = c;
+		}
+	}
+
+	flush_cache(H713_DISP_OSD_FB_ADDR, H713_DISP_OSD_SIZE);
+	printf("H713 panel: four solid quadrants published at 0x%08lx -- "
+	       "red=TL green=TR blue=BL yellow=BR, each %ux%u\n",
+	       H713_DISP_OSD_FB_ADDR, W / 2, H / 2);
+}
+
+/*
  * A framebuffer pattern that cannot hide an addressing error on either axis.
  *
  * fb-vprobe's eight horizontal bands were claimed to prove the framebuffer path.
@@ -8226,7 +8280,7 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 				bool quiesce, bool vendor_logo, bool plane_gate,
 				uint tcon_checker_style,
 				bool preserve_mips_timing, bool hbands,
-				bool grid)
+				bool grid, bool quads)
 {
 	int ret;
 
@@ -8342,7 +8396,14 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		h713_disp_dump(false);
 	}
 
-	if (grid) {
+	if (quads) {
+		h713_disp_fill_quads();
+		printf("H713 panel: QUADRANT TEST at panel 720p timing; one "
+		       "frame, holding %u ms\n", H713_DISP_STATIC_FRAME_DWELL_MS);
+		h713_disp_commit_osd_frame();
+		printf("H713 panel: QUADRANTS COMMITTED; photograph now\n");
+		mdelay(H713_DISP_STATIC_FRAME_DWELL_MS);
+	} else if (grid) {
 		h713_disp_fill_grid();
 		printf("H713 panel: GEOMETRY GRID at panel 720p timing; one "
 		       "frame, holding %u ms\n", H713_DISP_STATIC_FRAME_DWELL_MS);
@@ -8643,12 +8704,13 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 				      !strcmp(argv[3], "tcon-nsweep-hi");
 		bool hbands = argc == 4 && !strcmp(argv[3], "fb-vprobe");
 		bool grid = argc == 4 && !strcmp(argv[3], "fb-grid");
+		bool quads = argc == 4 && !strcmp(argv[3], "fb-quad");
 
 		if (argc == 4 && !noboot && !full && !quiesce && !vendor_logo &&
 		    !plane_gate && !tcon_checker && !tcon_checker_mono &&
 		    !tcon_solid && !tcon_solid_native && !tcon_dclk &&
 		    !tcon_solid_dclk_normal && !tcon_chroma && !tcon_chroma_62m &&
-		    !tcon_nsweep && !tcon_nsweep_hi && !hbands && !grid)
+		    !tcon_nsweep && !tcon_nsweep_hi && !hbands && !grid && !quads)
 			return CMD_RET_USAGE;
 		return h713_disp_panel_test(hextoul(argv[2], NULL), !noboot,
 					    full,
@@ -8657,7 +8719,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    tcon_solid || tcon_solid_native ||
 					    tcon_dclk || tcon_solid_dclk_normal ||
 					    tcon_chroma || tcon_chroma_62m ||
-					    tcon_nsweep || tcon_nsweep_hi || hbands || grid,
+					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads,
 					    vendor_logo, plane_gate,
 					    tcon_nsweep_hi ? 15 :
 					    tcon_nsweep ? 14 :
@@ -8668,7 +8730,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    (tcon_solid || tcon_solid_native) ? 9 :
 					    tcon_checker_mono ? 1 :
 					    tcon_checker ? 8 : 0,
-					    tcon_solid_native, hbands, grid) ?
+					    tcon_solid_native, hbands, grid, quads) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
@@ -8783,7 +8845,8 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "                                      tcon-nsweep: step the display PLL, checker at each step\n"
 	   "                                      tcon-nsweep-hi: same, N+1 50..60 (extends past the best so far)\n"
 	   "                                      fb-vprobe: 8 horizontal colour bands (vertical order only)\n"
-	   "                                      fb-grid: border+diagonals+corners; detects stride, flip, scale\n"
+	   "                                      fb-grid: border+diagonals+corners (needs a sharp photo)\n"
+	   "                                      fb-quad: four solid quadrants; survives blur, counts the tiling\n"
 	   "h713_disp auto <project-id> [nowait] - load from eMMC and run\n"
 	   "h713_disp load <project-id>         - load from eMMC only\n"
 	   "h713_disp <blob-addr> <project-id> [nowait] - run against a staged blob\n"
