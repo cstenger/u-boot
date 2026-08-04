@@ -169,6 +169,15 @@ static const u8 h713_vendor_bootlogo_sha256[SHA256_SUM_LEN] = {
 
 static bool h713_display_prepared;
 static bool h713_panel_test_ran;
+
+/*
+ * Set only by fb-band, which screens candidate offset registers and needs
+ * 0x0528008c holding its power-on value for the control step. A flag rather
+ * than a parameter because h713_disp_run and h713_disp_panel_test are already
+ * long in the tooth for arguments, and this is a diagnostic exception rather
+ * than a mode of operation.
+ */
+static bool h713_disp_keep_layer_xoff;
 static bool h713_comm_trace_active;
 
 /* Previous value of every trace slot, so streaming reports only changes. */
@@ -5067,6 +5076,45 @@ static void h713_disp_probe_contested(const char *when)
 	       when, readl(0x051c0014), readl(0x051c0028), readl(0x05140054));
 }
 
+/*
+ * The layer's pixel X origin. Comes up holding 123, which is exactly the pale
+ * band that sat at the left of every framebuffer photograph in this bring-up.
+ * test_32 proved it 1:1: 0 puts content at column 0 across the full 1280, 400
+ * puts it at 406. It also caused the apparent stride deficit -- with the origin
+ * at 0 the stride register measures S = V, correct as it always was.
+ */
+#define H713_DISP_LAYER_XOFF_REG	0x0528008cUL
+
+/*
+ * Clear it on every path that brings the display up.
+ *
+ * This lived in panel-test alone for a day, which meant the diagnostic harness
+ * rendered correctly while `auto` -- the one-command-from-power-on path, and
+ * the closest thing to real startup -- still produced the 123 px band and the
+ * shear. A fix that only the test path applies is not a fix.
+ *
+ * Called twice in panel-test: once here at the end of the sequence, and again
+ * after h713_disp_reassert_osd, because the DE replay re-asserts block 5 and
+ * the post-replay dump still reads 0000007b.
+ */
+static void h713_disp_clear_layer_xoff(const char *when)
+{
+	u32 was;
+
+	if (h713_disp_keep_layer_xoff)
+		return;
+
+	was = readl(H713_DISP_LAYER_XOFF_REG);
+	if (!was)
+		return;
+
+	writel(0, H713_DISP_LAYER_XOFF_REG);
+	dmb();
+	printf("H713 panel: layer X origin 0x%08lx %08x -> %08x %s, so content "
+	       "starts at column 0\n", H713_DISP_LAYER_XOFF_REG, was,
+	       readl(H713_DISP_LAYER_XOFF_REG), when);
+}
+
 static int h713_disp_run(ulong blob, u32 project, bool skip_hdcp_wait,
 			 bool prove_ready, bool trace, bool stability,
 			 bool comm_trace, bool stock_panel_power,
@@ -5187,6 +5235,7 @@ static int h713_disp_run(ulong blob, u32 project, bool skip_hdcp_wait,
 	h713_disp_configured = true;
 	printf("H713 disp: sequence complete, LVDS FIFO status=0x%08x\n",
 	       readl(0x05880fe0));
+	h713_disp_clear_layer_xoff("at the end of the sequence");
 
 	/*
 	 * Readiness is a property of a released coprocessor. With the MIPS
@@ -5484,13 +5533,6 @@ static void h713_disp_sample(void)
 #define H713_DISP_AFBD_STATUS_REG	0x05600168UL
 #define H713_DISP_AFBD_STRIDE_REG	0x05600170UL
 
-/*
- * The layer's pixel X origin. Comes up holding 123, which is exactly the pale
- * band that has been at the left of every framebuffer photograph in this
- * bring-up. test_32 proved it 1:1: 0 puts content at column 0 across the full
- * 1280, 400 puts it at 406.
- */
-#define H713_DISP_LAYER_XOFF_REG	0x0528008cUL
 
 /*
  * The measured fetch stride, from test_30: the edge sweep's five photographed
@@ -8954,6 +8996,13 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 	}
 	h713_panel_test_ran = true;
 
+	/*
+	 * fb-band screens candidate offset registers and scores every step
+	 * against 0x0528008c's power-on value, so it is the one mode that must
+	 * see 123 rather than the corrected 0.
+	 */
+	h713_disp_keep_layer_xoff = band;
+
 	ret = h713_disp_load(project);
 	if (ret)
 		return ret;
@@ -9114,16 +9163,7 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 	 * every mode except fb-band, which needs the untouched value for its
 	 * own control step.
 	 */
-	if (!band) {
-		u32 was = readl(H713_DISP_LAYER_XOFF_REG);
-
-		writel(0, H713_DISP_LAYER_XOFF_REG);
-		dmb();
-		printf("H713 panel: layer X origin 0x%08lx %08x -> %08x, so "
-		       "content starts at column 0\n",
-		       H713_DISP_LAYER_XOFF_REG, was,
-		       readl(H713_DISP_LAYER_XOFF_REG));
-	}
+	h713_disp_clear_layer_xoff("after the DE replay");
 
 	if (band) {
 		h713_disp_band_sweep();
