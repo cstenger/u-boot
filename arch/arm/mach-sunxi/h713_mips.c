@@ -6934,13 +6934,23 @@ static void h713_disp_hbp_sweep(void)
 static void h713_disp_fill_edge(u32 pitch)
 {
 	u32 *fb = (u32 *)H713_DISP_OSD_FB_ADDR;
-	u32 total = pitch * H713_DISP_OSD_HEIGHT;
+	/*
+	 * Fill the whole allocation, not pitch * height. The hardware walks its
+	 * own pitch, so a 720-row frame consumes P_hw * 720 words, and every
+	 * assumed pitch below P_hw leaves the bottom of the frame fetching
+	 * unwritten memory. At 1180 assumed against ~1187 actual that is only
+	 * the last four rows -- but an unexplained artefact at a frame edge has
+	 * cost this bring-up a session before, and the pattern is periodic, so
+	 * covering the full 1280*720 costs one short loop and leaves nothing at
+	 * any edge that needs explaining.
+	 */
+	u32 total = H713_DISP_OSD_SIZE / sizeof(u32);
 	u32 i;
 
 	for (i = 0; i < total; i++)
 		fb[i] = (i % pitch) < pitch / 2 ? 0xffff0000 : 0xff0000ff;
 
-	flush_cache(H713_DISP_OSD_FB_ADDR, total * sizeof(u32));
+	flush_cache(H713_DISP_OSD_FB_ADDR, H713_DISP_OSD_SIZE);
 }
 
 static void h713_disp_edge_sweep(const u16 *list, uint count)
