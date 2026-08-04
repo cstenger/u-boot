@@ -8618,9 +8618,7 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		h713_disp_dump(false);
 	}
 
-	if (hbp) {
-		h713_disp_hbp_sweep();
-	} else if (pitch_wide) {
+	if (pitch_wide) {
 		h713_disp_pitch_sweep(h713_pitch_sweep_wide,
 				      ARRAY_SIZE(h713_pitch_sweep_wide));
 	} else if (pitch) {
@@ -8674,7 +8672,9 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		h713_disp_boardb_plane_gate_test();
 	} else if (tcon_checker_style) {
 		/* Board-B hardware pattern; independent of the OSD pixel path. */
-		if (tcon_checker_style == 15)
+		if (tcon_checker_style == 16)
+			h713_disp_hbp_sweep();
+		else if (tcon_checker_style == 15)
 			h713_disp_tcon_n_sweep(h713_n_sweep_hi,
 					       ARRAY_SIZE(h713_n_sweep_hi));
 		else if (tcon_checker_style == 14)
@@ -8964,6 +8964,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    tcon_chroma || tcon_chroma_62m ||
 					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads || vbands || pitch || pitch_wide || hbp,
 					    vendor_logo, plane_gate,
+					    hbp ? 16 :
 					    tcon_nsweep_hi ? 15 :
 					    tcon_nsweep ? 14 :
 					    tcon_chroma_62m ? 13 :
