@@ -7100,30 +7100,32 @@ static void h713_disp_stride_sweep(void)
 }
 
 /*
- * Drive the stride to 1280 and be done with it.
+ * Kept as the run that closed the framebuffer path, and as the correction to
+ * how it was understood.
  *
- * test_31 answered the causality question: 0x05600170 is live, with unit slope.
- * Four well-determined steps fit S = V - 42 to an rms of 0.04 stripes, and the
- * default V = 1280 lands on S = 1238, which is the same number test_30 got from
- * a completely different experiment. Two independent measurements agreeing on
- * the stride is what makes this worth extrapolating from.
+ * The sweep was built expecting S = V - 42, from test_31, and predicting a
+ * minimum near V = 1322. test_33 falsified that outright. With the layer X
+ * origin zeroed, the five swept steps come back at S = 1300.1, 1309.8, 1319.4,
+ * 1329.1, 1338.7 against registers 1300..1340 -- so
  *
- * So the framebuffer path should come right at V = 1322 px (0x14a8 bytes). This
- * sweep writes the pattern at the natural 1280 -- what every other framebuffer
- * client will use -- and looks for the register value that renders it with no
- * shear at all:
+ *	S = V
  *
- *	1300 -> 12.4   1310 -> 6.8   1320 -> 1.1
- *	1330 ->  4.5   1340 -> 10.1  1280 -> 23.6 (control, today's behaviour)
+ * and the stride register is a plain byte stride that was correct all along.
+ * The control step at the stock 0x1400 rendered one dead-vertical red/blue
+ * edge across the full width, drifting 0.0 px per row.
  *
- * Coarse 10 px steps rather than a tight bracket around 1322, because that
- * figure is extrapolated 42 px beyond anything yet measured. A wide sweep still
- * measures if the offset is off -- the V is locatable anywhere in the range --
- * where a tight one would simply miss. The control is the same pattern at
- * today's register value, so the run carries its own before-and-after.
+ * So there was never a second fault. The stride deficit measured twice as
+ * 1237-1238 was a *consequence* of 0x0528008c holding 123; zeroing the origin
+ * removed the shear as well as the band. Two symptoms, one register.
  *
- * The pale band is a separate fault and will not close here. It is a content
- * width, not a stride, and nothing in this sweep addresses it.
+ * That is the same mistake the old log made when it read the band as a stride,
+ * one level up: a number measured downstream of a fault was modelled as an
+ * independent fault of its own. Neither test_30 nor test_31 was wrong about
+ * what it measured -- S really was 1238 while the origin was 123 -- and both
+ * were wrong about what it meant.
+ *
+ * The mechanism, why an origin of 123 costs 42 px of advance per row, is not
+ * understood and is no longer load-bearing.
  */
 static const u16 h713_stride_fix_sweep_px[] = {
 	1300, 1310, 1320, 1330, 1340, 1280,
@@ -7244,11 +7246,10 @@ static void h713_disp_stride_fix_sweep(void)
 	u32 saved = readl(H713_DISP_AFBD_STRIDE_REG);
 	uint i;
 
-	printf("H713 fix: pattern written at the natural %u px. Sweeping AFBD "
-	       "stride for the value that renders it unsheared -- predicted "
-	       "12.4/6.8/1.1/4.5/10.1 stripes, minimum near 1320-1322, then a "
-	       "control at today's %u px that should show ~23.6. A step with ONE "
-	       "vertical edge is the framebuffer path fixed.\n",
+	printf("H713 fix: pattern written at the natural %u px, AFBD stride "
+	       "swept. S = V, so expect 11.3/16.9/22.5/28.1/33.8 stripes and "
+	       "the last step -- the stock %u px -- to render ONE vertical edge. "
+	       "That last step is the whole framebuffer path, correct.\n",
 	       H713_DISP_OSD_WIDTH, saved / 4);
 
 	h713_disp_fill_edge(H713_DISP_OSD_WIDTH);
@@ -7261,13 +7262,15 @@ static void h713_disp_stride_fix_sweep(void)
 		h713_disp_chroma_marker(i + 1);
 		h713_disp_commit_osd_frame();
 		printf("H713 fix: step %u, register %08x (%u px), reads back "
-		       "%08x; S = %u if the unit slope holds, so %u.%u stripe(s) "
-		       "expected\n",
+		       "%08x; S = %u, so %u.%u stripe(s) expected\n",
 		       i + 1, px * 4, px,
-		       readl(H713_DISP_AFBD_STRIDE_REG), px - 42,
-		       720 * (px > 1322 ? px - 1322 : 1322 - px) /
-		       H713_DISP_OSD_WIDTH,
-		       (7200 * (px > 1322 ? px - 1322 : 1322 - px) /
+		       readl(H713_DISP_AFBD_STRIDE_REG), px,
+		       720 * (px > H713_DISP_OSD_WIDTH ?
+			      px - H713_DISP_OSD_WIDTH :
+			      H713_DISP_OSD_WIDTH - px) / H713_DISP_OSD_WIDTH,
+		       (7200 * (px > H713_DISP_OSD_WIDTH ?
+				px - H713_DISP_OSD_WIDTH :
+				H713_DISP_OSD_WIDTH - px) /
 			H713_DISP_OSD_WIDTH) % 10);
 		mdelay(H713_DISP_CHROMA_PHASE_MS);
 	}
