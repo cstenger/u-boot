@@ -6500,7 +6500,16 @@ static void h713_disp_boardb_tcon_chroma_test(void)
 
 static const u8 h713_n_sweep[] = { 32, 36, 40, 43, 47, 52 };
 
-static void h713_disp_tcon_n_sweep(void)
+/*
+ * The first sweep found banding at N+1 = 32, 36 and 52, nothing at 40, 43 and
+ * 47, and the strongest response at 52 -- which was the top of the range. The
+ * optimum may well lie beyond it, so this list extends upward. 1440 MHz is 40%
+ * above the working point and well inside the rate limits the sibling CCU video
+ * PLLs document, and every step restores.
+ */
+static const u8 h713_n_sweep_hi[] = { 50, 52, 54, 56, 58, 60 };
+
+static void h713_disp_tcon_n_sweep(const u8 *list, uint count)
 {
 	u32 saved_pll = readl(H713_DISP_PLL_REG);
 	u32 saved_ctrl = readl(H713_DISP_TCON_CTRL_REG);
@@ -6515,8 +6524,8 @@ static void h713_disp_tcon_n_sweep(void)
 	       "with the red/blue 128px checker at each step\n",
 	       saved_pll, base, H713_DISP_PLL_N_NOW);
 
-	for (i = 0; i < ARRAY_SIZE(h713_n_sweep); i++) {
-		uint np1 = h713_n_sweep[i];
+	for (i = 0; i < count; i++) {
+		uint np1 = list[i];
 		u32 val = (saved_pll & ~(0xFFU << 8)) |
 			  (((np1 - 1) & 0xFF) << 8);
 		ulong khz, expect;
@@ -8097,8 +8106,12 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		h713_disp_boardb_plane_gate_test();
 	} else if (tcon_checker_style) {
 		/* Board-B hardware pattern; independent of the OSD pixel path. */
-		if (tcon_checker_style == 14)
-			h713_disp_tcon_n_sweep();
+		if (tcon_checker_style == 15)
+			h713_disp_tcon_n_sweep(h713_n_sweep_hi,
+					       ARRAY_SIZE(h713_n_sweep_hi));
+		else if (tcon_checker_style == 14)
+			h713_disp_tcon_n_sweep(h713_n_sweep,
+					       ARRAY_SIZE(h713_n_sweep));
 		else if (tcon_checker_style == 13)
 			h713_disp_chroma_test_at_62m();
 		else if (tcon_checker_style == 12)
@@ -8357,12 +8370,14 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 				       !strcmp(argv[3], "tcon-chroma-62m");
 		bool tcon_nsweep = argc == 4 &&
 				   !strcmp(argv[3], "tcon-nsweep");
+		bool tcon_nsweep_hi = argc == 4 &&
+				      !strcmp(argv[3], "tcon-nsweep-hi");
 
 		if (argc == 4 && !noboot && !full && !quiesce && !vendor_logo &&
 		    !plane_gate && !tcon_checker && !tcon_checker_mono &&
 		    !tcon_solid && !tcon_solid_native && !tcon_dclk &&
 		    !tcon_solid_dclk_normal && !tcon_chroma && !tcon_chroma_62m &&
-		    !tcon_nsweep)
+		    !tcon_nsweep && !tcon_nsweep_hi)
 			return CMD_RET_USAGE;
 		return h713_disp_panel_test(hextoul(argv[2], NULL), !noboot,
 					    full,
@@ -8371,8 +8386,9 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    tcon_solid || tcon_solid_native ||
 					    tcon_dclk || tcon_solid_dclk_normal ||
 					    tcon_chroma || tcon_chroma_62m ||
-					    tcon_nsweep,
+					    tcon_nsweep || tcon_nsweep_hi,
 					    vendor_logo, plane_gate,
+					    tcon_nsweep_hi ? 15 :
 					    tcon_nsweep ? 14 :
 					    tcon_chroma_62m ? 13 :
 					    tcon_chroma ? 12 :
@@ -8494,6 +8510,7 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "                                      tcon-chroma: RGB solids + red/blue checkers (128/32px)\n"
 	   "                                      tcon-chroma-62m: same, with DCLK retuned 73.7 -> 61.7 MHz\n"
 	   "                                      tcon-nsweep: step the display PLL, checker at each step\n"
+	   "                                      tcon-nsweep-hi: same, N+1 50..60 (extends past the best so far)\n"
 	   "h713_disp auto <project-id> [nowait] - load from eMMC and run\n"
 	   "h713_disp load <project-id>         - load from eMMC only\n"
 	   "h713_disp <blob-addr> <project-id> [nowait] - run against a staged blob\n"
