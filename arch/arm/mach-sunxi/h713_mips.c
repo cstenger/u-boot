@@ -7850,6 +7850,47 @@ static int h713_disp_call_table(uint raw_entries)
 	return 0;
 }
 
+/*
+ * Bring the display up and stop, leaving everything clocked.
+ *
+ * The register diagnostics -- scanrate, regscan, clkfind -- all need a live,
+ * clocked display, which until now meant running a full panel-test first and
+ * sitting through its generator phases just to reach a usable prompt. That also
+ * conflated two unrelated things: the bring-up sequence under test, and the
+ * measurement being taken.
+ *
+ * This runs the bring-up alone. `quiesce` additionally parks the MIPS core the
+ * way the generator modes do, which is what the register diagnostics want:
+ * with the firmware halted, nothing rewrites display registers underneath a
+ * measurement or a perturbation.
+ */
+static int h713_disp_init_only(u32 project, bool release_mips, bool quiesce)
+{
+	int ret;
+
+	ret = h713_disp_load(project);
+	if (ret)
+		return ret;
+
+	ret = h713_disp_run(H713_DISP_LOGO_ADDR, project, true, true, false,
+			    false, false, true, release_mips);
+	if (ret)
+		return ret;
+
+	if (quiesce) {
+		h713_disp_quiesce_mips_owner();
+		h713_disp_probe_contested("MIPS quiesced");
+	}
+	h713_disp_latch_panel_timing();
+
+	printf("H713 disp: display initialised%s; scanrate, regscan and "
+	       "clkfind can run now. Power-cycle before another init.\n",
+	       quiesce ? " with the MIPS core quiesced" :
+	       release_mips ? " with the firmware running" :
+			      " from the ARM sequence alone");
+	return 0;
+}
+
 static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 				bool quiesce, bool vendor_logo, bool plane_gate,
 				uint tcon_checker_style,
@@ -8147,6 +8188,17 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		return h713_disp_comm_state() ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 
+	if ((argc == 3 || argc == 4) && !strcmp(argv[1], "init")) {
+		u32 project = hextoul(argv[2], NULL);
+		bool noboot  = argc == 4 && !strcmp(argv[3], "noboot");
+		bool quiesce = argc == 4 && !strcmp(argv[3], "quiesce");
+
+		if (argc == 4 && !noboot && !quiesce)
+			return CMD_RET_USAGE;
+		return h713_disp_init_only(project, !noboot, quiesce) ?
+		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
+	}
+
 	if ((argc == 2 || argc == 3) && !strcmp(argv[1], "clkfind")) {
 		int which = argc == 3 ? (int)dectoul(argv[2], NULL) : -1;
 
@@ -8313,6 +8365,9 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "h713_disp calltable [raw-entries]   - read the live CPU_COMM call table\n"
 	   "h713_disp commstate                 - read the CPU_COMM transports\n"
 	   "h713_disp commtrace                 - read the CPU_COMM trace stage\n"
+	   "h713_disp init <project-id> [noboot|quiesce]\n"
+	   "                                    - bring the display up and stop, ready for diagnostics\n"
+	   "                                      quiesce: park the MIPS core (use this for clkfind)\n"
 	   "h713_disp scanrate                  - measure line/frame rate and real DCLK\n"
 	   "h713_disp regscan [base] [words]    - find which registers move, and what they count\n"
 	   "h713_disp clkfind [index]           - list, or test ONE clock candidate (see docs)\n"
