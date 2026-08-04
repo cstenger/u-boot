@@ -6467,6 +6467,99 @@ static void h713_disp_boardb_tcon_chroma_test(void)
 }
 
 /*
+ * Sweep the display PLL and watch for the checker to resolve.
+ *
+ * clkfind settled that 0x058c0014 is the display PLL -- N+1 from 43 to 42 moved
+ * the free-running counter -2.28% against a predicted -2.326% -- so the PLL runs
+ * at 24 MHz * (N+1) = 1032 MHz and the counter is PLL/56.
+ *
+ * It did not settle the ratio between the PLL and DCLK, and cannot: the two
+ * fields the panel config writes into 0x058c0024 both left the counter flat,
+ * which is what a divider downstream of the counter's tap point looks like. So
+ * DCLK is 1032/14 = 73.7, 1032/7 = 147.4, or 18.4 MHz, and no measurement
+ * available here distinguishes them.
+ *
+ * Searching is cheaper than deducing. The chroma checker now reproduces across
+ * boots -- test_17, test_18 and test_19 all separated the solids cleanly -- so
+ * it is a usable instrument, and the PLL is a verified knob. Step N across a
+ * range that brackets 62 MHz under the 1032/14 reading, show the red/blue
+ * checker at each step, and look for cells to appear.
+ *
+ * N+1 from 32 to 52 keeps the PLL between 768 and 1248 MHz, near its working
+ * point, which is deliberately a narrower range than the retune that hung the
+ * board. Under the /14 reading that spans 54.9 to 89.1 MHz of DCLK and brackets
+ * the panel's 62. If the checker resolves at any step, that step's N gives both
+ * the right DCLK and the ratio; if none does, the /14 reading is wrong and the
+ * remaining two candidates need a different approach.
+ *
+ * Each step verifies itself: the counter must track N proportionally, and a
+ * step where it does not is reported and its visual result disclaimed.
+ */
+#define H713_DISP_PLL_REG	0x058c0014UL
+#define H713_DISP_PLL_N_NOW	43
+
+static const u8 h713_n_sweep[] = { 32, 36, 40, 43, 47, 52 };
+
+static void h713_disp_tcon_n_sweep(void)
+{
+	u32 saved_pll = readl(H713_DISP_PLL_REG);
+	u32 saved_ctrl = readl(H713_DISP_TCON_CTRL_REG);
+	u32 saved_mode = readl(H713_DISP_TCON_MODE_REG);
+	u32 saved_size = readl(H713_DISP_TCON_PATTERN_SIZE_REG);
+	u32 saved_rgb0 = readl(H713_DISP_TCON_PATTERN_RGB0_REG);
+	u32 saved_rgb1 = readl(H713_DISP_TCON_PATTERN_RGB1_REG);
+	ulong base = h713_disp_counter_khz(100000);
+	uint i;
+
+	printf("H713 nsweep: PLL %08x, counter %lu kHz at N+1=%u; stepping N "
+	       "with the red/blue 128px checker at each step\n",
+	       saved_pll, base, H713_DISP_PLL_N_NOW);
+
+	for (i = 0; i < ARRAY_SIZE(h713_n_sweep); i++) {
+		uint np1 = h713_n_sweep[i];
+		u32 val = (saved_pll & ~(0xFFU << 8)) |
+			  (((np1 - 1) & 0xFF) << 8);
+		ulong khz, expect;
+		long err;
+
+		printf("H713 nsweep: step %u, N+1=%u, PLL %08x -> %08x ...\n",
+		       i + 1, np1, saved_pll, val);
+		writel(val, H713_DISP_PLL_REG);
+		dmb();
+		mdelay(100);
+
+		khz = h713_disp_counter_khz(50000);
+		expect = base * np1 / H713_DISP_PLL_N_NOW;
+		err = expect ? ((long)khz - (long)expect) * 100 / (long)expect : 0;
+		printf("H713 nsweep: counter %lu kHz, expected %lu (%+ld%%)%s\n",
+		       khz, expect, err,
+		       (err > 3 || err < -3) ?
+		       "   <== did not track; this step's image means nothing" :
+		       "");
+
+		h713_disp_chroma_marker(i + 1);
+		h713_disp_tcon_pattern_apply(saved_ctrl, 0x00800080,
+					     H713_TCON_RGB_RED,
+					     H713_TCON_RGB_BLUE);
+		printf("H713 nsweep: CHECKER AT N+1=%u ACTIVE; observe now\n",
+		       np1);
+		mdelay(H713_DISP_CHROMA_PHASE_MS);
+		h713_disp_boardb_tcon_generator_off(saved_ctrl, saved_mode);
+	}
+
+	writel(saved_size, H713_DISP_TCON_PATTERN_SIZE_REG);
+	writel(saved_rgb0, H713_DISP_TCON_PATTERN_RGB0_REG);
+	writel(saved_rgb1, H713_DISP_TCON_PATTERN_RGB1_REG);
+	writel(saved_mode, H713_DISP_TCON_MODE_REG);
+	writel(saved_ctrl, H713_DISP_TCON_CTRL_REG);
+	writel(saved_pll, H713_DISP_PLL_REG);
+	dmb();
+	mdelay(100);
+	printf("H713 nsweep: restored PLL %08x, counter %lu kHz\n",
+	       readl(H713_DISP_PLL_REG), h713_disp_counter_khz(100000));
+}
+
+/*
  * Run the chroma sweep with the panel clock retuned to the DCLK the panel
  * actually asks for, and prove the retune took effect before believing
  * anything optical.
@@ -8004,7 +8097,9 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		h713_disp_boardb_plane_gate_test();
 	} else if (tcon_checker_style) {
 		/* Board-B hardware pattern; independent of the OSD pixel path. */
-		if (tcon_checker_style == 13)
+		if (tcon_checker_style == 14)
+			h713_disp_tcon_n_sweep();
+		else if (tcon_checker_style == 13)
 			h713_disp_chroma_test_at_62m();
 		else if (tcon_checker_style == 12)
 			h713_disp_boardb_tcon_chroma_test();
@@ -8260,11 +8355,14 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		bool tcon_chroma = argc == 4 && !strcmp(argv[3], "tcon-chroma");
 		bool tcon_chroma_62m = argc == 4 &&
 				       !strcmp(argv[3], "tcon-chroma-62m");
+		bool tcon_nsweep = argc == 4 &&
+				   !strcmp(argv[3], "tcon-nsweep");
 
 		if (argc == 4 && !noboot && !full && !quiesce && !vendor_logo &&
 		    !plane_gate && !tcon_checker && !tcon_checker_mono &&
 		    !tcon_solid && !tcon_solid_native && !tcon_dclk &&
-		    !tcon_solid_dclk_normal && !tcon_chroma && !tcon_chroma_62m)
+		    !tcon_solid_dclk_normal && !tcon_chroma && !tcon_chroma_62m &&
+		    !tcon_nsweep)
 			return CMD_RET_USAGE;
 		return h713_disp_panel_test(hextoul(argv[2], NULL), !noboot,
 					    full,
@@ -8272,8 +8370,10 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    tcon_checker || tcon_checker_mono ||
 					    tcon_solid || tcon_solid_native ||
 					    tcon_dclk || tcon_solid_dclk_normal ||
-					    tcon_chroma || tcon_chroma_62m,
+					    tcon_chroma || tcon_chroma_62m ||
+					    tcon_nsweep,
 					    vendor_logo, plane_gate,
+					    tcon_nsweep ? 14 :
 					    tcon_chroma_62m ? 13 :
 					    tcon_chroma ? 12 :
 					    tcon_solid_dclk_normal ? 11 :
@@ -8393,6 +8493,7 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "                                      tcon-solid-dclk-normal: zero/one under normal DCLK\n"
 	   "                                      tcon-chroma: RGB solids + red/blue checkers (128/32px)\n"
 	   "                                      tcon-chroma-62m: same, with DCLK retuned 73.7 -> 61.7 MHz\n"
+	   "                                      tcon-nsweep: step the display PLL, checker at each step\n"
 	   "h713_disp auto <project-id> [nowait] - load from eMMC and run\n"
 	   "h713_disp load <project-id>         - load from eMMC only\n"
 	   "h713_disp <blob-addr> <project-id> [nowait] - run against a staged blob\n"
