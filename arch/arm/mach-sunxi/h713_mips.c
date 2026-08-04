@@ -9705,7 +9705,10 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 
 U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "run stock's fastlogo display sequence for a project ID",
-	   "test <project-id> [source] [level]  - load, patch, run, sample, log\n"
+	   "test <project-id> [source] [level] [mode] - load, patch, run, sample, log\n"
+	   "                                      level 0..5 (ASSERT..VERBOSE), default 3\n"
+	   "                                      mode 0=sync 1=async 2=buf, default 2\n"
+	   "                                      buf is a ~2.6 KB ring and wraps; sync does not\n"
 	   "h713_disp mips-test <project-id>    - run with CPU_COMM readiness proof\n"
 	   "h713_disp mips-trace <project-id>   - stream full-launch startup markers\n"
 	   "h713_disp mips-comm-trace <project-id> - trace CPU_COMM RETURN progress\n"
