@@ -6911,6 +6911,61 @@ static void h713_disp_hbp_sweep(void)
 	printf("H713 hbp: restored 0x05880028=%08x\n", readl(0x05880028));
 }
 
+/*
+ * One edge instead of eight bands.
+ *
+ * The pitch sweep was scored on two criteria and one of them was impossible.
+ * The pale band is the hardware fetching fewer pixels per display line than the
+ * line shows; the sweep only changes the pattern written into memory, so no
+ * candidate can alter the band, and it did not. Only verticality can respond --
+ * and judging whether eight fine bands are quite vertical, through blur and
+ * keystone, is a poor way to decide anything.
+ *
+ * So: two halves, red then blue, repeating every P pixels in linear order. That
+ * is a single boundary. At the correct pitch it stands vertical; at any other it
+ * leans, and the lean is large and low-frequency -- nothing to alias, nothing
+ * fine to resolve, readable at a glance.
+ *
+ * It also quantifies rather than just flagging. The edge shifts by
+ * (P_hw - P_pattern) pixels per row, so its slope measured against the frame
+ * gives the true fetch width directly, even from a step that is merely close.
+ * Two steps that lean opposite ways bracket the answer between them.
+ */
+static void h713_disp_fill_edge(u32 pitch)
+{
+	u32 *fb = (u32 *)H713_DISP_OSD_FB_ADDR;
+	u32 total = pitch * H713_DISP_OSD_HEIGHT;
+	u32 i;
+
+	for (i = 0; i < total; i++)
+		fb[i] = (i % pitch) < pitch / 2 ? 0xffff0000 : 0xff0000ff;
+
+	flush_cache(H713_DISP_OSD_FB_ADDR, total * sizeof(u32));
+}
+
+static void h713_disp_edge_sweep(const u16 *list, uint count)
+{
+	uint i;
+
+	printf("H713 edge: one red/blue boundary per step. The step whose edge "
+	       "stands vertical is the true fetch pitch; a leaning edge gives it "
+	       "from the slope. The pale band cannot change and is not a "
+	       "criterion.\n");
+
+	for (i = 0; i < count; i++) {
+		u32 p = list[i];
+
+		h713_disp_fill_edge(p);
+		h713_disp_chroma_marker(i + 1);
+		h713_disp_commit_osd_frame();
+		printf("H713 edge: step %u, assumed pitch %u px; vertical edge "
+		       "means correct, lean gives (true - %u) px per row\n",
+		       i + 1, p, p);
+		mdelay(H713_DISP_CHROMA_PHASE_MS);
+	}
+	printf("H713 edge: sweep complete\n");
+}
+
 static void h713_disp_pitch_sweep(const u16 *list, uint count)
 {
 	uint i;
@@ -8531,7 +8586,7 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 				bool preserve_mips_timing, bool hbands,
 				bool grid, bool quads, bool vbands,
 				bool pitch, bool pitch_wide, bool hbp,
-				bool pitch_low)
+				bool pitch_low, bool edge)
 {
 	int ret;
 
@@ -8647,7 +8702,10 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		h713_disp_dump(false);
 	}
 
-	if (pitch_low) {
+	if (edge) {
+		h713_disp_edge_sweep(h713_pitch_sweep_low,
+				     ARRAY_SIZE(h713_pitch_sweep_low));
+	} else if (pitch_low) {
 		h713_disp_pitch_sweep(h713_pitch_sweep_low,
 				      ARRAY_SIZE(h713_pitch_sweep_low));
 	} else if (pitch_wide) {
@@ -8982,12 +9040,13 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		bool hbp = argc == 4 && !strcmp(argv[3], "tcon-hbp");
 		bool pitch_low = argc == 4 &&
 				 !strcmp(argv[3], "fb-pitch-low");
+		bool edge = argc == 4 && !strcmp(argv[3], "fb-edge");
 
 		if (argc == 4 && !noboot && !full && !quiesce && !vendor_logo &&
 		    !plane_gate && !tcon_checker && !tcon_checker_mono &&
 		    !tcon_solid && !tcon_solid_native && !tcon_dclk &&
 		    !tcon_solid_dclk_normal && !tcon_chroma && !tcon_chroma_62m &&
-		    !tcon_nsweep && !tcon_nsweep_hi && !hbands && !grid && !quads && !vbands && !pitch && !pitch_wide && !hbp && !pitch_low)
+		    !tcon_nsweep && !tcon_nsweep_hi && !hbands && !grid && !quads && !vbands && !pitch && !pitch_wide && !hbp && !pitch_low && !edge)
 			return CMD_RET_USAGE;
 		return h713_disp_panel_test(hextoul(argv[2], NULL), !noboot,
 					    full,
@@ -8996,7 +9055,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    tcon_solid || tcon_solid_native ||
 					    tcon_dclk || tcon_solid_dclk_normal ||
 					    tcon_chroma || tcon_chroma_62m ||
-					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads || vbands || pitch || pitch_wide || hbp || pitch_low,
+					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads || vbands || pitch || pitch_wide || hbp || pitch_low || edge,
 					    vendor_logo, plane_gate,
 					    hbp ? 16 :
 					    tcon_nsweep_hi ? 15 :
@@ -9008,7 +9067,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    (tcon_solid || tcon_solid_native) ? 9 :
 					    tcon_checker_mono ? 1 :
 					    tcon_checker ? 8 : 0,
-					    tcon_solid_native, hbands, grid, quads, vbands, pitch, pitch_wide, hbp, pitch_low) ?
+					    tcon_solid_native, hbands, grid, quads, vbands, pitch, pitch_wide, hbp, pitch_low, edge) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
@@ -9129,7 +9188,8 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "                                      fb-pitch: sweep the assumed line pitch 1280..1300\n"
 	   "                                      fb-pitch-wide: sweep 1360..1920 (HTOTAL and alignment roundings)\n"
 	   "                                      tcon-hbp: sweep the horizontal back porch to chase the edge band\n"
-	   "                                      fb-pitch-low: sweep 1180..1200; the band vanishing marks the answer\n"
+	   "                                      fb-pitch-low: sweep 1180..1200 with eight bands\n"
+	   "                                      fb-edge: same sweep, ONE red/blue edge -- slope gives the pitch\n"
 	   "h713_disp auto <project-id> [nowait] - load from eMMC and run\n"
 	   "h713_disp load <project-id>         - load from eMMC only\n"
 	   "h713_disp <blob-addr> <project-id> [nowait] - run against a staged blob\n"
