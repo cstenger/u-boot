@@ -8094,9 +8094,31 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		       "firmware PHY/routing state retained\n");
 
 	if ((full || quiesce) && !preserve_mips_timing && !tcon_checker_style) {
+		/*
+		 * The replay is still needed here: it re-asserts DE block 5,
+		 * which is what configures the OSD/AFBD path the framebuffer
+		 * modes depend on. But it also clears three words the firmware
+		 * set -- 0x051c0014[2:0], 0x051c0028[28:16] and 0x05140054[7] --
+		 * so capture them first and put them back afterwards. The
+		 * generator modes sidestep this by skipping the replay entirely;
+		 * the framebuffer modes cannot.
+		 */
+		u32 phy14 = readl(0x051c0014);
+		u32 phy28 = readl(0x051c0028);
+		u32 route54 = readl(0x05140054);
+
 		ret = h713_disp_reassert_osd(H713_DISP_LOGO_ADDR, project);
 		if (ret)
 			return ret;
+
+		writel(phy14, 0x051c0014);
+		writel(phy28, 0x051c0028);
+		writel(route54, 0x05140054);
+		dmb();
+		printf("H713 panel: firmware PHY/routing restored after the DE "
+		       "replay: %08x %08x %08x\n",
+		       readl(0x051c0014), readl(0x051c0028),
+		       readl(0x05140054));
 		h713_disp_probe_contested("after DE replay");
 		printf("H713 panel: OSD state after %s re-assert\n",
 		       quiesce ? "post-quiesce" : "full-test");
