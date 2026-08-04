@@ -5516,6 +5516,63 @@ static void h713_disp_sample(void)
  * Stock U-Boot blits bootlogo.bmp into that buffer after applying the table;
  * our register-only replay must provide pixels explicitly.
  */
+/*
+ * Eight horizontal bands, 90 rows each, in eight distinct hues.
+ *
+ * The existing fill_pattern draws vertical bars, which probe horizontal
+ * addressing. With the link now correct -- the TCON generator renders a clean
+ * checkerboard -- the remaining fault is that a framebuffer image collapses
+ * vertically: the whole 1280x720 vendor logo arrives as two thin lines of
+ * glyph-like structure on a field that should be black.
+ *
+ * Horizontal bands discriminate the causes, which vertical bars cannot:
+ *
+ *   all eight bands, in order, full height  -> vertical addressing is fine and
+ *                                              the logo fault is elsewhere
+ *   bands squeezed into a thin strip        -> vertical scale is wrong by a
+ *                                              large factor
+ *   one or two hues filling the frame       -> only a few source rows are read
+ *                                              and repeated
+ *   bands out of order or interleaved       -> stride or tiling mismatch, which
+ *                                              is what feeding linear ARGB to a
+ *                                              decoder expecting a tiled or
+ *                                              compressed layout would look like
+ *
+ * Hues rather than greys, because the optical path answers chroma far more
+ * reliably than luminance.
+ */
+static void h713_disp_fill_hbands(void)
+{
+	static const u32 hues[] = {
+		0xffff0000,	/* red     */
+		0xffff8000,	/* orange  */
+		0xffffff00,	/* yellow  */
+		0xff00ff00,	/* green   */
+		0xff00ffff,	/* cyan    */
+		0xff0000ff,	/* blue    */
+		0xff8000ff,	/* purple  */
+		0xffff00ff,	/* magenta */
+	};
+	u32 *fb = (u32 *)H713_DISP_OSD_FB_ADDR;
+	uint band_h = H713_DISP_OSD_HEIGHT / ARRAY_SIZE(hues);
+	uint x, y;
+
+	for (y = 0; y < H713_DISP_OSD_HEIGHT; y++) {
+		uint band = y / band_h;
+		u32 colour = hues[band < ARRAY_SIZE(hues) ?
+				  band : ARRAY_SIZE(hues) - 1];
+
+		for (x = 0; x < H713_DISP_OSD_WIDTH; x++)
+			*fb++ = colour;
+	}
+
+	flush_cache(H713_DISP_OSD_FB_ADDR, H713_DISP_OSD_SIZE);
+	printf("H713 panel: %u horizontal bands of %u rows published at "
+	       "0x%08lx (red orange yellow green cyan blue purple magenta, "
+	       "top to bottom)\n", (uint)ARRAY_SIZE(hues), band_h,
+	       H713_DISP_OSD_FB_ADDR);
+}
+
 static void h713_disp_fill_pattern(uint phase)
 {
 	static const u32 colours[] = {
@@ -8009,7 +8066,7 @@ static int h713_disp_init_only(u32 project, bool release_mips, bool quiesce)
 static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 				bool quiesce, bool vendor_logo, bool plane_gate,
 				uint tcon_checker_style,
-				bool preserve_mips_timing)
+				bool preserve_mips_timing, bool hbands)
 {
 	int ret;
 
@@ -8125,7 +8182,15 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		h713_disp_dump(false);
 	}
 
-	if (vendor_logo) {
+	if (hbands) {
+		h713_disp_fill_hbands();
+		printf("H713 panel: HORIZONTAL BAND PROBE at panel 720p timing; "
+		       "one frame, holding %u ms\n",
+		       H713_DISP_STATIC_FRAME_DWELL_MS);
+		h713_disp_commit_osd_frame();
+		printf("H713 panel: BANDS COMMITTED; photograph now\n");
+		mdelay(H713_DISP_STATIC_FRAME_DWELL_MS);
+	} else if (vendor_logo) {
 		/* No gate probes or animation: reproduce one stock logo frame. */
 		ret = h713_disp_publish_vendor_bootlogo(false);
 		if (ret)
@@ -8407,12 +8472,13 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 				   !strcmp(argv[3], "tcon-nsweep");
 		bool tcon_nsweep_hi = argc == 4 &&
 				      !strcmp(argv[3], "tcon-nsweep-hi");
+		bool hbands = argc == 4 && !strcmp(argv[3], "fb-vprobe");
 
 		if (argc == 4 && !noboot && !full && !quiesce && !vendor_logo &&
 		    !plane_gate && !tcon_checker && !tcon_checker_mono &&
 		    !tcon_solid && !tcon_solid_native && !tcon_dclk &&
 		    !tcon_solid_dclk_normal && !tcon_chroma && !tcon_chroma_62m &&
-		    !tcon_nsweep && !tcon_nsweep_hi)
+		    !tcon_nsweep && !tcon_nsweep_hi && !hbands)
 			return CMD_RET_USAGE;
 		return h713_disp_panel_test(hextoul(argv[2], NULL), !noboot,
 					    full,
@@ -8421,7 +8487,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    tcon_solid || tcon_solid_native ||
 					    tcon_dclk || tcon_solid_dclk_normal ||
 					    tcon_chroma || tcon_chroma_62m ||
-					    tcon_nsweep || tcon_nsweep_hi,
+					    tcon_nsweep || tcon_nsweep_hi || hbands,
 					    vendor_logo, plane_gate,
 					    tcon_nsweep_hi ? 15 :
 					    tcon_nsweep ? 14 :
@@ -8432,7 +8498,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    (tcon_solid || tcon_solid_native) ? 9 :
 					    tcon_checker_mono ? 1 :
 					    tcon_checker ? 8 : 0,
-					    tcon_solid_native) ?
+					    tcon_solid_native, hbands) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
@@ -8546,6 +8612,7 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "                                      tcon-chroma-62m: same, with DCLK retuned 73.7 -> 61.7 MHz\n"
 	   "                                      tcon-nsweep: step the display PLL, checker at each step\n"
 	   "                                      tcon-nsweep-hi: same, N+1 50..60 (extends past the best so far)\n"
+	   "                                      fb-vprobe: 8 horizontal colour bands through the framebuffer path\n"
 	   "h713_disp auto <project-id> [nowait] - load from eMMC and run\n"
 	   "h713_disp load <project-id>         - load from eMMC only\n"
 	   "h713_disp <blob-addr> <project-id> [nowait] - run against a staged blob\n"
