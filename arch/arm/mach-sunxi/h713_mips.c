@@ -4796,6 +4796,99 @@ static int h713_disp_pll_video2_set_n(uint n_plus_1)
 }
 
 /*
+ * Identify which register actually controls the pixel clock, by perturbing one
+ * candidate field at a time and watching the free-running counter.
+ *
+ * Retuning the CCU's PLL_VIDEO2 proved that it does not: the N field write read
+ * back correctly as 0xb9002300 and the counter did not move by a single kHz.
+ * The display block carries its own PLL -- 0x058c0014 reads 0xb8002a00, the
+ * same 0x2a in bits 15:8 and near-identical control bits to PLL_VIDEO2's
+ * 0xb9002a00 -- and the panel config patches write both 0x058c0014 and
+ * 0x058c0024 with panel-derived values. That is the likely clock path.
+ *
+ * Rather than guess field meanings one build at a time, perturb each candidate,
+ * measure, and restore. Whichever moves the counter is in the chain. Each field
+ * is restored before the next is tried and the counter is re-measured
+ * afterwards, so a candidate that fails to restore is reported rather than
+ * silently poisoning the rest of the sweep.
+ *
+ * Run with the MIPS quiesced and the raster still clocked. Power-cycle after,
+ * as with every other mode here.
+ */
+struct h713_clk_candidate {
+	ulong reg;
+	u8 shift;
+	u8 width;
+	u32 alt;
+	const char *what;
+};
+
+static const struct h713_clk_candidate h713_clk_candidates[] = {
+	{ 0x058c0014,  8, 8, 0x23, "disp-PLL N   0x058c0014[15:8]" },
+	{ 0x058c0024,  0, 3, 0x03, "divider?     0x058c0024[2:0]" },
+	{ 0x058c0024, 24, 6, 0x17, "divider?     0x058c0024[29:24]" },
+	{ 0x058c0020,  0, 8, 0x3f, "unknown      0x058c0020[7:0]" },
+	{ 0x058c0018,  0, 8, 0x0f, "unknown      0x058c0018[7:0]" },
+	{ 0x058c002c,  0, 8, 0x08, "unknown      0x058c002c[7:0]" },
+	{ 0x058c0028,  0, 8, 0x01, "unknown      0x058c0028[7:0]" },
+};
+
+static int h713_disp_clk_find(void)
+{
+	ulong base_khz = h713_disp_counter_khz(100000);
+	uint i;
+
+	printf("H713 clkfind: baseline counter %lu kHz\n", base_khz);
+	if (!base_khz) {
+		printf("H713 clkfind: counter is not running; nothing to measure\n");
+		return -EIO;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(h713_clk_candidates); i++) {
+		const struct h713_clk_candidate *c = &h713_clk_candidates[i];
+		u32 mask = (u32)(((1ULL << c->width) - 1) << c->shift);
+		u32 saved = readl(c->reg);
+		u32 val = (saved & ~mask) | ((c->alt << c->shift) & mask);
+		ulong khz, back;
+		long delta;
+
+		if (val == saved) {
+			printf("  %-32s already holds the alternate value\n",
+			       c->what);
+			continue;
+		}
+
+		writel(val, c->reg);
+		dmb();
+		mdelay(50);
+		khz = h713_disp_counter_khz(100000);
+
+		writel(saved, c->reg);
+		dmb();
+		mdelay(50);
+		back = h713_disp_counter_khz(100000);
+
+		delta = ((long)khz - (long)base_khz) * 100 / (long)base_khz;
+		printf("  %-32s %08x->%08x  counter %5lu -> %5lu kHz (%+ld%%)%s\n",
+		       c->what, saved, val, base_khz, khz, delta,
+		       (delta > 2 || delta < -2) ? "   <== IN THE CLOCK PATH" :
+		       (!khz ? "   <== stopped the counter" : ""));
+
+		if (back > base_khz + base_khz / 50 ||
+		    back < base_khz - base_khz / 50) {
+			printf("H713 clkfind: counter did not return to baseline "
+			       "(%lu kHz); stopping so later results are not "
+			       "read against a changed state\n", back);
+			return -EIO;
+		}
+	}
+
+	printf("H713 clkfind: sweep complete, counter back at %lu kHz\n",
+	       h713_disp_counter_khz(100000));
+	return 0;
+}
+
+/*
  * Find the registers that actually move, and what they count.
  *
  * 0x05880000 was long described as the raster position within the programmed
@@ -8021,6 +8114,10 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		return h713_disp_comm_state() ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 
+	if (argc == 2 && !strcmp(argv[1], "clkfind"))
+		return h713_disp_clk_find() ?
+		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
+
 	if (argc == 2 && !strcmp(argv[1], "scanrate"))
 		return h713_disp_scan_rate() ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
@@ -8182,6 +8279,7 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "h713_disp commtrace                 - read the CPU_COMM trace stage\n"
 	   "h713_disp scanrate                  - measure line/frame rate and real DCLK\n"
 	   "h713_disp regscan [base] [words]    - find which registers move, and what they count\n"
+	   "h713_disp clkfind                   - find which register drives the pixel clock\n"
 	   "h713_disp commdev                   - read the firmware channel table\n"
 	   "h713_disp fwmd <mips-va> [words]    - dump firmware memory (cache-safe)\n"
 	   "h713_disp commcall <id> [chan=<hex>] [pid=<hex>] [args..]\n"
