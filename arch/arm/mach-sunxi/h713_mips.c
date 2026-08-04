@@ -5517,6 +5517,79 @@ static void h713_disp_sample(void)
  * our register-only replay must provide pixels explicitly.
  */
 /*
+ * A framebuffer pattern that cannot hide an addressing error on either axis.
+ *
+ * fb-vprobe's eight horizontal bands were claimed to prove the framebuffer path.
+ * They do not. Every row of a band is uniform across the full width, so a
+ * horizontal stride error leaves the bands looking perfectly correct -- the same
+ * structural blindness as scoring a checkerboard with a column-only metric, or
+ * judging a logo by a row-luminance profile. Three instruments in this
+ * investigation have now reported on an axis they could not see.
+ *
+ * The vendor logo shows what the bands missed: a 545x36 text block centred at
+ * (368,343), verified byte-exact in the framebuffer by fbcheck, projects as a
+ * streak spanning nearly the full width and only a few rows tall.
+ *
+ * This pattern is sensitive to everything the bands were not:
+ *
+ *   2 px white border      any scale or crop error moves or loses an edge
+ *   both diagonals         a stride error changes their slope; they are the
+ *                          single most sensitive feature to row pitch
+ *   centre crosshair       shows translation
+ *   corner squares         red TL, green TR, blue BL, yellow BR -- names any
+ *                          flip, rotation or mirror unambiguously
+ *   1 px grid every 128    a repeating reference for measuring scale directly
+ *
+ * Diagonals matter most. If the hardware reads with a row pitch different from
+ * the 5120 bytes written, a corner-to-corner diagonal comes back at a visibly
+ * different angle, and the angle gives the true pitch.
+ */
+static void h713_disp_fill_grid(void)
+{
+	u32 *fb = (u32 *)H713_DISP_OSD_FB_ADDR;
+	const u32 W = H713_DISP_OSD_WIDTH, H = H713_DISP_OSD_HEIGHT;
+	u32 x, y;
+
+	for (y = 0; y < H; y++)
+		for (x = 0; x < W; x++)
+			fb[y * W + x] = 0xff000000;
+
+	for (y = 0; y < H; y++) {
+		for (x = 0; x < W; x++) {
+			u32 *p = &fb[y * W + x];
+
+			if (x < 2 || x >= W - 2 || y < 2 || y >= H - 2)
+				*p = 0xffffffff;			/* border    */
+			else if (!(x % 128) || !(y % 128))
+				*p = 0xff404040;			/* grid      */
+			if (x * H / W == y)
+				*p = 0xff00ffff;			/* diag TL-BR*/
+			if ((W - 1 - x) * H / W == y)
+				*p = 0xffff00ff;			/* diag TR-BL*/
+			if ((x >= W / 2 - 60 && x < W / 2 + 60 && y >= H / 2 - 1 &&
+			     y < H / 2 + 1) ||
+			    (y >= H / 2 - 60 && y < H / 2 + 60 && x >= W / 2 - 1 &&
+			     x < W / 2 + 1))
+				*p = 0xffffffff;			/* crosshair */
+			if (x < 80 && y < 80)
+				*p = 0xffff0000;			/* TL red    */
+			if (x >= W - 80 && y < 80)
+				*p = 0xff00ff00;			/* TR green  */
+			if (x < 80 && y >= H - 80)
+				*p = 0xff0000ff;			/* BL blue   */
+			if (x >= W - 80 && y >= H - 80)
+				*p = 0xffffff00;			/* BR yellow */
+		}
+	}
+
+	flush_cache(H713_DISP_OSD_FB_ADDR, H713_DISP_OSD_SIZE);
+	printf("H713 panel: geometry grid published at 0x%08lx -- 2px border, "
+	       "both diagonals, centre crosshair, 128px grid, corners "
+	       "red=TL green=TR blue=BL yellow=BR\n",
+	       H713_DISP_OSD_FB_ADDR);
+}
+
+/*
  * Read the framebuffer back and report where the non-black content actually
  * landed, so the BMP-to-framebuffer conversion can be checked without the
  * optical path in the way.
@@ -8152,7 +8225,8 @@ static int h713_disp_init_only(u32 project, bool release_mips, bool quiesce)
 static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 				bool quiesce, bool vendor_logo, bool plane_gate,
 				uint tcon_checker_style,
-				bool preserve_mips_timing, bool hbands)
+				bool preserve_mips_timing, bool hbands,
+				bool grid)
 {
 	int ret;
 
@@ -8268,7 +8342,14 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		h713_disp_dump(false);
 	}
 
-	if (hbands) {
+	if (grid) {
+		h713_disp_fill_grid();
+		printf("H713 panel: GEOMETRY GRID at panel 720p timing; one "
+		       "frame, holding %u ms\n", H713_DISP_STATIC_FRAME_DWELL_MS);
+		h713_disp_commit_osd_frame();
+		printf("H713 panel: GRID COMMITTED; photograph now\n");
+		mdelay(H713_DISP_STATIC_FRAME_DWELL_MS);
+	} else if (hbands) {
 		h713_disp_fill_hbands();
 		printf("H713 panel: HORIZONTAL BAND PROBE at panel 720p timing; "
 		       "one frame, holding %u ms\n",
@@ -8561,12 +8642,13 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		bool tcon_nsweep_hi = argc == 4 &&
 				      !strcmp(argv[3], "tcon-nsweep-hi");
 		bool hbands = argc == 4 && !strcmp(argv[3], "fb-vprobe");
+		bool grid = argc == 4 && !strcmp(argv[3], "fb-grid");
 
 		if (argc == 4 && !noboot && !full && !quiesce && !vendor_logo &&
 		    !plane_gate && !tcon_checker && !tcon_checker_mono &&
 		    !tcon_solid && !tcon_solid_native && !tcon_dclk &&
 		    !tcon_solid_dclk_normal && !tcon_chroma && !tcon_chroma_62m &&
-		    !tcon_nsweep && !tcon_nsweep_hi && !hbands)
+		    !tcon_nsweep && !tcon_nsweep_hi && !hbands && !grid)
 			return CMD_RET_USAGE;
 		return h713_disp_panel_test(hextoul(argv[2], NULL), !noboot,
 					    full,
@@ -8575,7 +8657,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    tcon_solid || tcon_solid_native ||
 					    tcon_dclk || tcon_solid_dclk_normal ||
 					    tcon_chroma || tcon_chroma_62m ||
-					    tcon_nsweep || tcon_nsweep_hi || hbands,
+					    tcon_nsweep || tcon_nsweep_hi || hbands || grid,
 					    vendor_logo, plane_gate,
 					    tcon_nsweep_hi ? 15 :
 					    tcon_nsweep ? 14 :
@@ -8586,7 +8668,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    (tcon_solid || tcon_solid_native) ? 9 :
 					    tcon_checker_mono ? 1 :
 					    tcon_checker ? 8 : 0,
-					    tcon_solid_native, hbands) ?
+					    tcon_solid_native, hbands, grid) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
@@ -8700,7 +8782,8 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "                                      tcon-chroma-62m: same, with DCLK retuned 73.7 -> 61.7 MHz\n"
 	   "                                      tcon-nsweep: step the display PLL, checker at each step\n"
 	   "                                      tcon-nsweep-hi: same, N+1 50..60 (extends past the best so far)\n"
-	   "                                      fb-vprobe: 8 horizontal colour bands through the framebuffer path\n"
+	   "                                      fb-vprobe: 8 horizontal colour bands (vertical order only)\n"
+	   "                                      fb-grid: border+diagonals+corners; detects stride, flip, scale\n"
 	   "h713_disp auto <project-id> [nowait] - load from eMMC and run\n"
 	   "h713_disp load <project-id>         - load from eMMC only\n"
 	   "h713_disp <blob-addr> <project-id> [nowait] - run against a staged blob\n"
