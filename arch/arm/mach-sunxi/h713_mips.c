@@ -6921,15 +6921,27 @@ static void h713_disp_hbp_sweep(void)
  * and judging whether eight fine bands are quite vertical, through blur and
  * keystone, is a poor way to decide anything.
  *
- * So: two halves, red then blue, repeating every P pixels in linear order. That
- * is a single boundary. At the correct pitch it stands vertical; at any other it
- * leans, and the lean is large and low-frequency -- nothing to alias, nothing
- * fine to resolve, readable at a glance.
+ * So: two halves, red then blue, repeating every P pixels in linear order.
  *
- * It also quantifies rather than just flagging. The edge shifts by
- * (P_hw - P_pattern) pixels per row, so its slope measured against the frame
- * gives the true fetch width directly, even from a step that is merely close.
- * Two steps that lean opposite ways bracket the answer between them.
+ * Row Y begins at word Y*P_hw, so its phase is (Y*D) mod P for D = P_hw - P.
+ * The boundary therefore slides D pixels per row -- and, crucially, it *wraps*.
+ * It crosses the full width once every P/|D| rows, so a 720-row frame shows
+ *
+ *	N = 720*|D| / P
+ *
+ * diagonal red/blue stripes, and inverting that gives the answer from any step:
+ *
+ *	|P_hw - P| = N * P / 720,  about 1.64 px per stripe at these pitches.
+ *
+ * That is the real scoring rule, and it is much stronger than "look for the
+ * vertical one": every step measures the pitch independently, and the six must
+ * agree. Expect a single edge only from a step within ~1.6 px of the truth --
+ * with 4 px steps at most one can be, and the rest will show 2, 3, 5, 8 stripes
+ * rather than the one boundary an earlier note here promised. Do not read a
+ * multi-stripe step as a failed step or as moire; it is the measurement.
+ *
+ * Fewest stripes is closest, and two steps leaning opposite ways bracket the
+ * answer between them.
  */
 static void h713_disp_fill_edge(u32 pitch)
 {
@@ -6957,10 +6969,12 @@ static void h713_disp_edge_sweep(const u16 *list, uint count)
 {
 	uint i;
 
-	printf("H713 edge: one red/blue boundary per step. The step whose edge "
-	       "stands vertical is the true fetch pitch; a leaning edge gives it "
-	       "from the slope. The pale band cannot change and is not a "
-	       "criterion.\n");
+	printf("H713 edge: COUNT THE DIAGONAL RED/BLUE STRIPES in each step. "
+	       "N stripes down the frame means the pitch is wrong by N*P/720 px "
+	       "-- so every step measures it, and the six must agree. Fewest "
+	       "stripes is closest; opposite leans bracket the answer. Several "
+	       "stripes is the measurement, not a failed step. The pale band "
+	       "cannot change and is not a criterion.\n");
 
 	for (i = 0; i < count; i++) {
 		u32 p = list[i];
@@ -6968,9 +6982,9 @@ static void h713_disp_edge_sweep(const u16 *list, uint count)
 		h713_disp_fill_edge(p);
 		h713_disp_chroma_marker(i + 1);
 		h713_disp_commit_osd_frame();
-		printf("H713 edge: step %u, assumed pitch %u px; vertical edge "
-		       "means correct, lean gives (true - %u) px per row\n",
-		       i + 1, p, p);
+		printf("H713 edge: step %u, assumed pitch %u px; each stripe = "
+		       "%u.%02u px of error, so |true - %u| = stripes * that\n",
+		       i + 1, p, p * 100 / 720 / 100, p * 100 / 720 % 100, p);
 		mdelay(H713_DISP_CHROMA_PHASE_MS);
 	}
 	printf("H713 edge: sweep complete\n");
