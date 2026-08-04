@@ -5517,6 +5517,55 @@ static void h713_disp_sample(void)
  * our register-only replay must provide pixels explicitly.
  */
 /*
+ * Find the display's true line pitch by matching the pattern to it.
+ *
+ * Every framebuffer probe is explained by one model: the hardware fetches
+ * P = 1280 + d pixels per display line where we write 1280, so each display row
+ * starts d pixels further into the buffer than the last.
+ *
+ *   fb-vprobe  horizontal bands  row Y shows source row ~Y(1+d/1280); for d~10
+ *                                a 0.8% compression, invisible -- looks correct
+ *   fb-hprobe  vertical bands    the row start walks, cycling the eight bands
+ *                                every 1280/d rows -> fine horizontal rainbow
+ *   fb-quad    quadrants         each row lands wholly in one quadrant colour ->
+ *                                solid full-width stripes, halves swapping
+ *   bootlogo   36-row text       sheared into a thin diagonal streak
+ *
+ * It also explains why fbcheck finds the framebuffer byte-exact. It is. The
+ * fault is entirely in how the display walks it.
+ *
+ * Counting rainbow cycles in the fb-hprobe capture gives d ~ 9.7 px, but blur
+ * merges stripes and undercounts, so that is worth +-4 px at best. Rather than
+ * guess a register from a soft number, sweep the pattern instead: fill the
+ * buffer so the eight bands repeat every P pixels in LINEAR index order, for a
+ * series of candidate P. When P equals the hardware's true pitch the bands stand
+ * up straight and stop sliding; every other value leaves them sloped or striped.
+ *
+ * The criterion is unambiguous and needs no register knowledge -- and once P is
+ * known, d = P - 1280 says exactly how much a stride or width field is out.
+ */
+static const u16 h713_pitch_sweep[] = { 1280, 1284, 1288, 1292, 1296, 1300 };
+
+static void h713_disp_fill_pitch(u32 pitch)
+{
+	static const u32 hues[] = {
+		0xffff0000, 0xffff8000, 0xffffff00, 0xff00ff00,
+		0xff00ffff, 0xff0000ff, 0xff8000ff, 0xffff00ff,
+	};
+	u32 *fb = (u32 *)H713_DISP_OSD_FB_ADDR;
+	u32 total = H713_DISP_OSD_WIDTH * H713_DISP_OSD_HEIGHT;
+	u32 band = pitch / ARRAY_SIZE(hues);
+	u32 i;
+
+	for (i = 0; i < total; i++) {
+		u32 b = (i % pitch) / band;
+
+		fb[i] = hues[b < ARRAY_SIZE(hues) ? b : ARRAY_SIZE(hues) - 1];
+	}
+	flush_cache(H713_DISP_OSD_FB_ADDR, H713_DISP_OSD_SIZE);
+}
+
+/*
  * Eight vertical bands. The exact complement of fb-vprobe.
  *
  * fb-vprobe varies only down the frame and renders correctly. fb-quad varies on
@@ -6740,6 +6789,28 @@ static void h713_disp_chroma_phase(const char *label, u32 ctrl, u32 size,
 	       readl(H713_DISP_LVDS_LANE_REG),
 	       readl(H713_DISP_LVDS_SCAN_REG));
 	mdelay(H713_DISP_CHROMA_PHASE_MS);
+}
+
+static void h713_disp_pitch_sweep(void)
+{
+	uint i;
+
+	printf("H713 pitch: sweeping the assumed line pitch; the step whose "
+	       "bands stand up straight is the hardware's true pitch\n");
+
+	for (i = 0; i < ARRAY_SIZE(h713_pitch_sweep); i++) {
+		u32 p = h713_pitch_sweep[i];
+
+		h713_disp_fill_pitch(p);
+		h713_disp_chroma_marker(i + 1);
+		h713_disp_commit_osd_frame();
+		printf("H713 pitch: step %u, assumed pitch %u px (d = %+d); "
+		       "vertical bands mean this is correct\n",
+		       i + 1, p, (int)p - H713_DISP_OSD_WIDTH);
+		mdelay(H713_DISP_CHROMA_PHASE_MS);
+	}
+
+	printf("H713 pitch: sweep complete\n");
 }
 
 /*
@@ -8338,7 +8409,8 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 				bool quiesce, bool vendor_logo, bool plane_gate,
 				uint tcon_checker_style,
 				bool preserve_mips_timing, bool hbands,
-				bool grid, bool quads, bool vbands)
+				bool grid, bool quads, bool vbands,
+				bool pitch)
 {
 	int ret;
 
@@ -8454,7 +8526,9 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		h713_disp_dump(false);
 	}
 
-	if (vbands) {
+	if (pitch) {
+		h713_disp_pitch_sweep();
+	} else if (vbands) {
 		h713_disp_fill_vbands();
 		printf("H713 panel: VERTICAL BAND PROBE at panel 720p timing; "
 		       "one frame, holding %u ms\n",
@@ -8772,12 +8846,13 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		bool grid = argc == 4 && !strcmp(argv[3], "fb-grid");
 		bool quads = argc == 4 && !strcmp(argv[3], "fb-quad");
 		bool vbands = argc == 4 && !strcmp(argv[3], "fb-hprobe");
+		bool pitch = argc == 4 && !strcmp(argv[3], "fb-pitch");
 
 		if (argc == 4 && !noboot && !full && !quiesce && !vendor_logo &&
 		    !plane_gate && !tcon_checker && !tcon_checker_mono &&
 		    !tcon_solid && !tcon_solid_native && !tcon_dclk &&
 		    !tcon_solid_dclk_normal && !tcon_chroma && !tcon_chroma_62m &&
-		    !tcon_nsweep && !tcon_nsweep_hi && !hbands && !grid && !quads && !vbands)
+		    !tcon_nsweep && !tcon_nsweep_hi && !hbands && !grid && !quads && !vbands && !pitch)
 			return CMD_RET_USAGE;
 		return h713_disp_panel_test(hextoul(argv[2], NULL), !noboot,
 					    full,
@@ -8786,7 +8861,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    tcon_solid || tcon_solid_native ||
 					    tcon_dclk || tcon_solid_dclk_normal ||
 					    tcon_chroma || tcon_chroma_62m ||
-					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads || vbands,
+					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads || vbands || pitch,
 					    vendor_logo, plane_gate,
 					    tcon_nsweep_hi ? 15 :
 					    tcon_nsweep ? 14 :
@@ -8797,7 +8872,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    (tcon_solid || tcon_solid_native) ? 9 :
 					    tcon_checker_mono ? 1 :
 					    tcon_checker ? 8 : 0,
-					    tcon_solid_native, hbands, grid, quads, vbands) ?
+					    tcon_solid_native, hbands, grid, quads, vbands, pitch) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
@@ -8915,6 +8990,7 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "                                      fb-grid: border+diagonals+corners (needs a sharp photo)\n"
 	   "                                      fb-quad: four solid quadrants; survives blur, counts the tiling\n"
 	   "                                      fb-hprobe: 8 vertical bands; isolates the horizontal axis\n"
+	   "                                      fb-pitch: sweep the assumed line pitch 1280..1300\n"
 	   "h713_disp auto <project-id> [nowait] - load from eMMC and run\n"
 	   "h713_disp load <project-id>         - load from eMMC only\n"
 	   "h713_disp <blob-addr> <project-id> [nowait] - run against a staged blob\n"
