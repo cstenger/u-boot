@@ -4571,10 +4571,21 @@ struct h713_panel_patch {
  *
  * guarded by (fieldmask << shift) being a subset of the record's own mask.
  *
- * Two sites are deliberately omitted. Stock's 0x05280084[31:16] and
- * 0x0528008c[15:0] both resolve to a literal zero in static analysis, which
- * may be a decode artefact rather than a real store; writing a zero we cannot
- * justify is worse than leaving the vendor default in place.
+ * Two sites were deliberately omitted, on the grounds that stock's literal
+ * zero at 0x05280084[31:16] and 0x0528008c[15:0] might be a decode artefact
+ * rather than a real store, and that an unjustifiable zero was worse than the
+ * vendor default.
+ *
+ * 0x0528008c[15:0] is now restored: that omission was the whole framebuffer
+ * fault. The vendor default is another panel's and it is 123, which is exactly
+ * the pale left band and, through the source advance, the shear. The static
+ * analysis was right and the caution was wrong; what it lacked was hardware,
+ * and test_32 and test_33 supply it.
+ *
+ * 0x05280084[31:16] is still omitted and is now *more* suspicious, not less.
+ * It currently holds 720 and stock appears to zero it. Do not change it on
+ * this reasoning alone -- it earned a two-sided perturbation of its own, the
+ * way 0x0528008c did.
  */
 static int h713_disp_panel_patch(ulong blob, const struct h713_disp_sel *sel)
 {
@@ -4626,6 +4637,26 @@ static int h713_disp_panel_patch(ulong blob, const struct h713_disp_sel *sel)
 		{ 0x0524c014,  8, 0xff,   c->vsync },
 		{ 0x05280084,  0, 0xffff, c->width },
 		{ 0x05280088,  0, 0xffff, c->vsync + c->vbp },
+		/*
+		 * The layer's pixel X origin, restored 2026-08-04. Stock writes
+		 * a literal zero here and this table omitted it, on the grounds
+		 * that an unjustifiable zero was worse than the vendor default.
+		 * The vendor default is another panel's, and it is 123 -- which
+		 * is precisely the pale band that sat at the left of every
+		 * framebuffer photograph in this bring-up, and, through the
+		 * source advance, the shear as well.
+		 *
+		 * The static analysis was right; the caution was wrong. What it
+		 * lacked was hardware: test_32 drove this register 1:1 (0 puts
+		 * content at column 0 across the full 1280, 400 puts it at 406,
+		 * four other candidates moved it by a pixel) and test_33 showed
+		 * the stride reads S = V once it is zero.
+		 *
+		 * Patching the record rather than writing the register after
+		 * the fact also survives h713_disp_reassert_osd, which replays
+		 * DE block 5 from this same blob.
+		 */
+		{ 0x0528008c,  0, 0xffff, 0 },
 	};
 	const struct h713_disp_block *ranges[] = {
 		&h713_disp_prologue[sel->prologue - 1],
@@ -5086,16 +5117,17 @@ static void h713_disp_probe_contested(const char *when)
 #define H713_DISP_LAYER_XOFF_REG	0x0528008cUL
 
 /*
- * Clear it on every path that brings the display up.
+ * A backstop, no longer the fix.
  *
- * This lived in panel-test alone for a day, which meant the diagnostic harness
- * rendered correctly while `auto` -- the one-command-from-power-on path, and
- * the closest thing to real startup -- still produced the 123 px band and the
- * shear. A fix that only the test path applies is not a fix.
+ * The real correction is the 0x0528008c record patch in
+ * h713_disp_panel_patch, which is what stock does and which therefore applies
+ * through the ordinary sequence, on every path, and survives the DE replay.
  *
- * Called twice in panel-test: once here at the end of the sequence, and again
- * after h713_disp_reassert_osd, because the DE replay re-asserts block 5 and
- * the post-replay dump still reads 0000007b.
+ * This stays because it costs nothing and it *reports*. If the patch lands,
+ * the register already reads 0 and these calls are silent. If they ever print,
+ * the record patch did not take -- most likely the record's own mask no longer
+ * admits [15:0] -- and that is worth knowing on the console rather than
+ * rediscovering from a photograph.
  */
 static void h713_disp_clear_layer_xoff(const char *when)
 {
@@ -5110,9 +5142,10 @@ static void h713_disp_clear_layer_xoff(const char *when)
 
 	writel(0, H713_DISP_LAYER_XOFF_REG);
 	dmb();
-	printf("H713 panel: layer X origin 0x%08lx %08x -> %08x %s, so content "
-	       "starts at column 0\n", H713_DISP_LAYER_XOFF_REG, was,
-	       readl(H713_DISP_LAYER_XOFF_REG), when);
+	printf("H713 panel: layer X origin 0x%08lx was %08x %s -- the record "
+	       "patch did not take; forced to %08x\n",
+	       H713_DISP_LAYER_XOFF_REG, was, when,
+	       readl(H713_DISP_LAYER_XOFF_REG));
 }
 
 static int h713_disp_run(ulong blob, u32 project, bool skip_hdcp_wait,
