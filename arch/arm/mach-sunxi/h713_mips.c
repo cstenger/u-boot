@@ -9177,24 +9177,32 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		printf("H713 panel: BANDS COMMITTED; photograph now\n");
 		mdelay(H713_DISP_STATIC_FRAME_DWELL_MS);
 	} else if (vendor_logo) {
-		/* No gate probes or animation: reproduce one stock logo frame. */
-		ret = h713_disp_publish_vendor_bootlogo(false, vendor_chroma);
+		/*
+		 * Two markers, bracketing the publish, so one run says where
+		 * the panel dies rather than only that it did.
+		 *
+		 *   1 then 2 blinks -> panel alive throughout; the fault is in
+		 *     the frame content or the commit
+		 *   1 blink only    -> publishing the logo kills it, and for
+		 *     vendor-logo-late that means the FAT read specifically,
+		 *     since that is all this variant moved
+		 *   neither         -> the panel never came up in this mode,
+		 *     and everything after init is beside the point
+		 *
+		 * The marker drives the TCON generator, which reaches the panel
+		 * without touching the framebuffer path at all.
+		 */
+		h713_disp_chroma_marker(1);
+		/*
+		 * vendor-logo-late skipped the pre-run load, so it has to load
+		 * here. Publishing with load=false hashed whatever DRAM was
+		 * left at 0x6d000000 and was correctly refused -- which killed
+		 * the bisection run before it reached either marker.
+		 */
+		ret = h713_disp_publish_vendor_bootlogo(vendor_late,
+						       vendor_chroma);
 		if (ret)
 			return ret;
-		/*
-		 * A positive control, and the thing this mode has always been
-		 * missing. Three runs came back "nothing on the panel" with a
-		 * framebuffer that fbcheck proves is correct, and none of them
-		 * could say whether the panel was lit at all -- every other
-		 * mode emits a marker before its frame and so answers that for
-		 * free. Two blinks off the TCON generator, which reaches the
-		 * panel without touching the framebuffer path:
-		 *
-		 *   blinks seen, logo absent -> panel and link are fine and the
-		 *     fault is specific to framebuffer scanout in this mode
-		 *   nothing seen at all      -> the panel is not lit in this
-		 *     mode, and the logo was never the question
-		 */
 		h713_disp_chroma_marker(2);
 		/* Bounds measured from the file: rows 343..378, cols 368..912. */
 		h713_disp_verify_fb(343, 378, 368, 912, vendor_chroma);
