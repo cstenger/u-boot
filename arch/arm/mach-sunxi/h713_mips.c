@@ -5546,6 +5546,27 @@ static void h713_disp_sample(void)
  */
 static const u16 h713_pitch_sweep[] = { 1280, 1284, 1288, 1292, 1296, 1300 };
 
+/*
+ * All six of the narrow sweep came back as solid per-row colour, which means the
+ * slide exceeds one band (160 px) at every one of them: the pitch is nowhere
+ * near 1280, and the d ~ 9.7 px read off the fb-hprobe capture was moire -- the
+ * same aliasing trap already flagged for fb-quad and then walked into anyway.
+ *
+ * The leading candidate is that the hardware walks HTOTAL rather than the active
+ * width. 0x05880020 reads 02f80550: 760 total lines by 1360 total columns
+ * against a 1280x720 active area. P = 1360 predicts a half-band slide per row,
+ * an eight-band cycle every 16 rows and ~45 cycles down the frame -- which is
+ * the fine rainbow observed -- while compressing fb-vprobe by only 1.0625, still
+ * reading as correct. It was not in the narrow list.
+ *
+ * This wider list brackets that and the usual alignment roundings. If 1360 is
+ * the one that stands up, the fix is to feed the framebuffer a 1360-pixel stride
+ * (5440 bytes) or to correct whichever field is handing HTOTAL to the fetch.
+ */
+static const u16 h713_pitch_sweep_wide[] = {
+	1360, 1366, 1408, 1440, 1536, 1920,
+};
+
 static void h713_disp_fill_pitch(u32 pitch)
 {
 	static const u32 hues[] = {
@@ -6791,15 +6812,15 @@ static void h713_disp_chroma_phase(const char *label, u32 ctrl, u32 size,
 	mdelay(H713_DISP_CHROMA_PHASE_MS);
 }
 
-static void h713_disp_pitch_sweep(void)
+static void h713_disp_pitch_sweep(const u16 *list, uint count)
 {
 	uint i;
 
 	printf("H713 pitch: sweeping the assumed line pitch; the step whose "
 	       "bands stand up straight is the hardware's true pitch\n");
 
-	for (i = 0; i < ARRAY_SIZE(h713_pitch_sweep); i++) {
-		u32 p = h713_pitch_sweep[i];
+	for (i = 0; i < count; i++) {
+		u32 p = list[i];
 
 		h713_disp_fill_pitch(p);
 		h713_disp_chroma_marker(i + 1);
@@ -8410,7 +8431,7 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 				uint tcon_checker_style,
 				bool preserve_mips_timing, bool hbands,
 				bool grid, bool quads, bool vbands,
-				bool pitch)
+				bool pitch, bool pitch_wide)
 {
 	int ret;
 
@@ -8526,8 +8547,12 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		h713_disp_dump(false);
 	}
 
-	if (pitch) {
-		h713_disp_pitch_sweep();
+	if (pitch_wide) {
+		h713_disp_pitch_sweep(h713_pitch_sweep_wide,
+				      ARRAY_SIZE(h713_pitch_sweep_wide));
+	} else if (pitch) {
+		h713_disp_pitch_sweep(h713_pitch_sweep,
+				      ARRAY_SIZE(h713_pitch_sweep));
 	} else if (vbands) {
 		h713_disp_fill_vbands();
 		printf("H713 panel: VERTICAL BAND PROBE at panel 720p timing; "
@@ -8847,12 +8872,14 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		bool quads = argc == 4 && !strcmp(argv[3], "fb-quad");
 		bool vbands = argc == 4 && !strcmp(argv[3], "fb-hprobe");
 		bool pitch = argc == 4 && !strcmp(argv[3], "fb-pitch");
+		bool pitch_wide = argc == 4 &&
+				  !strcmp(argv[3], "fb-pitch-wide");
 
 		if (argc == 4 && !noboot && !full && !quiesce && !vendor_logo &&
 		    !plane_gate && !tcon_checker && !tcon_checker_mono &&
 		    !tcon_solid && !tcon_solid_native && !tcon_dclk &&
 		    !tcon_solid_dclk_normal && !tcon_chroma && !tcon_chroma_62m &&
-		    !tcon_nsweep && !tcon_nsweep_hi && !hbands && !grid && !quads && !vbands && !pitch)
+		    !tcon_nsweep && !tcon_nsweep_hi && !hbands && !grid && !quads && !vbands && !pitch && !pitch_wide)
 			return CMD_RET_USAGE;
 		return h713_disp_panel_test(hextoul(argv[2], NULL), !noboot,
 					    full,
@@ -8861,7 +8888,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    tcon_solid || tcon_solid_native ||
 					    tcon_dclk || tcon_solid_dclk_normal ||
 					    tcon_chroma || tcon_chroma_62m ||
-					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads || vbands || pitch,
+					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads || vbands || pitch || pitch_wide,
 					    vendor_logo, plane_gate,
 					    tcon_nsweep_hi ? 15 :
 					    tcon_nsweep ? 14 :
@@ -8872,7 +8899,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    (tcon_solid || tcon_solid_native) ? 9 :
 					    tcon_checker_mono ? 1 :
 					    tcon_checker ? 8 : 0,
-					    tcon_solid_native, hbands, grid, quads, vbands, pitch) ?
+					    tcon_solid_native, hbands, grid, quads, vbands, pitch, pitch_wide) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
@@ -8991,6 +9018,7 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "                                      fb-quad: four solid quadrants; survives blur, counts the tiling\n"
 	   "                                      fb-hprobe: 8 vertical bands; isolates the horizontal axis\n"
 	   "                                      fb-pitch: sweep the assumed line pitch 1280..1300\n"
+	   "                                      fb-pitch-wide: sweep 1360..1920 (HTOTAL and alignment roundings)\n"
 	   "h713_disp auto <project-id> [nowait] - load from eMMC and run\n"
 	   "h713_disp load <project-id>         - load from eMMC only\n"
 	   "h713_disp <blob-addr> <project-id> [nowait] - run against a staged blob\n"
