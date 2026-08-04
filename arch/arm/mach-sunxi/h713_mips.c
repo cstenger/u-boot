@@ -5517,6 +5517,92 @@ static void h713_disp_sample(void)
  * our register-only replay must provide pixels explicitly.
  */
 /*
+ * Read the framebuffer back and report where the non-black content actually
+ * landed, so the BMP-to-framebuffer conversion can be checked without the
+ * optical path in the way.
+ *
+ * fb-vprobe proved the framebuffer path itself: eight synthetic bands render in
+ * the right order at full height. So if a converted image looks wrong, the fault
+ * is between the file and the framebuffer, not downstream of it. Photographs
+ * cannot settle that -- a projection shot at an angle is keystoned, and an
+ * axis-aligned measurement of a trapezoid produces margins that look like shear
+ * whether or not any exists.
+ *
+ * For bootlogo.bmp the expected answer is exact and known from the file:
+ * bright content confined to rows 343..378 and columns 368..912 of 1280x720,
+ * with equal margins. Any row outside that range holding content means the
+ * conversion is wrong -- a stride mismatch shears, a wrong row order flips, a
+ * wrong pixel stride stretches -- and the per-row extents say which.
+ */
+static void h713_disp_verify_fb(uint expect_y0, uint expect_y1,
+				uint expect_x0, uint expect_x1)
+{
+	const u32 *fb = (const u32 *)H713_DISP_OSD_FB_ADDR;
+	uint y, x, bad_rows = 0;
+	uint first_y = H713_DISP_OSD_HEIGHT, last_y = 0;
+	uint min_x = H713_DISP_OSD_WIDTH, max_x = 0;
+
+	printf("H713 fbcheck: scanning %ux%u at 0x%08lx; expecting content in "
+	       "rows %u..%u, columns %u..%u\n",
+	       H713_DISP_OSD_WIDTH, H713_DISP_OSD_HEIGHT,
+	       H713_DISP_OSD_FB_ADDR, expect_y0, expect_y1,
+	       expect_x0, expect_x1);
+
+	for (y = 0; y < H713_DISP_OSD_HEIGHT; y++) {
+		const u32 *row = fb + y * H713_DISP_OSD_WIDTH;
+		uint rx0 = H713_DISP_OSD_WIDTH, rx1 = 0, n = 0;
+
+		for (x = 0; x < H713_DISP_OSD_WIDTH; x++) {
+			u32 p = row[x];
+			uint r = (p >> 16) & 0xff, g = (p >> 8) & 0xff;
+			uint b = p & 0xff;
+
+			if (r > 60 || g > 60 || b > 60) {
+				if (x < rx0)
+					rx0 = x;
+				if (x > rx1)
+					rx1 = x;
+				n++;
+			}
+		}
+		if (!n)
+			continue;
+
+		if (y < first_y)
+			first_y = y;
+		last_y = y;
+		if (rx0 < min_x)
+			min_x = rx0;
+		if (rx1 > max_x)
+			max_x = rx1;
+
+		if (y < expect_y0 || y > expect_y1) {
+			if (bad_rows < 8)
+				printf("  row %3u OUTSIDE expected range: %u px, "
+				       "x %u..%u\n", y, n, rx0, rx1);
+			bad_rows++;
+		} else if ((y - expect_y0) % 8 == 0) {
+			printf("  row %3u  %4u px  x %u..%u\n", y, n, rx0, rx1);
+		}
+	}
+
+	printf("H713 fbcheck: content rows %u..%u (expected %u..%u), "
+	       "columns %u..%u (expected %u..%u)\n",
+	       first_y, last_y, expect_y0, expect_y1,
+	       min_x, max_x, expect_x0, expect_x1);
+	if (bad_rows)
+		printf("H713 fbcheck: %u row(s) outside the expected range -- the "
+		       "conversion is wrong, not the display\n", bad_rows);
+	else if (first_y == expect_y0 && last_y == expect_y1 &&
+		 min_x == expect_x0 && max_x == expect_x1)
+		printf("H713 fbcheck: EXACT match; the framebuffer holds the "
+		       "image the file describes\n");
+	else
+		printf("H713 fbcheck: within range but not exact; compare the "
+		       "bounds above against the file\n");
+}
+
+/*
  * Eight horizontal bands, 90 rows each, in eight distinct hues.
  *
  * The existing fill_pattern draws vertical bars, which probe horizontal
@@ -8195,6 +8281,8 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		ret = h713_disp_publish_vendor_bootlogo(false);
 		if (ret)
 			return ret;
+		/* Bounds measured from the file: rows 343..378, cols 368..912. */
+		h713_disp_verify_fb(343, 378, 368, 912);
 		printf("H713 panel: EXACT VENDOR LOGO TEST at panel 720p timing; "
 		       "one frame, holding %u ms\n",
 		       H713_DISP_STATIC_FRAME_DWELL_MS);
