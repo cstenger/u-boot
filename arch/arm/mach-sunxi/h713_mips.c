@@ -5874,7 +5874,7 @@ static void h713_disp_fill_grid(void)
  * wrong pixel stride stretches -- and the per-row extents say which.
  */
 static void h713_disp_verify_fb(uint expect_y0, uint expect_y1,
-				uint expect_x0, uint expect_x1)
+				uint expect_x0, uint expect_x1, bool red_only)
 {
 	const u32 *fb = (const u32 *)H713_DISP_OSD_FB_ADDR;
 	uint y, x, bad_rows = 0;
@@ -5896,7 +5896,8 @@ static void h713_disp_verify_fb(uint expect_y0, uint expect_y1,
 			uint r = (p >> 16) & 0xff, g = (p >> 8) & 0xff;
 			uint b = p & 0xff;
 
-			if (r > 60 || g > 60 || b > 60) {
+			if (red_only ? (r > 60 && b <= 60) :
+				       (r > 60 || g > 60 || b > 60)) {
 				if (x < rx0)
 					rx0 = x;
 				if (x > rx1)
@@ -6041,7 +6042,7 @@ static void h713_disp_fill_pattern(uint phase)
  * BMPs are bottom-up. Keeping that conversion literal makes this a control
  * for both the test-pattern contents and the presumed framebuffer byte order.
  */
-static int h713_disp_publish_vendor_bootlogo(bool load)
+static int h713_disp_publish_vendor_bootlogo(bool load, bool chroma)
 {
 	struct bmp_header *hdr = (struct bmp_header *)H713_DISP_VENDOR_BMP_ADDR;
 	u8 digest[SHA256_SUM_LEN];
@@ -6129,8 +6130,9 @@ static int h713_disp_publish_vendor_bootlogo(bool load)
 
 	flush_cache(H713_DISP_OSD_FB_ADDR, H713_DISP_OSD_SIZE);
 	printf("H713 panel: exact Board-B vendor bootlogo published at "
-	       "0x%08lx (stock 24-bit BMP -> 0xffRRGGBB)\n",
-	       H713_DISP_OSD_FB_ADDR);
+	       "0x%08lx (stock 24-bit BMP -> %s)\n",
+	       H713_DISP_OSD_FB_ADDR,
+	       chroma ? "red where lit, blue where not" : "0xffRRGGBB");
 	return 0;
 }
 
@@ -8896,7 +8898,8 @@ static int h713_disp_init_only(u32 project, bool release_mips, bool quiesce)
 }
 
 static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
-				bool quiesce, bool vendor_logo, bool plane_gate,
+				bool quiesce, bool vendor_logo, bool vendor_chroma,
+				bool plane_gate,
 				uint tcon_checker_style,
 				bool preserve_mips_timing, bool hbands,
 				bool grid, bool quads, bool vbands,
@@ -8913,7 +8916,7 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 
 	/* Seed before AFBD is enabled, then republish after MIPS readiness. */
 	if (vendor_logo) {
-		ret = h713_disp_publish_vendor_bootlogo(true);
+		ret = h713_disp_publish_vendor_bootlogo(true, vendor_chroma);
 		if (ret)
 			return ret;
 	} else {
@@ -9111,11 +9114,11 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		mdelay(H713_DISP_STATIC_FRAME_DWELL_MS);
 	} else if (vendor_logo) {
 		/* No gate probes or animation: reproduce one stock logo frame. */
-		ret = h713_disp_publish_vendor_bootlogo(false);
+		ret = h713_disp_publish_vendor_bootlogo(false, vendor_chroma);
 		if (ret)
 			return ret;
 		/* Bounds measured from the file: rows 343..378, cols 368..912. */
-		h713_disp_verify_fb(343, 378, 368, 912);
+		h713_disp_verify_fb(343, 378, 368, 912, vendor_chroma);
 		printf("H713 panel: EXACT VENDOR LOGO TEST at panel 720p timing; "
 		       "one frame, holding %u ms\n",
 		       H713_DISP_STATIC_FRAME_DWELL_MS);
@@ -9385,7 +9388,9 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		bool noboot = !strcmp(mode, "noboot");
 		bool full   = !strcmp(mode, "full");
 		bool quiesce = !strcmp(mode, "quiesce");
-		bool vendor_logo = !strcmp(mode, "vendor-logo");
+		bool vendor_chroma = !strcmp(mode, "vendor-logo-chroma");
+		bool vendor_logo = !strcmp(mode, "vendor-logo") ||
+				   vendor_chroma;
 		bool plane_gate = !strcmp(mode, "plane-gate");
 		bool tcon_checker = !strcmp(mode, "tcon-checker");
 		bool tcon_checker_mono = !strcmp(mode, "tcon-checker-mono");
@@ -9425,7 +9430,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    tcon_dclk || tcon_solid_dclk_normal ||
 					    tcon_chroma || tcon_chroma_62m ||
 					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads || vbands || pitch || pitch_wide || hbp || pitch_low || edge || edge_fine || stride || stride_fix || band,
-					    vendor_logo, plane_gate,
+					    vendor_logo, vendor_chroma, plane_gate,
 					    hbp ? 16 :
 					    tcon_nsweep_hi ? 15 :
 					    tcon_nsweep ? 14 :
@@ -9564,6 +9569,7 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "                                      fb-stride: pattern fixed, sweep AFBD 0x05600170 -- LIVE, unit slope, S = V - 42\n"
 	   "                                      fb-fix: pattern at the natural 1280, sweep for the register that unshears it\n"
 	   "                                      fb-band: solid fill, screen offset registers for the ~110px left band\n"
+	   "                                      vendor-logo-chroma: the stock logo, lit->red unlit->blue (it is pure grey, which this path cannot show)\n"
 	   "       h713_disp panel-test <id> <mode> <stride>  - same, with AFBD 0x05600170 forced to <stride> bytes (hex)\n"
 	   "h713_disp auto <project-id> [nowait] - load from eMMC and run\n"
 	   "h713_disp load <project-id>         - load from eMMC only\n"
