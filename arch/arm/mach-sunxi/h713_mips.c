@@ -168,6 +168,7 @@ static const u8 h713_vendor_bootlogo_sha256[SHA256_SUM_LEN] = {
 };
 
 static bool h713_display_prepared;
+static bool h713_panel_test_ran;
 static bool h713_comm_trace_active;
 
 /* Previous value of every trace slot, so streaming reports only changes. */
@@ -8929,6 +8930,29 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 				u32 stride_override)
 {
 	int ret;
+
+	/*
+	 * Refuse a second run per power-on, rather than producing a dark panel
+	 * and a console that looks perfect.
+	 *
+	 * Every mode ends holding the MIPS in reset, so a second run
+	 * initialises from a torn-down state: the whole sequence re-reports
+	 * success, the register dumps come back byte-identical, and nothing
+	 * reaches the panel. That has now cost this bring-up at least four
+	 * results -- two recorded in the handoff, and the vendor-logo runs that
+	 * chased a framebuffer fault while fbcheck was proving the framebuffer
+	 * correct. It is undetectable from the log, which is exactly why it
+	 * belongs in the tool and not in a note.
+	 */
+	if (h713_panel_test_ran) {
+		printf("H713 panel: REFUSING -- a display test has already run "
+		       "since power-on. Each one ends with the MIPS held in "
+		       "reset, so this run would initialise into a torn-down "
+		       "state: identical console, identical registers, dark "
+		       "panel. POWER-CYCLE THE BOARD and run it again.\n");
+		return -EPERM;
+	}
+	h713_panel_test_ran = true;
 
 	ret = h713_disp_load(project);
 	if (ret)
