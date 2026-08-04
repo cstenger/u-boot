@@ -5930,7 +5930,13 @@ static void h713_disp_verify_fb(uint expect_y0, uint expect_y1,
 	       "columns %u..%u (expected %u..%u)\n",
 	       first_y, last_y, expect_y0, expect_y1,
 	       min_x, max_x, expect_x0, expect_x1);
-	if (bad_rows)
+	if (first_y > last_y)
+		printf("H713 fbcheck: NO MATCHING PIXEL ANYWHERE. The bounds "
+		       "above are the untouched initial values, not a "
+		       "measurement. Whatever the framebuffer holds, it is not "
+		       "what this check was told to look for -- fix that before "
+		       "reading anything into the panel.\n");
+	else if (bad_rows)
 		printf("H713 fbcheck: %u row(s) outside the expected range -- the "
 		       "conversion is wrong, not the display\n", bad_rows);
 	else if (first_y == expect_y0 && last_y == expect_y1 &&
@@ -6124,7 +6130,21 @@ static int h713_disp_publish_vendor_bootlogo(bool load, bool chroma)
 		for (x = 0; x < H713_DISP_OSD_WIDTH; x++) {
 			u8 *p = src + x * 3;
 
-			*fb++ = 0xff000000 | (p[2] << 16) | (p[1] << 8) | p[0];
+			/*
+			 * The stock logo is 99% black and its lit pixels are
+			 * pure grey -- chroma |R-B| is exactly 0 across the
+			 * whole file. This optical path normalises luminance
+			 * away, so as shipped it photographs as an unlit panel
+			 * whether the framebuffer path works or not. Keep the
+			 * geometry, replace the palette: lit -> red, unlit ->
+			 * blue. Then a shear or an offset is visible.
+			 */
+			if (chroma)
+				*fb++ = (p[0] + p[1] + p[2] > 96) ?
+					0xffff0000 : 0xff0000ff;
+			else
+				*fb++ = 0xff000000 | (p[2] << 16) |
+					(p[1] << 8) | p[0];
 		}
 	}
 
