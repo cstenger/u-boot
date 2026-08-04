@@ -4823,68 +4823,101 @@ struct h713_clk_candidate {
 	const char *what;
 };
 
+/*
+ * SAFETY, learned the hard way: the first version of this swept all candidates
+ * in one go with large perturbations -- N 43 -> 36, dividers halved -- and hung
+ * the board. Stopping or wildly moving a clock that feeds the display fabric can
+ * wedge the bus on the next MMIO read, and nothing after that point runs.
+ *
+ * So: one candidate per invocation, chosen by index; the smallest useful
+ * perturbation rather than a large one; and the candidate is printed before the
+ * write, so if the board does hang, the serial log names exactly which field did
+ * it. Nothing here persists across a power cycle, so a hang costs a reboot.
+ */
 static const struct h713_clk_candidate h713_clk_candidates[] = {
-	{ 0x058c0014,  8, 8, 0x23, "disp-PLL N   0x058c0014[15:8]" },
-	{ 0x058c0024,  0, 3, 0x03, "divider?     0x058c0024[2:0]" },
-	{ 0x058c0024, 24, 6, 0x17, "divider?     0x058c0024[29:24]" },
-	{ 0x058c0020,  0, 8, 0x3f, "unknown      0x058c0020[7:0]" },
-	{ 0x058c0018,  0, 8, 0x0f, "unknown      0x058c0018[7:0]" },
-	{ 0x058c002c,  0, 8, 0x08, "unknown      0x058c002c[7:0]" },
-	{ 0x058c0028,  0, 8, 0x01, "unknown      0x058c0028[7:0]" },
+	{ 0x058c0014,  8, 8, 0x29, "disp-PLL N   0x058c0014[15:8]  0x2a->0x29" },
+	{ 0x058c0024,  0, 3, 0x06, "divider?     0x058c0024[2:0]   7->6" },
+	{ 0x058c0024, 24, 6, 0x2e, "divider?     0x058c0024[29:24] 0x2f->0x2e" },
+	{ 0x058c0020,  0, 8, 0x7e, "unknown      0x058c0020[7:0]   0x7f->0x7e" },
+	{ 0x058c0018,  0, 8, 0x1d, "unknown      0x058c0018[7:0]   0x1e->0x1d" },
+	{ 0x058c002c,  0, 8, 0x11, "unknown      0x058c002c[7:0]   0x10->0x11" },
+	{ 0x058c0028,  0, 8, 0x01, "unknown      0x058c0028[7:0]   0x00->0x01" },
 };
 
-static int h713_disp_clk_find(void)
+static int h713_disp_clk_find(int which)
 {
-	ulong base_khz = h713_disp_counter_khz(100000);
+	ulong base_khz;
+	const struct h713_clk_candidate *c;
+	u32 mask, saved, val;
+	ulong khz, back;
+	long delta;
 	uint i;
 
+	if (which < 0) {
+		printf("H713 clkfind: candidates (run one at a time with an index)\n");
+		for (i = 0; i < ARRAY_SIZE(h713_clk_candidates); i++)
+			printf("  %u  %-42s currently %08x\n", i,
+			       h713_clk_candidates[i].what,
+			       readl(h713_clk_candidates[i].reg));
+		printf("H713 clkfind: each write is minimal and restored; a hang "
+		       "costs a power cycle, not the board\n");
+		return 0;
+	}
+
+	if (which >= (int)ARRAY_SIZE(h713_clk_candidates)) {
+		printf("H713 clkfind: index %d out of range (0..%u)\n", which,
+		       (uint)ARRAY_SIZE(h713_clk_candidates) - 1);
+		return -EINVAL;
+	}
+
+	base_khz = h713_disp_counter_khz(100000);
 	printf("H713 clkfind: baseline counter %lu kHz\n", base_khz);
 	if (!base_khz) {
 		printf("H713 clkfind: counter is not running; nothing to measure\n");
 		return -EIO;
 	}
 
-	for (i = 0; i < ARRAY_SIZE(h713_clk_candidates); i++) {
-		const struct h713_clk_candidate *c = &h713_clk_candidates[i];
-		u32 mask = (u32)(((1ULL << c->width) - 1) << c->shift);
-		u32 saved = readl(c->reg);
-		u32 val = (saved & ~mask) | ((c->alt << c->shift) & mask);
-		ulong khz, back;
-		long delta;
+	c = &h713_clk_candidates[which];
+	mask = (u32)(((1ULL << c->width) - 1) << c->shift);
+	saved = readl(c->reg);
+	val = (saved & ~mask) | ((c->alt << c->shift) & mask);
 
-		if (val == saved) {
-			printf("  %-32s already holds the alternate value\n",
-			       c->what);
-			continue;
-		}
-
-		writel(val, c->reg);
-		dmb();
-		mdelay(50);
-		khz = h713_disp_counter_khz(100000);
-
-		writel(saved, c->reg);
-		dmb();
-		mdelay(50);
-		back = h713_disp_counter_khz(100000);
-
-		delta = ((long)khz - (long)base_khz) * 100 / (long)base_khz;
-		printf("  %-32s %08x->%08x  counter %5lu -> %5lu kHz (%+ld%%)%s\n",
-		       c->what, saved, val, base_khz, khz, delta,
-		       (delta > 2 || delta < -2) ? "   <== IN THE CLOCK PATH" :
-		       (!khz ? "   <== stopped the counter" : ""));
-
-		if (back > base_khz + base_khz / 50 ||
-		    back < base_khz - base_khz / 50) {
-			printf("H713 clkfind: counter did not return to baseline "
-			       "(%lu kHz); stopping so later results are not "
-			       "read against a changed state\n", back);
-			return -EIO;
-		}
+	if (val == saved) {
+		printf("H713 clkfind: %s already holds the alternate value\n",
+		       c->what);
+		return 0;
 	}
 
-	printf("H713 clkfind: sweep complete, counter back at %lu kHz\n",
-	       h713_disp_counter_khz(100000));
+	/* Announce before writing: if this hangs, the log names the culprit. */
+	printf("H713 clkfind: perturbing %s, %08x -> %08x ...\n",
+	       c->what, saved, val);
+
+	writel(val, c->reg);
+	dmb();
+	mdelay(50);
+	khz = h713_disp_counter_khz(100000);
+
+	writel(saved, c->reg);
+	dmb();
+	mdelay(50);
+	back = h713_disp_counter_khz(100000);
+
+	delta = ((long)khz - (long)base_khz) * 1000 / (long)base_khz;
+	printf("H713 clkfind: counter %lu -> %lu kHz (%+ld.%ld%%), restored to %lu\n",
+	       base_khz, khz, delta / 10, (delta < 0 ? -delta : delta) % 10, back);
+
+	if (!khz)
+		printf("H713 clkfind: the perturbation STOPPED the counter -- "
+		       "this field gates or sources the clock\n");
+	else if (delta > 10 || delta < -10)
+		printf("H713 clkfind: IN THE CLOCK PATH\n");
+	else
+		printf("H713 clkfind: no effect on the pixel clock\n");
+
+	if (back > base_khz + base_khz / 50 || back < base_khz - base_khz / 50)
+		printf("H713 clkfind: WARNING: counter did not return to "
+		       "baseline; power-cycle before trusting another run\n");
+
 	return 0;
 }
 
@@ -8114,9 +8147,12 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		return h713_disp_comm_state() ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 
-	if (argc == 2 && !strcmp(argv[1], "clkfind"))
-		return h713_disp_clk_find() ?
+	if ((argc == 2 || argc == 3) && !strcmp(argv[1], "clkfind")) {
+		int which = argc == 3 ? (int)dectoul(argv[2], NULL) : -1;
+
+		return h713_disp_clk_find(which) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
+	}
 
 	if (argc == 2 && !strcmp(argv[1], "scanrate"))
 		return h713_disp_scan_rate() ?
@@ -8279,7 +8315,7 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "h713_disp commtrace                 - read the CPU_COMM trace stage\n"
 	   "h713_disp scanrate                  - measure line/frame rate and real DCLK\n"
 	   "h713_disp regscan [base] [words]    - find which registers move, and what they count\n"
-	   "h713_disp clkfind                   - find which register drives the pixel clock\n"
+	   "h713_disp clkfind [index]           - list, or test ONE clock candidate (see docs)\n"
 	   "h713_disp commdev                   - read the firmware channel table\n"
 	   "h713_disp fwmd <mips-va> [words]    - dump firmware memory (cache-safe)\n"
 	   "h713_disp commcall <id> [chan=<hex>] [pid=<hex>] [args..]\n"
