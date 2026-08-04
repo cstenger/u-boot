@@ -8927,7 +8927,7 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 				bool pitch, bool pitch_wide, bool hbp,
 				bool pitch_low, bool edge, bool edge_fine,
 				bool stride, bool stride_fix, bool band,
-				u32 stride_override)
+				bool vendor_late, u32 stride_override)
 {
 	int ret;
 
@@ -8958,8 +8958,28 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 	if (ret)
 		return ret;
 
-	/* Seed before AFBD is enabled, then republish after MIPS readiness. */
-	if (vendor_logo) {
+	/*
+	 * Seed before AFBD is enabled, then republish after MIPS readiness.
+	 *
+	 * This seed is the one structural difference between vendor-logo, which
+	 * has never put anything on the panel, and every fb-* mode, which all
+	 * do. Those seed with a plain memory write; vendor-logo instead selects
+	 * a block device, reads 2.7 MB off FAT to 0x6d000000 and hashes it,
+	 * all before the display sequence runs.
+	 *
+	 * The failure is not visible anywhere in the register state: every dump
+	 * is identical to a run that renders, fbcheck proves the framebuffer
+	 * correct, the frame commits, and the TCON marker -- which does not
+	 * touch the framebuffer path at all -- is equally absent. Something
+	 * outside the dumped registers is being disturbed, so bisect the one
+	 * thing that differs instead of theorising about it.
+	 *
+	 * vendor-logo-late seeds like the working modes and loads the logo only
+	 * after init. If the panel lights, the pre-run load is the culprit and
+	 * the next question is which part of it; if it stays dark, the seed was
+	 * never the difference and this whole line of reasoning is wrong.
+	 */
+	if (vendor_logo && !vendor_late) {
 		ret = h713_disp_publish_vendor_bootlogo(true, vendor_chroma);
 		if (ret)
 			return ret;
@@ -9447,7 +9467,9 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		bool noboot = !strcmp(mode, "noboot");
 		bool full   = !strcmp(mode, "full");
 		bool quiesce = !strcmp(mode, "quiesce");
-		bool vendor_chroma = !strcmp(mode, "vendor-logo-chroma");
+		bool vendor_late = !strcmp(mode, "vendor-logo-late");
+		bool vendor_chroma = !strcmp(mode, "vendor-logo-chroma") ||
+				     vendor_late;
 		bool vendor_logo = !strcmp(mode, "vendor-logo") ||
 				   vendor_chroma;
 		bool plane_gate = !strcmp(mode, "plane-gate");
@@ -9501,7 +9523,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    tcon_checker_mono ? 1 :
 					    tcon_checker ? 8 : 0,
 					    tcon_solid_native, hbands, grid, quads, vbands, pitch, pitch_wide, hbp, pitch_low, edge, edge_fine, stride, stride_fix, band,
-					    stride_override) ?
+					    vendor_late, stride_override) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
@@ -9629,6 +9651,7 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "                                      fb-fix: pattern at the natural 1280, sweep for the register that unshears it\n"
 	   "                                      fb-band: solid fill, screen offset registers for the ~110px left band\n"
 	   "                                      vendor-logo-chroma: the stock logo, lit->red unlit->blue (it is pure grey, which this path cannot show)\n"
+	   "                                      vendor-logo-late: same, but seeded like the fb-* modes -- bisects the pre-run BMP load\n"
 	   "       h713_disp panel-test <id> <mode> <stride>  - same, with AFBD 0x05600170 forced to <stride> bytes (hex)\n"
 	   "h713_disp auto <project-id> [nowait] - load from eMMC and run\n"
 	   "h713_disp load <project-id>         - load from eMMC only\n"
