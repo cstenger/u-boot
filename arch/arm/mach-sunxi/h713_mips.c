@@ -4504,6 +4504,11 @@ static int h713_disp_stock_panel_power(void)
 }
 
 /*
+ * The panel power-down sequence lives further down, next to the AFBD and LVDS
+ * register definitions it needs: see h713_disp_teardown().
+ */
+
+/*
  * Board B's panel description, as stock assembles it.
  *
  * Stock parses its runtime DT into a flat 35-entry u32 array, then overwrites
@@ -5116,6 +5121,7 @@ static void h713_disp_probe_contested(const char *when)
  */
 #define H713_DISP_LAYER_XOFF_REG	0x0528008cUL
 
+
 /*
  * A backstop, no longer the fix.
  *
@@ -5565,6 +5571,110 @@ static void h713_disp_sample(void)
 #define H713_DISP_AFBD_READY_REG	0x05600144UL
 #define H713_DISP_AFBD_STATUS_REG	0x05600168UL
 #define H713_DISP_AFBD_STRIDE_REG	0x05600170UL
+
+/*
+ * The panel's declared power-down timings, from panel_config.ini:
+ *
+ *	PanelOnTiming0/1/2  = 20 / 550 / 75
+ *	PanelOffTiming0/1/2 = 20 / 250 / 75
+ *
+ * The on-side mapping is confirmed by the code above: OnTiming1 (550) is the
+ * pre-delay before the GPIO phase, and OnTiming0 (20) is the settle after it,
+ * before the display clocks and the MIPS release. OnTiming2 (75) is not
+ * accounted for on the on side either.
+ *
+ * The off-side assignment below is therefore SYMMETRY, NOT KNOWLEDGE. Off0
+ * mirrors On0 as the settle after the signal stops, Off1 mirrors On1 as the
+ * delay bracketing the power rail, and Off2 fills the gap between dropping
+ * reset and dropping power. If a panel datasheet or the stock power-down path
+ * ever contradicts this, believe them, not this comment.
+ */
+#define H713_PANEL_OFF_T0_MS	20
+#define H713_PANEL_OFF_T1_MS	250
+#define H713_PANEL_OFF_T2_MS	75
+
+/*
+ * Put the display back where a fresh bring-up can pick it up.
+ *
+ * Every mode has, until now, ended by abandoning the hardware: panel powered,
+ * MIPS in reset, clocks running. That is why "power-cycle before another run"
+ * exists, why a second run in one boot produces a dark panel with an
+ * identical-looking console, and why that trap cost four results before the
+ * refusal guard made it visible.
+ *
+ * The likely reason a second run fails is right here in the GPIOs. The bring-up
+ * powers the panel by driving PF6 high and pulsing PH16; if the panel is still
+ * powered from the previous run, that "power on" is a no-op and the panel never
+ * re-runs its own init. Dropping both properly is what should make a second
+ * bring-up behave like a first.
+ *
+ * Ordering is the general LVDS rule -- backlight off, then signal, then VCC --
+ * because it is the one part of this with real hardware risk. Panels can latch
+ * up when the data lanes outlive the rail, and repeated violations shorten
+ * their life.
+ *
+ * Two deliberate omissions:
+ *
+ *   - The backlight is not touched. Which PWM drives it is still unresolved:
+ *     display_cfg.xml says channel 0, panel_config.ini says channel 5, and the
+ *     dimmer we implemented drives PWM2 on PB4, which matches neither. Turning
+ *     off the wrong channel would be theatre.
+ *
+ *   - The display PLLs and mod clocks are left running. Disabling a block's
+ *     clock while something still reaches for it is the documented way to wedge
+ *     this interconnect, and the acceptance test does not need it: the bring-up
+ *     replays LogoRegData, which rewrites this state absolutely. Leaving them
+ *     up is the conservative choice, not an oversight.
+ *
+ * The firmware cannot do any of this for us. THal_Vp_Deinit was tested on
+ * hardware and changes four words inside AFBD, leaving LVDS, the PHY, the PLL,
+ * the mixer and the DE byte-identical.
+ */
+static void h713_disp_teardown(const char *why)
+{
+	u32 ctrl;
+
+	printf("H713 teardown: %s\n", why);
+
+	/* 1. Stop scanout before anything downstream of it goes away. */
+	ctrl = readl(H713_DISP_AFBD_CTRL_REG);
+	writel(ctrl & ~BIT(0), H713_DISP_AFBD_CTRL_REG);
+	dmb();
+
+	/* 2. Park the coprocessor. Also clears h713_display_prepared. */
+	h713_mips_stop();
+
+	/*
+	 * 3. Signal off, back to the values every cold probe in this bring-up
+	 *    has recorded before init: 051c0014=18000000, 051c0028=00000030,
+	 *    05140054=40000000.
+	 */
+	writel(0x00000000, 0x051c00d4);
+	writel(0x00000000, 0x051c00d8);
+	writel(0x00000000, 0x051c00dc);
+	writel(0x00000000, 0x051c00e0);
+	writel(0x18000000, 0x051c0014);
+	writel(0x00000030, 0x051c0028);
+	writel(0x40000000, 0x05140054);
+	dmb();
+
+	mdelay(H713_PANEL_OFF_T0_MS);
+
+	/* 4. Reset asserted, then the rail, then let it discharge. */
+	clrbits_le32((void *)H713_PH_DATA, BIT(16));
+	dmb();
+	mdelay(H713_PANEL_OFF_T2_MS);
+
+	clrbits_le32((void *)H713_PF_DATA, BIT(6));
+	dmb();
+	mdelay(H713_PANEL_OFF_T1_MS);
+
+	printf("H713 teardown: panel down (PF_DAT=%08x PH_DAT=%08x), "
+	       "PHY %08x/%08x, route %08x, MIPS reset=%08x\n",
+	       readl(H713_PF_DATA), readl(H713_PH_DATA),
+	       readl(0x051c0014), readl(0x051c0028), readl(0x05140054),
+	       readl(H713_MIPS_RESET_REG));
+}
 
 
 /*
@@ -9028,26 +9138,20 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 	int ret;
 
 	/*
-	 * Refuse a second run per power-on, rather than producing a dark panel
-	 * and a console that looks perfect.
+	 * A second run in one boot used to be refused, because every mode ended
+	 * by abandoning the hardware and the next one then initialised into a
+	 * torn-down state: the sequence re-reported success, the register dumps
+	 * came back byte-identical, and nothing reached the panel. Undetectable
+	 * from the log, and it cost four results before the refusal made it
+	 * visible.
 	 *
-	 * Every mode ends holding the MIPS in reset, so a second run
-	 * initialises from a torn-down state: the whole sequence re-reports
-	 * success, the register dumps come back byte-identical, and nothing
-	 * reaches the panel. That has now cost this bring-up at least four
-	 * results -- two recorded in the handoff, and the vendor-logo runs that
-	 * chased a framebuffer fault while fbcheck was proving the framebuffer
-	 * correct. It is undetectable from the log, which is exactly why it
-	 * belongs in the tool and not in a note.
+	 * Now there is a teardown, so tear down and carry on instead. Whether
+	 * that is enough is the whole acceptance test for it: if this second
+	 * run renders, the teardown is correct; if it comes back dark, it is
+	 * not, and the message below is what says which run you are looking at.
 	 */
-	if (h713_panel_test_ran) {
-		printf("H713 panel: REFUSING -- a display test has already run "
-		       "since power-on. Each one ends with the MIPS held in "
-		       "reset, so this run would initialise into a torn-down "
-		       "state: identical console, identical registers, dark "
-		       "panel. POWER-CYCLE THE BOARD and run it again.\n");
-		return -EPERM;
-	}
+	if (h713_panel_test_ran)
+		h713_disp_teardown("second run this boot, tearing down first");
 	h713_panel_test_ran = true;
 
 	/*
@@ -9364,9 +9468,7 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		return 0;
 	}
 
-	printf("H713 panel: pattern test complete; MIPS %s, "
-	       "power-cycle before another run\n",
-	       quiesce ? "held in reset after initialization" : "left running");
+	printf("H713 panel: pattern test complete\n");
 	return 0;
 }
 
@@ -9536,6 +9638,11 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 
 		return h713_disp_clk_find(which) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
+	}
+
+	if (argc == 2 && !strcmp(argv[1], "teardown")) {
+		h713_disp_teardown("requested from the prompt");
+		return CMD_RET_SUCCESS;
 	}
 
 	if (argc == 2 && !strcmp(argv[1], "scanrate"))
@@ -9740,6 +9847,9 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "h713_disp init <project-id> [noboot|quiesce]\n"
 	   "                                    - bring the display up and stop, ready for diagnostics\n"
 	   "                                      quiesce: park the MIPS core (use this for clkfind)\n"
+	   "h713_disp teardown                  - stop scanout, park the MIPS, drop the panel rail\n"\
+	   "                                      run it, then run panel-test again: if the second\n"\
+	   "                                      render is correct the teardown is correct\n"
 	   "h713_disp scanrate                  - measure line/frame rate and real DCLK\n"
 	   "h713_disp regscan [base] [words]    - find which registers move, and what they count\n"
 	   "h713_disp clkfind [index]           - list, or test ONE clock candidate (see docs)\n"
