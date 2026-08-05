@@ -8888,6 +8888,7 @@ static int h713_disp_call_table(uint raw_entries)
 {
 	u32 version, count;
 	uint i, w, shown = 0, populated = 0, matched = 0;
+	char name[H713_MIPS_SHMEM_CALL_ENTRY_SIZE - 12];
 
 	version = h713_mips_read_shmem(H713_MIPS_SHMEM_CALL_VERSION_OFF);
 	count   = h713_mips_read_shmem(H713_MIPS_SHMEM_CALL_COUNT_OFF);
@@ -8919,17 +8920,37 @@ static int h713_disp_call_table(uint raw_entries)
 			continue;
 		populated++;
 
-		for (w = 0; w < ARRAY_SIZE(word); w++) {
-			uint r;
+		/*
+		 * The entry names itself. Layout, settled from the first good
+		 * dump on 2026-08-04:
+		 *
+		 *   +0x00  0x00010000        version/flags
+		 *   +0x04  pid               0x8b8f32b0 for every entry so far
+		 *   +0x08  routine id        what commcall takes
+		 *   +0x0c  ASCII name, NUL-terminated ("THal_Vp_Deinit_1_000")
+		 *   +0x50  handler VA
+		 *   +0x5c  0xffffffff        free sentinel
+		 *
+		 * Reading the name out of the entry beats matching against a
+		 * built-in list: the firmware exports 1224 slots and the list
+		 * knew fifteen, so everything else dumped as anonymous hex and
+		 * the ids we actually needed -- Deinit, the backlight pair --
+		 * were sitting in plain ASCII the whole time.
+		 */
+		name[0] = '\0';
+		for (w = 0; w < sizeof(name) - 1; w++) {
+			u8 c = (word[3 + w / 4] >> ((w % 4) * 8)) & 0xff;
 
-			for (r = 0; r < ARRAY_SIZE(h713_comm_routines); r++) {
-				if (word[w] != h713_comm_routines[r].id)
-					continue;
-				printf("  entry %4u  +0x%02x = %08x  %s\n",
-				       i, w * 4, word[w],
-				       h713_comm_routines[r].name);
-				matched++;
-			}
+			if (!c)
+				break;
+			name[w] = (c >= 0x20 && c < 0x7f) ? c : '?';
+		}
+		name[w] = '\0';
+
+		if (name[0]) {
+			printf("  entry %4u  id %08x  handler %08x  %s\n",
+			       i, word[2], word[20], name);
+			matched++;
 		}
 
 		if (shown < raw_entries) {
@@ -8944,10 +8965,10 @@ static int h713_disp_call_table(uint raw_entries)
 		}
 	}
 
-	printf("H713 comm: %u populated entr%s, %u known routine id(s) matched\n",
+	printf("H713 comm: %u populated entr%s, %u named\n",
 	       populated, populated == 1 ? "y" : "ies", matched);
 	if (!matched)
-		printf("H713 comm: no id matched -- the raw dumps above are the "
+		printf("H713 comm: nothing named -- the raw dumps above are the "
 		       "input for working out the entry layout offline\n");
 	return 0;
 }
