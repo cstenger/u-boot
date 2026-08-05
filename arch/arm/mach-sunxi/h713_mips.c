@@ -5662,6 +5662,28 @@ static void h713_disp_sample(void)
 #define H713_BL_PWM_HZ		25000
 #define H713_BL_PWM_MUX		2
 
+/*
+ * The PWM block is gated and held in reset out of cold boot, and nothing in
+ * the display path ungates it. The first sweep wrote CTL, PERIOD and ENABLE
+ * and read all three back as zero -- the writes went nowhere, so the run said
+ * nothing about the panel.
+ *
+ * CCU 0x7ac carries both, from our own H713 CCU driver: BIT(0) is bus-pwm's
+ * gate and BIT(16) is RST_BUS_PWM. Gate first, then release reset, which is
+ * the ordering the sunxi clock code uses.
+ */
+#define H713_CCU_PWM_BGR	0x020017acUL
+
+static void h713_disp_pwm_bus_enable(void)
+{
+	setbits_le32((void *)H713_CCU_PWM_BGR, BIT(0));
+	dmb();
+	udelay(20);
+	setbits_le32((void *)H713_CCU_PWM_BGR, BIT(16));
+	dmb();
+	udelay(20);
+}
+
 static void h713_disp_backlight_set(uint percent)
 {
 	const uint ch = H713_BL_PWM_CH;
@@ -5672,6 +5694,7 @@ static void h713_disp_backlight_set(uint percent)
 		percent = 100;
 	act = period * percent / 100;
 
+	h713_disp_pwm_bus_enable();
 	sunxi_gpio_set_cfgpin(SUNXI_GPB(4), H713_BL_PWM_MUX);
 
 	/* HOSC, divide by one: clear both CLK_SRC[8:7] and DIV_M[3:0]. */
@@ -5684,11 +5707,16 @@ static void h713_disp_backlight_set(uint percent)
 	dmb();
 
 	printf("H713 backlight: PWM%u %u%% duty (%u/%u cycles at %u Hz), "
-	       "PB4 mux=%d, CTL=%08x PERIOD=%08x EN=%08x\n",
+	       "PB4 mux=%d, BGR=%08x CTL=%08x PERIOD=%08x EN=%08x\n",
 	       ch, percent, act, period, H713_BL_PWM_HZ,
 	       sunxi_gpio_get_cfgpin(SUNXI_GPB(4)),
+	       readl(H713_CCU_PWM_BGR),
 	       readl(H713_PWM_CTL(ch)), readl(H713_PWM_PERIOD(ch)),
 	       readl(H713_PWM_ENABLE));
+	if (!readl(H713_PWM_ENABLE))
+		printf("H713 backlight: PWM registers still read zero -- the "
+		       "block is not accepting writes, so this step says "
+		       "nothing about the panel\n");
 }
 
 
