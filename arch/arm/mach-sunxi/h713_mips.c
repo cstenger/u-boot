@@ -5630,6 +5630,68 @@ static void h713_disp_sample(void)
  * hardware and changes four words inside AFBD, leaving LVDS, the PHY, the PLL,
  * the mixer and the DE byte-identical.
  */
+/*
+ * The panel dimmer, per the stock runtime DTB's tvtop panel block:
+ *
+ *	panel_pwm_ch = 2      PWM2, which the h713 pinctrl driver muxes on
+ *	                      PB4 at function 2
+ *	panel_pwm_freq = 25000
+ *	panel_pwm_pol = 0     active high
+ *	panel_pwm_min = 0, panel_pwm_max = 100, panel_backlight = 75
+ *
+ * Register layout from our own sun8i 8-channel PWM driver (patch 0007).
+ * 24 MHz HOSC with both dividers at 1 gives 24e6/25e3 = 960 cycles a period,
+ * which fits the 16-bit fields with room for 100% duty.
+ *
+ * This exists to retest a parked negative. The earlier bench note -- "a running
+ * 25 kHz PWM on PB4 changed brightness not at all, so PB4/PWM2 is not the
+ * control" -- was taken when the display path did not work, and the standing
+ * explanation was that the panel ignores its dim input until fastlogo has run
+ * its serial init. That init now demonstrably happens: the panel renders. So
+ * the test is worth repeating against a panel that is actually up, which was
+ * never possible before.
+ */
+#define H713_PWM_BASE		0x02000c00UL
+#define H713_PWM_PCCR(pair)	(H713_PWM_BASE + 0x020 + (pair) * 4)
+#define H713_PWM_CLK_GATE	(H713_PWM_BASE + 0x040)
+#define H713_PWM_ENABLE		(H713_PWM_BASE + 0x080)
+#define H713_PWM_CTL(ch)	(H713_PWM_BASE + 0x100 + (ch) * 0x20)
+#define H713_PWM_PERIOD(ch)	(H713_PWM_BASE + 0x104 + (ch) * 0x20)
+
+#define H713_BL_PWM_CH		2
+#define H713_BL_PWM_HZ		25000
+#define H713_BL_PWM_MUX		2
+
+static void h713_disp_backlight_set(uint percent)
+{
+	const uint ch = H713_BL_PWM_CH;
+	u32 period = 24000000u / H713_BL_PWM_HZ;
+	u32 act;
+
+	if (percent > 100)
+		percent = 100;
+	act = period * percent / 100;
+
+	sunxi_gpio_set_cfgpin(SUNXI_GPB(4), H713_BL_PWM_MUX);
+
+	/* HOSC, divide by one: clear both CLK_SRC[8:7] and DIV_M[3:0]. */
+	clrbits_le32((void *)H713_PWM_PCCR(ch / 2), 0x18f);
+	/* Prescaler 0, active high to match panel_pwm_pol = 0. */
+	writel(BIT(8), H713_PWM_CTL(ch));
+	writel(((period - 1) << 16) | act, H713_PWM_PERIOD(ch));
+	setbits_le32((void *)H713_PWM_CLK_GATE, BIT(ch));
+	setbits_le32((void *)H713_PWM_ENABLE, BIT(ch));
+	dmb();
+
+	printf("H713 backlight: PWM%u %u%% duty (%u/%u cycles at %u Hz), "
+	       "PB4 mux=%d, CTL=%08x PERIOD=%08x EN=%08x\n",
+	       ch, percent, act, period, H713_BL_PWM_HZ,
+	       sunxi_gpio_get_cfgpin(SUNXI_GPB(4)),
+	       readl(H713_PWM_CTL(ch)), readl(H713_PWM_PERIOD(ch)),
+	       readl(H713_PWM_ENABLE));
+}
+
+
 static void h713_disp_teardown(const char *why)
 {
 	u32 ctrl;
@@ -7404,6 +7466,38 @@ static void h713_disp_fill_solid(u32 argb)
 	flush_cache(H713_DISP_OSD_FB_ADDR, total * sizeof(u32));
 }
 
+/*
+ * Hold a full-white field and step the dimmer.
+ *
+ * White because the question is whether the backlight changes, and a bright
+ * uniform field makes a duty change unmistakable while a dark one hides it.
+ * No chroma markers between steps: they drive the TCON generator, which would
+ * replace the field and change apparent brightness by itself. The console
+ * prints the step instead, and the operator watches continuously.
+ */
+static void h713_disp_backlight_sweep(void)
+{
+	static const u8 duty[] = { 100, 75, 50, 25, 0, 100 };
+	uint i;
+
+	printf("H713 backlight: full-white field, stepping PWM2 duty. Watch the "
+	       "panel continuously -- if brightness tracks these steps, the "
+	       "parked \"PB4 is not the control\" result was taken against a "
+	       "panel that had never been initialised.\n");
+
+	h713_disp_fill_solid(0xffffffff);
+	h713_disp_commit_osd_frame();
+
+	for (i = 0; i < ARRAY_SIZE(duty); i++) {
+		printf("H713 backlight: step %u of %u -> %u%%\n",
+		       i + 1, (uint)ARRAY_SIZE(duty), duty[i]);
+		h713_disp_backlight_set(duty[i]);
+		mdelay(4000);
+	}
+	printf("H713 backlight: sweep complete, left at %u%%\n",
+	       duty[ARRAY_SIZE(duty) - 1]);
+}
+
 static void h713_disp_band_sweep(void)
 {
 	uint i, j;
@@ -9133,7 +9227,8 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 				bool pitch, bool pitch_wide, bool hbp,
 				bool pitch_low, bool edge, bool edge_fine,
 				bool stride, bool stride_fix, bool band,
-				bool vendor_early, u32 stride_override)
+				bool bl_sweep, bool vendor_early,
+				u32 stride_override)
 {
 	int ret;
 
@@ -9323,7 +9418,9 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 	 */
 	h713_disp_clear_layer_xoff("after the DE replay");
 
-	if (band) {
+	if (bl_sweep) {
+		h713_disp_backlight_sweep();
+	} else if (band) {
 		h713_disp_band_sweep();
 	} else if (stride_fix) {
 		h713_disp_stride_fix_sweep();
@@ -9730,12 +9827,14 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		bool stride = !strcmp(mode, "fb-stride");
 		bool stride_fix = !strcmp(mode, "fb-fix");
 		bool band = !strcmp(mode, "fb-band");
+		bool bl_sweep = !strcmp(mode, "bl-sweep");
 
 		if (argc >= 4 && !noboot && !full && !quiesce && !vendor_logo &&
 		    !plane_gate && !tcon_checker && !tcon_checker_mono &&
 		    !tcon_solid && !tcon_solid_native && !tcon_dclk &&
 		    !tcon_solid_dclk_normal && !tcon_chroma && !tcon_chroma_62m &&
-		    !tcon_nsweep && !tcon_nsweep_hi && !hbands && !grid && !quads && !vbands && !pitch && !pitch_wide && !hbp && !pitch_low && !edge && !edge_fine && !stride && !stride_fix && !band)
+		    !tcon_nsweep && !tcon_nsweep_hi && !hbands && !grid && !quads && !vbands && !pitch && !pitch_wide && !hbp && !pitch_low && !edge && !edge_fine && !stride && !stride_fix && !band &&
+		    !bl_sweep)
 			return CMD_RET_USAGE;
 		return h713_disp_panel_test(hextoul(argv[2], NULL), !noboot,
 					    full,
@@ -9744,7 +9843,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    tcon_solid || tcon_solid_native ||
 					    tcon_dclk || tcon_solid_dclk_normal ||
 					    tcon_chroma || tcon_chroma_62m ||
-					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads || vbands || pitch || pitch_wide || hbp || pitch_low || edge || edge_fine || stride || stride_fix || band,
+					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads || vbands || pitch || pitch_wide || hbp || pitch_low || edge || edge_fine || stride || stride_fix || band || bl_sweep,
 					    vendor_logo, vendor_chroma, plane_gate,
 					    hbp ? 16 :
 					    tcon_nsweep_hi ? 15 :
@@ -9757,7 +9856,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    tcon_checker_mono ? 1 :
 					    tcon_checker ? 8 : 0,
 					    tcon_solid_native, hbands, grid, quads, vbands, pitch, pitch_wide, hbp, pitch_low, edge, edge_fine, stride, stride_fix, band,
-					    vendor_early, stride_override) ?
+					    bl_sweep, vendor_early, stride_override) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
@@ -9890,6 +9989,7 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "                                      fb-stride: pattern fixed, sweep AFBD 0x05600170 -- LIVE, unit slope, S = V - 42\n"
 	   "                                      fb-fix: pattern at the natural 1280, sweep for the register that unshears it\n"
 	   "                                      fb-band: solid fill, screen offset registers for the ~110px left band\n"
+	   "                                      bl-sweep: white field, step PWM2/PB4 duty 100..0 (the stock dimmer)\n"
 	   "                                      vendor-logo-chroma: the stock logo, lit->red unlit->blue (it is pure grey, which this path cannot show)\n"
 	   "                                      vendor-logo-late: alias of vendor-logo-chroma; loading late is now the default\n"
 	   "                                      vendor-logo-early: loads before the display sequence -- known broken, kept to chase why\n"
