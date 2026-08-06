@@ -22,3 +22,19 @@ config SPL_IMAGE_TYPE
 	string
 	default "sunxi_egon" if SPL_IMAGE_TYPE_SUNXI_EGON
 	default "sunxi_toc0" if SPL_IMAGE_TYPE_SUNXI_TOC0
+
+config H713_VENDOR_CHAINLOAD
+	bool "H713: one-shot chainload of the vendor boot chain"
+	depends on MACH_SUN50I_H713
+	default n
+	help
+	  Let the SPL hand the machine to the vendor's boot0 for exactly one
+	  boot, when the RTC marker asks for it, instead of swapping the first
+	  stage on eMMC.  Ours stays installed at LBA 0x10 and remains the
+	  default: the marker is consumed before the handoff, so a vendor
+	  excursion that hangs comes back to our own U-Boot on the next power
+	  cycle.
+
+	  The vendor's boot0 is read from LBA 0x100 and checksum-verified
+	  before anything is entered; put it there with
+	  tools/boot-switch.sh stage.  Nothing is written to eMMC.

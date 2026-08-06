@@ -320,18 +320,73 @@
 
 #ifdef CONFIG_MACH_SUN50I_H713
 /*
+ * Switch to the vendor stack with one command, no host attached: copy the
+ * vendor's boot0 from LBA 0x100 -- the second copy the vendor itself keeps at
+ * 128 KiB, restored there by tools/boot-switch.sh stage -- over the first stage
+ * at LBA 0x10, then power cycle.  Both boot chains are then complete and
+ * resident: ours is SPL(0x10) + U-Boot proper(0x12000) + FIT(boot_a) + UDISK,
+ * the vendor's is boot0(0x100) + its TOC1 boot package(24576/32800, which is
+ * where its U-Boot, BL31 and OP-TEE live) + its slot-B Android images.
+ *
+ * Every step is chained with && and the copy is checked for the eGON magic
+ * before it is written, so a failed read cannot go on to install whatever DRAM
+ * happened to hold -- the failure that has already produced one worthless
+ * "backup" on this board.  There is no switch_ours counterpart here: once the
+ * vendor owns LBA 0x10 this environment is not running.  See docs/flash.md for
+ * the two ways back (the FEL button, or the stashed SPL at LBA 0x14000).
+ */
+#define H713_SWITCH_VENDOR_COMMAND \
+	"mmc dev 1 && mmc read 0x48000000 0x100 0x40 && " \
+	"itest.l *0x48000004 == 0x4e4f4765 && " \
+	"mmc write 0x48000000 0x10 0x40 && " \
+	"echo VENDOR FIRST STAGE INSTALLED - POWER CYCLE TO BOOT IT"
+/*
+ * The one-shot form: arm the RTC marker the SPL consumes and reset.  Ours
+ * stays installed at LBA 0x10, so the next boot after the vendor excursion is
+ * ours again with nothing to undo, and a vendor chain that hangs costs a power
+ * cycle rather than the FEL button.  Prefer this over switch_vendor, which
+ * makes the vendor the persistent default until something rewrites LBA 0x10.
+ */
+#define H713_BOOT_VENDOR_COMMAND \
+	"mw.l 0x0709011c 0x001db007 && reset"
+#define H713_SWITCH_ENV_SETTINGS \
+	"boot_vendor=" H713_BOOT_VENDOR_COMMAND "\0" \
+	"switch_vendor=" H713_SWITCH_VENDOR_COMMAND "\0"
+
+/*
  * The BROM-loaded first stage is a single raw image at LBA 0x10 (not slotted).
  * Provide it under a non-slotted alias "uboot" as well as "bootloader":
  * slot-aware fastboot hosts auto-append the A/B suffix to "bootloader" and end
  * up writing the unused 36 MiB GPT partition "bootloader_a" instead of LBA 0x10.
  * "uboot" is not a GPT partition name, so the host passes it through verbatim.
- * Flash the first stage with:  fastboot flash uboot u-boot-sunxi-with-spl-*.bin
+ *
+ * LBA 0x10 holds *only* the 32 KiB first stage, because those 64 sectors are
+ * the one range this board's two boot chains contend for: either our SPL or
+ * the vendor's boot0 lives there, and swapping them is how you switch stacks.
+ * U-Boot proper therefore lives in the "empty" partition (LBA 0x49ac00): not
+ * at LBA 0x50, which is inside the region the vendor's boot0 reads, and no
+ * longer in "bootloader_a" either -- that one looked like OTA staging but is
+ * really a live FAT16 holding the vendor's mips/ display artifacts, and our
+ * image over its boot sector left the vendor unable to mount it
+ * ("** Unrecognized filesystem type **", bench 2026-08-06).  "empty" is 15 MiB
+ * of zeros in the factory image and is named in nothing the vendor boots.  The size
+ * guards below are deliberately tight so that flashing the concatenated
+ * u-boot-sunxi-with-spl-*.bin to "uboot" fails loudly instead of quietly
+ * recreating the old overlapping layout.  Flash the two halves with:
+ *   fastboot flash uboot  <first 32 KiB of u-boot-sunxi-with-spl-*.bin>
+ *   fastboot flash ubootp <the remainder>
+ * or let tools/boot-switch.sh split them for you.
  */
 #define H713_FASTBOOT_ENV_SETTINGS \
-	"fastboot_raw_partition_bootloader=0x10 0x1ff0\0" \
-	"fastboot_raw_partition_uboot=0x10 0x1ff0\0" \
+	"fastboot_raw_partition_bootloader=0x10 0x40\0" \
+	"fastboot_raw_partition_uboot=0x10 0x40\0" \
+	"fastboot_raw_partition_ubootp=0x49ac00 0x2000\0" \
+	"fastboot_raw_partition_vboot0=0x100 0x40\0" \
+	"fastboot_raw_partition_splstash=0x49cc00 0x40\0" \
+	H713_SWITCH_ENV_SETTINGS \
 	H713_FASTBOOT_MODE_ENV_SETTINGS
 #else
+#define H713_SWITCH_VENDOR_COMMAND ""
 #define H713_FASTBOOT_ENV_SETTINGS
 #endif
 

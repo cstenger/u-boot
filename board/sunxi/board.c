@@ -579,6 +579,19 @@ int board_mmc_init(struct bd_info *bis)
 	return 0;
 }
 
+#ifdef CONFIG_H713_VENDOR_CHAINLOAD
+/*
+ * The chainloader runs in board_init_f, before the block layer is up, so it
+ * cannot reach the eMMC through find_mmc_device().  Hand it the controller
+ * directly.  Slot 2 is the eMMC on this board; slot 0 is the absent SD socket.
+ */
+struct mmc *h713_chain_emmc(void)
+{
+	mmc_pinmux_setup(2);
+	return sunxi_mmc_init(2);
+}
+#endif
+
 #ifdef CONFIG_ENV_MMC_DEVICE_INDEX
 int mmc_get_env_dev(void)
 {
@@ -922,11 +935,49 @@ int misc_init_r(void)
 	}
 
 	/* Existing H713 boards may load an environment saved before these defaults
-	 * were added.  Populate missing values without replacing user overrides.
+	 * were added.  Populate missing values without replacing user overrides,
+	 * and retire the one stale default that is actively dangerous.
 	 */
+	if (IS_ENABLED(CONFIG_MACH_SUN50I_H713)) {
+		/* name, current default, superseded default to retire */
+		static const struct {
+			const char *name, *val, *old;
+		} raw_parts[] = {
+			{ "fastboot_raw_partition_bootloader",
+			  "0x10 0x40",       "0x10 0x1ff0" },
+			{ "fastboot_raw_partition_uboot",
+			  "0x10 0x40",       "0x10 0x1ff0" },
+			{ "fastboot_raw_partition_ubootp",
+			  "0x49ac00 0x2000", "0x12000 0x2000" },
+			{ "fastboot_raw_partition_vboot0",
+			  "0x100 0x40",      NULL },
+			{ "fastboot_raw_partition_splstash",
+			  "0x49cc00 0x40",   "0x14000 0x40" },
+		};
+		int i;
+
+		for (i = 0; i < ARRAY_SIZE(raw_parts); i++) {
+			const char *cur = env_get(raw_parts[i].name);
+
+			/* Retire defaults that are now actively wrong: the
+			 * 0x1ff0-sector first-stage guard is wide enough to
+			 * flash the whole concatenated image over the vendor's
+			 * boot region, and the 0x12000 targets point into
+			 * bootloader_a, which is the vendor's display-artifact
+			 * filesystem and not ours to write.  A value someone
+			 * actually chose is left alone.
+			 */
+			if (!cur ||
+			    (raw_parts[i].old && !strcmp(cur, raw_parts[i].old)))
+				env_set(raw_parts[i].name, raw_parts[i].val);
+		}
+	}
 	if (IS_ENABLED(CONFIG_MACH_SUN50I_H713) &&
-	    !env_get("fastboot_raw_partition_bootloader"))
-		env_set("fastboot_raw_partition_bootloader", "0x10 0x1ff0");
+	    !env_get("switch_vendor"))
+		env_set("switch_vendor", H713_SWITCH_VENDOR_COMMAND);
+	if (IS_ENABLED(CONFIG_H713_VENDOR_CHAINLOAD) &&
+	    !env_get("boot_vendor"))
+		env_set("boot_vendor", H713_BOOT_VENDOR_COMMAND);
 	if (IS_ENABLED(CONFIG_MACH_SUN50I_H713) &&
 	    IS_ENABLED(CONFIG_USB_FUNCTION_ACM) &&
 	    IS_ENABLED(CONFIG_USB_FUNCTION_FASTBOOT) &&

@@ -381,9 +381,14 @@ unsigned long board_spl_mmc_get_uboot_raw_sector(struct mmc *mmc,
  * controller by hand -- doing it by hand wedges on this board.
  *
  * Writes our SPL back over sectors 16..79, the only range a clobbered first
- * stage occupies; U-Boot proper at sector 80 survives untouched. Then halts,
- * so the board is restored by a power cycle rather than by continuing to boot
- * from a half-known state.
+ * stage occupies; U-Boot proper survives untouched at LBA 0x12000, outside the
+ * region either boot chain contends for. Then halts, so the board is restored
+ * by a power cycle rather than by continuing to boot from a half-known state.
+ *
+ * The payload is h713_spl_payload.h, an xxd-style dump of the first 32 KiB of
+ * u-boot-sunxi-with-spl-ddr3.bin. REGENERATE IT WHENEVER THE SPL CHANGES -- a
+ * stale payload installs a first stage that looks for U-Boot proper wherever
+ * it used to live, which is the opposite of a recovery.
  */
 void spl_board_prepare_for_boot(void)
 {
@@ -540,6 +545,10 @@ u32 spl_mmc_boot_mode(struct mmc *mmc, const u32 boot_device)
 	return result;
 }
 
+#ifdef CONFIG_H713_VENDOR_CHAINLOAD
+void h713_vendor_chainload(void);
+#endif
+
 void board_init_f(ulong dummy)
 {
 	sunxi_sram_init();
@@ -560,6 +569,15 @@ void board_init_f(ulong dummy)
 	i2c_init(CONFIG_SYS_I2C_SPEED, CONFIG_SYS_I2C_SLAVE);
 #endif
 	sunxi_board_init();
+
+#ifdef CONFIG_H713_VENDOR_CHAINLOAD
+	/*
+	 * After DRAM, because the SPL's BSS lives there and the MMC stack
+	 * needs it.  Returns unless the RTC marker asks for the vendor chain,
+	 * in which case it does not return at all.
+	 */
+	h713_vendor_chainload();
+#endif
 }
 #endif /* CONFIG_XPL_BUILD */
 
