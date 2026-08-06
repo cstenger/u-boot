@@ -5651,16 +5651,59 @@ static void h713_disp_sample(void)
  * the test is worth repeating against a panel that is actually up, which was
  * never possible before.
  */
+/*
+ * This is the mainline `pwm-sun20i-d1` register map, the second-generation
+ * sunxi PWM IP. Do not "correct" it against `pwm-sun8i.c` (patch 0007) -- that
+ * was tried on 2026-08-05 and it is wrong, in a way this hardware proved:
+ *
+ *   - patch 0007 calls 0x040 dead-zone control and 0x060 ENABLE. Under this
+ *     map 0x040 is the per-channel CLK_GATE and 0x080 is ENABLE. After the
+ *     switch, a full block dump read 0x040 = 0 and 0x080 = 0 -- the channel
+ *     ungated and disabled -- and CNT(2) at 0x02000d48 read 0, i.e. the
+ *     counter was not running. Under patch 0007's map every field was set
+ *     correctly and the counter should have been counting. It was not.
+ *   - patch 0007 puts CLK_CFG SRC at [1:0], DIV_M at [6:4] and a gate at bit
+ *     7. Here SRC is [8:7] and DIV_M is [3:0], which is exactly the 0x18f
+ *     mask below, and the gating lives in the separate CLK_GATE register.
+ *   - patch 0007 puts active cycles at [31:16]. Here [31:16] is entire-1.
+ *
+ * The "verified from live hardware" note in patch 0007 -- PERIOD2 = 0x03BF03C0
+ * -- does not discriminate: 0x3bf = 959 and 0x3c0 = 960, so it reads as 25 kHz
+ * at ~100% duty under *either* field order. It is a degenerate sample and must
+ * not be cited as proof of the layout again.
+ *
+ * Whether patch 0007 is also wrong for the R_PWM instance it was DMM-validated
+ * against is open; that block may be a different generation. Nothing here
+ * depends on the answer.
+ */
 #define H713_PWM_BASE		0x02000c00UL
 #define H713_PWM_PCCR(pair)	(H713_PWM_BASE + 0x020 + (pair) * 4)
 #define H713_PWM_CLK_GATE	(H713_PWM_BASE + 0x040)
 #define H713_PWM_ENABLE		(H713_PWM_BASE + 0x080)
 #define H713_PWM_CTL(ch)	(H713_PWM_BASE + 0x100 + (ch) * 0x20)
 #define H713_PWM_PERIOD(ch)	(H713_PWM_BASE + 0x104 + (ch) * 0x20)
+#define H713_PWM_CNT(ch)	(H713_PWM_BASE + 0x108 + (ch) * 0x20)
 
 #define H713_BL_PWM_CH		2
 #define H713_BL_PWM_HZ		25000
-#define H713_BL_PWM_MUX		2
+/*
+ * PB4's pwm2 function is mux **3**, not 2. Corrected 2026-08-05 after a sweep
+ * with a verifiably correct PWM -- CLK_CFG=0x80, PERIOD=03c003c0..000003c0,
+ * EN bit 2 set -- changed brightness not at all, because the waveform was
+ * being driven into a pad muxed to a different function.
+ *
+ * Three independent sources say 3: board B's own stock U-Boot DTB
+ * (`pwm2@0 { allwinner,pins = "PB4"; allwinner,muxsel = <0x03>; }`), the
+ * upstream mainline H616 pinctrl table, and patch 0018. The only source
+ * saying 2 is patch 0002, our own H713 pinctrl transcription -- which is also
+ * the table the kernel binds, so the Linux pwm-backlight test of 2026-07-24
+ * had the same fault and its debugfs "function pwm2" was true at the
+ * abstraction level and wrong at the register level. One transcription error,
+ * both null results.
+ *
+ * Patch 0002 still needs the same correction for Linux.
+ */
+#define H713_BL_PWM_MUX		3
 
 /*
  * The PWM block is gated and held in reset out of cold boot, and nothing in
@@ -5687,8 +5730,9 @@ static void h713_disp_pwm_bus_enable(void)
 static void h713_disp_backlight_set(uint percent)
 {
 	const uint ch = H713_BL_PWM_CH;
-	u32 period = 24000000u / H713_BL_PWM_HZ;
+	u32 period = 24000000u / H713_BL_PWM_HZ;	/* 960 cycles at 25 kHz */
 	u32 act;
+	u32 cnt_a, cnt_b;
 
 	if (percent > 100)
 		percent = 100;
@@ -5699,24 +5743,44 @@ static void h713_disp_backlight_set(uint percent)
 
 	/* HOSC, divide by one: clear both CLK_SRC[8:7] and DIV_M[3:0]. */
 	clrbits_le32((void *)H713_PWM_PCCR(ch / 2), 0x18f);
-	/* Prescaler 0, active high to match panel_pwm_pol = 0. */
+	/* Prescaler 0, ACT_STA high to match panel_pwm_pol = 0. */
 	writel(BIT(8), H713_PWM_CTL(ch));
+	/* [31:16] entire cycles - 1, [15:0] active cycles. */
 	writel(((period - 1) << 16) | act, H713_PWM_PERIOD(ch));
 	setbits_le32((void *)H713_PWM_CLK_GATE, BIT(ch));
 	setbits_le32((void *)H713_PWM_ENABLE, BIT(ch));
 	dmb();
 
+	/*
+	 * The counter is the only witness that the channel is actually running
+	 * rather than merely configured. Two reads a few microseconds apart
+	 * must differ -- a full 960-cycle period is 40 us, so a static value
+	 * means no clock is reaching the channel.
+	 */
+	cnt_a = readl(H713_PWM_CNT(ch));
+	udelay(7);
+	cnt_b = readl(H713_PWM_CNT(ch));
+
 	printf("H713 backlight: PWM%u %u%% duty (%u/%u cycles at %u Hz), "
-	       "PB4 mux=%d, BGR=%08x CTL=%08x PERIOD=%08x EN=%08x\n",
+	       "PB4 mux=%d, BGR=%08x PCCR=%08x CTL=%08x PERIOD=%08x "
+	       "GATE=%08x EN=%08x CNT=%08x->%08x\n",
 	       ch, percent, act, period, H713_BL_PWM_HZ,
 	       sunxi_gpio_get_cfgpin(SUNXI_GPB(4)),
 	       readl(H713_CCU_PWM_BGR),
+	       readl(H713_PWM_PCCR(ch / 2)),
 	       readl(H713_PWM_CTL(ch)), readl(H713_PWM_PERIOD(ch)),
-	       readl(H713_PWM_ENABLE));
-	if (!readl(H713_PWM_ENABLE))
-		printf("H713 backlight: PWM registers still read zero -- the "
+	       readl(H713_PWM_CLK_GATE), readl(H713_PWM_ENABLE),
+	       cnt_a, cnt_b);
+
+	/* Check this channel's bit, not the register being nonzero. */
+	if (!(readl(H713_PWM_ENABLE) & BIT(ch)))
+		printf("H713 backlight: PWM%u enable bit did not stick -- the "
 		       "block is not accepting writes, so this step says "
-		       "nothing about the panel\n");
+		       "nothing about the panel\n", ch);
+	if (cnt_a == cnt_b)
+		printf("H713 backlight: PWM%u counter is static -- the channel "
+		       "is configured but not running, so this step says "
+		       "nothing about the panel\n", ch);
 }
 
 
@@ -7508,10 +7572,13 @@ static void h713_disp_backlight_sweep(void)
 	static const u8 duty[] = { 100, 75, 50, 25, 0, 100 };
 	uint i;
 
-	printf("H713 backlight: full-white field, stepping PWM2 duty. Watch the "
-	       "panel continuously -- if brightness tracks these steps, the "
-	       "parked \"PB4 is not the control\" result was taken against a "
-	       "panel that had never been initialised.\n");
+	printf("H713 backlight: full-white field, stepping PWM2 duty on PB4 "
+	       "mux 3. Each step prints CNT twice; if those two values differ "
+	       "the channel is genuinely running, and the panel's response (or "
+	       "lack of one) is evidence about the panel rather than about this "
+	       "code. As of 2026-08-05 the counter runs, the duty steps, and "
+	       "brightness does not change -- put a DMM on PB4 to find out "
+	       "whether the waveform actually reaches the pad.\n");
 
 	h713_disp_fill_solid(0xffffffff);
 	h713_disp_commit_osd_frame();
