@@ -5774,6 +5774,68 @@ static void h713_disp_pwm_bus_enable(void)
 	udelay(20);
 }
 
+/*
+ * Modulate the light's supply enable on PB5 by hand.
+ *
+ * PB5 has no PWM function in this SoC's pinmux -- gpio_in/gpio_out only -- so
+ * toggling is the only way to modulate it. That is worth doing because the
+ * light is not fed a raw rail: the LED header measures 52.6 V against a 36 V
+ * input, so a boost converter sits between them, and PWM-on-enable is a
+ * standard dimming technique for LED boost drivers. If this converter honours
+ * it, brightness control needs no new hardware at all.
+ *
+ * Shell loops cannot test this. A recursive "run" gives a duty set by command
+ * dispatch time (roughly 90% on) at an uncontrolled frequency, which is why
+ * bit-banging from the prompt showed nothing.
+ *
+ * Bounded by construction: it runs for a fixed time and always restores PB5
+ * high on exit. Ctrl-C aborts a command, not a loop, so a U-Boot experiment
+ * that cannot end by itself is one power cycle away from being a nuisance.
+ *
+ * PB5 is shared with fan power. Low duty slows the fan, so prefer short runs
+ * and start high; the light being off for the same period makes this thermally
+ * safe, but a stalled fan is still worth avoiding.
+ */
+static void h713_disp_bl_gpio_pwm(uint freq_hz, uint duty_pct, uint secs)
+{
+	ulong period_us, hi_us, lo_us, cycles, i;
+
+	if (freq_hz < 1 || freq_hz > 20000) {
+		printf("bl-gpio: frequency %u out of range (1..20000 Hz)\n",
+		       freq_hz);
+		return;
+	}
+	if (duty_pct > 100)
+		duty_pct = 100;
+	if (secs < 1 || secs > 30)
+		secs = 3;
+
+	period_us = 1000000UL / freq_hz;
+	hi_us = period_us * duty_pct / 100;
+	lo_us = period_us - hi_us;
+	cycles = (ulong)freq_hz * secs;
+
+	printf("bl-gpio: PB5 %u Hz %u%% for %u s (%lu us high, %lu us low)\n",
+	       freq_hz, duty_pct, secs, hi_us, lo_us);
+
+	sunxi_gpio_set_cfgpin(SUNXI_GPB(5), SUNXI_GPIO_OUTPUT);
+
+	for (i = 0; i < cycles; i++) {
+		if (hi_us) {
+			setbits_le32((void *)H713_PB_DATA, BIT(5));
+			udelay(hi_us);
+		}
+		if (lo_us) {
+			clrbits_le32((void *)H713_PB_DATA, BIT(5));
+			udelay(lo_us);
+		}
+	}
+
+	/* Never leave the fan/backlight interlock deasserted. */
+	setbits_le32((void *)H713_PB_DATA, BIT(5));
+	printf("bl-gpio: done, PB5 restored high\n");
+}
+
 static void h713_disp_backlight_set(uint percent)
 {
 	const uint ch = H713_BL_PWM_CH;
@@ -9861,6 +9923,13 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		return h713_disp_comm_state() ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 
+	if (argc == 5 && !strcmp(argv[1], "bl-gpio")) {
+		h713_disp_bl_gpio_pwm(dectoul(argv[2], NULL),
+				      dectoul(argv[3], NULL),
+				      dectoul(argv[4], NULL));
+		return CMD_RET_SUCCESS;
+	}
+
 	if ((argc == 3 || argc == 4) && !strcmp(argv[1], "init")) {
 		u32 project = hextoul(argv[2], NULL);
 		bool noboot  = argc == 4 && !strcmp(argv[3], "noboot");
@@ -10134,6 +10203,9 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "                                      fb-fix: pattern at the natural 1280, sweep for the register that unshears it\n"
 	   "                                      fb-band: solid fill, screen offset registers for the ~110px left band\n"
 	   "                                      bl-sweep: white field, step PWM2/PB4 duty 100..0 (the stock dimmer)\n"
+	   "h713_disp bl-gpio <hz> <duty%> <secs> - bit-bang PB5, the light's supply enable, to test whether the\n"
+	   "                                      on-board boost converter dims on PWM-of-enable. Self-terminating;\n"
+	   "                                      always restores PB5 high. PB5 also powers the fan: keep runs short.\n"
 	   "                                      vendor-logo-chroma: the stock logo, lit->red unlit->blue (it is pure grey, which this path cannot show)\n"
 	   "                                      vendor-logo-late: alias of vendor-logo-chroma; loading late is now the default\n"
 	   "                                      vendor-logo-early: loads before the display sequence -- known broken, kept to chase why\n"
