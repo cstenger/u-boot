@@ -10,6 +10,7 @@
 
 #include <command.h>
 #include <bmp_layout.h>
+#include <console.h>
 #include <cpu_func.h>
 #include <fs.h>
 #include <linux/delay.h>
@@ -6841,11 +6842,23 @@ static void h713_disp_quiesce_mips_owner(void)
  * AFBD ready bit may self-clear after the raster accepts it, so the readback
  * is diagnostic rather than an error check.
  */
-static void h713_disp_commit_osd_frame(void)
+struct h713_disp_commit_stat {
+	u32  pending, cleared, done;
+	uint wait_us;
+	bool completed;		/* BIT(1) observed before the timeout */
+};
+
+/*
+ * The silent half, so a caller committing hundreds of frames is not really
+ * measuring the console. One printf of the line below is ~130 bytes, which at
+ * 115200 baud is ~11 ms -- comparable to a whole frame at 59.71 Hz, so printing
+ * per commit would dominate exactly the timing an animation is trying to
+ * measure. h713_disp_anim_run() reports aggregates instead.
+ */
+static void h713_disp_commit_osd_frame_quiet(struct h713_disp_commit_stat *st)
 {
 	u32 ctrl = readl(H713_DISP_AFBD_CTRL_REG);
 	u32 pending = readl(H713_DISP_AFBD_STATUS_REG);
-	u32 cleared;
 	u32 done;
 	uint wait_us;
 
@@ -6857,7 +6870,8 @@ static void h713_disp_commit_osd_frame(void)
 	 */
 	if (pending)
 		writel(pending, H713_DISP_AFBD_STATUS_REG);
-	cleared = readl(H713_DISP_AFBD_STATUS_REG);
+	st->pending = pending;
+	st->cleared = readl(H713_DISP_AFBD_STATUS_REG);
 
 	writel(ctrl | BIT(0), H713_DISP_AFBD_CTRL_REG);
 	writel(1, H713_DISP_AFBD_READY_REG);
@@ -6869,11 +6883,20 @@ static void h713_disp_commit_osd_frame(void)
 			break;
 		udelay(100);
 	}
-	done = readl(H713_DISP_AFBD_STATUS_REG);
+	st->done = readl(H713_DISP_AFBD_STATUS_REG);
+	st->wait_us = wait_us;
+	st->completed = !!(st->done & BIT(1));
+}
+
+static void h713_disp_commit_osd_frame(void)
+{
+	struct h713_disp_commit_stat st;
+
+	h713_disp_commit_osd_frame_quiet(&st);
 
 	printf("H713 panel: frame commit irq=%08x->%08x->%08x wait=%uus "
 	       "AFBD-ctrl=%08x ready=%08x OSD=%08x scan=%08x\n",
-	       pending, cleared, done, wait_us,
+	       st.pending, st.cleared, st.done, st.wait_us,
 	       readl(H713_DISP_AFBD_CTRL_REG),
 	       readl(H713_DISP_AFBD_READY_REG),
 	       readl(H713_DISP_OSD_CTRL_REG),
@@ -7467,6 +7490,168 @@ static void h713_disp_fill_edge(u32 pitch)
 		fb[i] = (i % pitch) < pitch / 2 ? 0xffff0000 : 0xff0000ff;
 
 	flush_cache(H713_DISP_OSD_FB_ADDR, total * sizeof(u32));
+}
+
+/*
+ * The animated test signal: one red bar on blue, moving left to right.
+ *
+ * Everything rendered in this bring-up so far has been a single frame held
+ * still, so sustained commits, frame timing and liveness are all untested.
+ * h713_disp_commit_osd_frame() hand-manages what stock does in an IRQ handler,
+ * and at most six chained commits had ever been exercised before this existed.
+ *
+ * Deliberately not decoded video. A decoder brings its own buffers, format
+ * conversion and timing, so a stall would have five candidate causes instead of
+ * one -- and this bring-up has already spent days modelling a symptom measured
+ * downstream of a fault as a fault of its own. Video is the integration test
+ * once this passes, and this becomes the reference DECD is scored against.
+ *
+ * Chroma, not luminance: the optical path normalises luminance away, which is
+ * why every photographable signal here is red against blue.
+ *
+ * The bar's position encodes the frame number. x = (frame * STEP) mod WIDTH, so
+ * a photograph gives frame mod (WIDTH / STEP) = mod 80, and the console prints
+ * the committed count. If the predicted x and the photographed x agree, the
+ * panel is showing the frame the ARM believes it committed -- which is the
+ * whole point, and is not something a static frame can establish.
+ */
+#define H713_DISP_ANIM_BAR_PX		64
+#define H713_DISP_ANIM_STEP_PX		16
+#define H713_DISP_ANIM_FRAMES		600
+#define H713_DISP_ANIM_REPORT		60
+
+static void h713_disp_fill_bar(u32 x)
+{
+	u32 *fb = (u32 *)H713_DISP_OSD_FB_ADDR;
+	/*
+	 * Same reasoning as h713_disp_fill_edge(): cover the whole span the
+	 * hardware may walk, not width * height, so no row ever fetches
+	 * unwritten memory.
+	 */
+	u32 total = H713_DISP_EDGE_SPAN_WORDS;
+	u32 row, i;
+
+	for (i = 0; i < total; i++)
+		fb[i] = 0xff0000ff;
+
+	/*
+	 * Row-addressed, which is only legitimate because S = V is settled:
+	 * 0x05600170 is a plain byte stride and the layer X origin is 0, so row
+	 * r begins at word r * 1280. Do not combine this mode with a stride
+	 * override -- the bar would shear and the position would stop meaning
+	 * the frame number.
+	 */
+	for (row = 0; row < H713_DISP_OSD_HEIGHT; row++) {
+		u32 base = row * H713_DISP_OSD_WIDTH;
+		u32 k;
+
+		for (k = 0; k < H713_DISP_ANIM_BAR_PX; k++)
+			fb[base + (x + k) % H713_DISP_OSD_WIDTH] = 0xffff0000;
+	}
+
+	flush_cache(H713_DISP_OSD_FB_ADDR, total * sizeof(u32));
+}
+
+static void h713_disp_anim_run(u32 frames)
+{
+	struct h713_disp_commit_stat st;
+	u32 f, x = 0, completed = 0, timeouts = 0, first_timeout = 0;
+	u64 wait_sum = 0, fill_sum = 0;
+	uint wait_min = ~0U, wait_max = 0, fill_min = ~0U, fill_max = 0;
+	ulong t_start, t_end;
+	bool stopped = false;
+
+	if (!frames)
+		frames = H713_DISP_ANIM_FRAMES;
+
+	printf("H713 anim: %u frames, %u px bar stepping %u px/frame, wrapping "
+	       "every %u frames.\n"
+	       "H713 anim: SMOOTH MOTION means sustained commits work. A STALL "
+	       "after k frames localises the handshake break -- the frame number "
+	       "is reported. TEARING shows as a horizontal discontinuity in the "
+	       "bar. Ctrl-C stops.\n",
+	       frames, H713_DISP_ANIM_BAR_PX, H713_DISP_ANIM_STEP_PX,
+	       H713_DISP_OSD_WIDTH / H713_DISP_ANIM_STEP_PX);
+
+	t_start = timer_get_us();
+
+	for (f = 0; f < frames; f++) {
+		ulong t0;
+		uint fill_us;
+
+		x = (f * H713_DISP_ANIM_STEP_PX) % H713_DISP_OSD_WIDTH;
+
+		t0 = timer_get_us();
+		h713_disp_fill_bar(x);
+		fill_us = (uint)(timer_get_us() - t0);
+
+		h713_disp_commit_osd_frame_quiet(&st);
+
+		fill_sum += fill_us;
+		if (fill_us < fill_min)
+			fill_min = fill_us;
+		if (fill_us > fill_max)
+			fill_max = fill_us;
+
+		wait_sum += st.wait_us;
+		if (st.wait_us < wait_min)
+			wait_min = st.wait_us;
+		if (st.wait_us > wait_max)
+			wait_max = st.wait_us;
+
+		if (st.completed) {
+			completed++;
+		} else {
+			/*
+			 * Report the first one immediately and keep going:
+			 * whether it recovers or stays wedged is the actual
+			 * diagnostic, and stopping here would discard it.
+			 */
+			if (!timeouts++) {
+				first_timeout = f;
+				printf("H713 anim: FIRST COMMIT TIMEOUT at "
+				       "frame %u (irq=%08x->%08x->%08x, waited "
+				       "%u us). Continuing to see whether it "
+				       "recovers.\n", f, st.pending, st.cleared,
+				       st.done, st.wait_us);
+			}
+		}
+
+		if (f && !(f % H713_DISP_ANIM_REPORT))
+			printf("H713 anim: frame %u, bar x=%u, committed %u, "
+			       "timeouts %u, last wait %u us, fill %u us\n",
+			       f, x, completed, timeouts, st.wait_us, fill_us);
+
+		if (ctrlc()) {
+			printf("H713 anim: interrupted at frame %u\n", f);
+			frames = f + 1;
+			stopped = true;
+			break;
+		}
+	}
+
+	t_end = timer_get_us();
+
+	printf("H713 anim: %s after %u frame(s) in %lu ms\n",
+	       stopped ? "STOPPED" : "complete", frames,
+	       (t_end - t_start) / 1000);
+	printf("H713 anim: committed %u, timeouts %u%s\n",
+	       completed, timeouts, timeouts ? "" : " -- sustained commits OK");
+	if (timeouts)
+		printf("H713 anim: first timeout was frame %u; %u of %u frames "
+		       "completed, so the handshake %s\n", first_timeout,
+		       completed, frames,
+		       completed > first_timeout ? "recovered at least once" :
+		       "did not recover -- suspect the missing ARM IRQ handler");
+	printf("H713 anim: commit wait min/mean/max %u/%lu/%u us; "
+	       "fill min/mean/max %u/%lu/%u us\n",
+	       wait_min, (ulong)(wait_sum / frames), wait_max,
+	       fill_min, (ulong)(fill_sum / frames), fill_max);
+	printf("H713 anim: PHOTOGRAPH NOW. Final bar x=%u (frame %u mod %u = "
+	       "%u). If the bar is not there, the panel is not showing the "
+	       "frame the ARM committed.\n",
+	       x, frames - 1, H713_DISP_OSD_WIDTH / H713_DISP_ANIM_STEP_PX,
+	       (frames - 1) % (H713_DISP_OSD_WIDTH / H713_DISP_ANIM_STEP_PX));
 }
 
 static void h713_disp_edge_sweep(const u16 *list, uint count)
@@ -9438,7 +9623,7 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 				bool pitch_low, bool edge, bool edge_fine,
 				bool stride, bool stride_fix, bool band,
 				bool bl_sweep, bool vendor_early,
-				u32 stride_override)
+				u32 stride_override, bool anim, u32 anim_frames)
 {
 	int ret;
 
@@ -9628,7 +9813,9 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 	 */
 	h713_disp_clear_layer_xoff("after the DE replay");
 
-	if (bl_sweep) {
+	if (anim) {
+		h713_disp_anim_run(anim_frames);
+	} else if (bl_sweep) {
 		h713_disp_backlight_sweep();
 	} else if (band) {
 		h713_disp_band_sweep();
@@ -10002,7 +10189,16 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		 * testable against any mode without a rebuild.
 		 */
 		const char *mode = argc >= 4 ? argv[3] : "";
-		u32 stride_override = argc == 5 ?
+		bool anim = !strcmp(mode, "fb-anim");
+		/*
+		 * fb-anim takes a decimal frame count in the same slot. A
+		 * stride override would shear the bar and break the position ->
+		 * frame-number encoding, so the two are mutually exclusive by
+		 * construction rather than by a warning nobody reads.
+		 */
+		u32 anim_frames = (anim && argc == 5) ?
+				   dectoul(argv[4], NULL) : 0;
+		u32 stride_override = (!anim && argc == 5) ?
 				       hextoul(argv[4], NULL) : 0;
 		bool noboot = !strcmp(mode, "noboot");
 		bool full   = !strcmp(mode, "full");
@@ -10051,7 +10247,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		    !tcon_solid && !tcon_solid_native && !tcon_dclk &&
 		    !tcon_solid_dclk_normal && !tcon_chroma && !tcon_chroma_62m &&
 		    !tcon_nsweep && !tcon_nsweep_hi && !hbands && !grid && !quads && !vbands && !pitch && !pitch_wide && !hbp && !pitch_low && !edge && !edge_fine && !stride && !stride_fix && !band &&
-		    !bl_sweep)
+		    !bl_sweep && !anim)
 			return CMD_RET_USAGE;
 		return h713_disp_panel_test(hextoul(argv[2], NULL), !noboot,
 					    full,
@@ -10060,7 +10256,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    tcon_solid || tcon_solid_native ||
 					    tcon_dclk || tcon_solid_dclk_normal ||
 					    tcon_chroma || tcon_chroma_62m ||
-					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads || vbands || pitch || pitch_wide || hbp || pitch_low || edge || edge_fine || stride || stride_fix || band || bl_sweep,
+					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads || vbands || pitch || pitch_wide || hbp || pitch_low || edge || edge_fine || stride || stride_fix || band || bl_sweep || anim,
 					    vendor_logo, vendor_chroma, plane_gate,
 					    hbp ? 16 :
 					    tcon_nsweep_hi ? 15 :
@@ -10073,7 +10269,8 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    tcon_checker_mono ? 1 :
 					    tcon_checker ? 8 : 0,
 					    tcon_solid_native, hbands, grid, quads, vbands, pitch, pitch_wide, hbp, pitch_low, edge, edge_fine, stride, stride_fix, band,
-					    bl_sweep, vendor_early, stride_override) ?
+					    bl_sweep, vendor_early, stride_override,
+				    anim, anim_frames) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
@@ -10209,6 +10406,8 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "                                      fb-fix: pattern at the natural 1280, sweep for the register that unshears it\n"
 	   "                                      fb-band: solid fill, screen offset registers for the ~110px left band\n"
 	   "                                      bl-sweep: white field, step PWM2/PB4 duty 100..0 (the stock dimmer)\n"
+	   "                                      fb-anim: moving red bar on blue -- the ONLY test of sustained commits\n"
+	   "                                               argv[5] is a decimal frame count (default 600); Ctrl-C stops\n"
 	   "h713_disp bl-gpio <hz> <duty%> <secs> - bit-bang PB5, the light's supply enable, to test whether the\n"
 	   "                                      on-board boost converter dims on PWM-of-enable. Self-terminating;\n"
 	   "                                      always restores PB5 high. PB5 also powers the fan: keep runs short.\n"
