@@ -5942,19 +5942,29 @@ static void h713_disp_teardown(const char *why)
 	printf("H713 teardown: %s\n", why);
 
 	/*
-	 * 0. Acquire the display clocks before touching a display register.
+	 * 0. Make the display blocks reachable before touching one.
 	 *
-	 * Straight from the vendor, whose shutdown log reads "ge2d: acquire
-	 * tvdisp clock on emergency shutdown" -- it turns the display clock ON
-	 * in order to turn the display off. Step 1 below READS the AFBD control
+	 * The idea is the vendor's -- its shutdown log reads "ge2d: acquire
+	 * tvdisp clock on emergency shutdown", turning the display clock ON in
+	 * order to turn the display off. Step 1 below READS the AFBD control
 	 * register, and those blocks wedge the interconnect when read gated, so
-	 * without this teardown could only run after a completed sequence and
-	 * had to refuse otherwise. With it, teardown works from any state.
+	 * without this teardown could only run after a completed sequence.
 	 *
-	 * Idempotent and CCU-only, so it costs two delays on the common path
-	 * where everything is already running.
+	 * The clocks alone are NOT enough, which cost a hang on 2026-08-07:
+	 * h713_display_clocks_on() ran, and the very next AFBD read still took
+	 * the board. h713_display_prepare()'s own comment says why -- "the
+	 * initial SPL values open only part of the display fabric" -- so the
+	 * TVTOP routing at 0x05700000 is part of what makes these blocks
+	 * reachable, not merely part of configuring them.
+	 *
+	 * So call the whole of prepare(). It is not a guess: every normal run
+	 * calls it cold before any display access, so it is the one primitive
+	 * proven safe from this exact state. Only when the sequence has not
+	 * run -- on the warm path everything is already up and re-running it
+	 * would churn TVTOP and the mixer for nothing.
 	 */
-	h713_display_clocks_on();
+	if (!h713_disp_configured)
+		h713_display_prepare();
 
 	/* 1. Stop scanout before anything downstream of it goes away. */
 	ctrl = readl(H713_DISP_AFBD_CTRL_REG);
