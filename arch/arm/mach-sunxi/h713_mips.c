@@ -6026,6 +6026,31 @@ static int h713_disp_fail(int ret)
 	return ret;
 }
 
+/*
+ * Refuse a cold read of the display blocks rather than hang the board.
+ *
+ * h713_disp_dump has always done this; scanrate, regscan and clkfind never did,
+ * and "h713_disp scanrate" on a cold boot wedged the board on 2026-08-07 --
+ * h713_disp_scan_rate() reads 0x05880000 three times and that block is gated
+ * until the sequence runs.
+ *
+ * Deliberately a refusal and not the ungate that teardown got. Teardown has
+ * real work to do cold: drop the rails, park the MIPS. These three only
+ * *measure*, and every one of them measures something driven by the display
+ * PLL -- so with the clocks merely ungated and no sequence run they would
+ * return a confident number that means nothing. A refusal is the honest answer.
+ */
+static bool h713_disp_readable(const char *what)
+{
+	if (h713_disp_configured)
+		return true;
+
+	printf("H713 disp: display not configured this boot -- %s reads blocks "
+	       "that are still gated, and would hang.\n"
+	       "           run 'panel-test' or 'init' first\n", what);
+	return false;
+}
+
 
 
 /*
@@ -10287,6 +10312,10 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 	if ((argc == 2 || argc == 3) && !strcmp(argv[1], "clkfind")) {
 		int which = argc == 3 ? (int)dectoul(argv[2], NULL) : -1;
 
+		/* Perturbs a clock and watches the display witness to score it. */
+		if (!h713_disp_readable("clkfind"))
+			return CMD_RET_FAILURE;
+
 		return h713_disp_clk_find(which) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
@@ -10302,14 +10331,25 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		return CMD_RET_SUCCESS;
 	}
 
-	if (argc == 2 && !strcmp(argv[1], "scanrate"))
+	if (argc == 2 && !strcmp(argv[1], "scanrate")) {
+		if (!h713_disp_readable("scanrate"))
+			return CMD_RET_FAILURE;
 		return h713_disp_scan_rate() ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
+	}
 
 	if ((argc >= 2 && argc <= 4) && !strcmp(argv[1], "regscan")) {
 		ulong base = argc >= 3 ? hextoul(argv[2], NULL) : 0x05880000UL;
 		uint words = argc >= 4 ? dectoul(argv[3], NULL) : 32;
 
+		/*
+		 * Only the display window needs the guard; regscan is happy to
+		 * walk the CCU or anything else cold, and refusing that would
+		 * take away a diagnostic that works.
+		 */
+		if (base >= 0x05000000UL && base < 0x06000000UL &&
+		    !h713_disp_readable("regscan of the display window"))
+			return CMD_RET_FAILURE;
 		return h713_disp_reg_scan(base, words) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
