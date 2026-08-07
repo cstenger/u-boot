@@ -5962,6 +5962,46 @@ static void h713_disp_teardown(const char *why)
 	       readl(H713_MIPS_RESET_REG));
 }
 
+/*
+ * The one place a failed display run cleans up after itself.
+ *
+ * Every error path in h713_disp_panel_test, h713_disp_init_only and
+ * h713_disp_test used to be a bare "return ret", leaving the panel powered and
+ * the MIPS live. Not hypothetical: it is exactly what vendor-logo-late did when
+ * its bootlogo hash refusal fired, and the next run then initialised into a
+ * half-torn-down state and came back dark with a console that looked perfect.
+ *
+ * Deliberately a shared failure handler rather than the single "goto out" the
+ * plan called for, because SUCCESS must not tear down. panel-test leaving the
+ * display up is load-bearing: it is what lets "panel-test ... ; boot" hand a
+ * live frame to Linux, which is how the handoff was verified on 2026-08-07.
+ * A single exit covering both would have silently broken that, and the same
+ * applies to init_only, whose whole purpose is to leave the display up for
+ * scanrate/regscan/clkfind.
+ *
+ * The guard is not caution, it is a hang. h713_disp_teardown() opens by reading
+ * the AFBD control register, and these blocks are gated until the sequence
+ * completes -- reading them cold stalls the interconnect and hangs the board,
+ * which is why h713_disp_dump refuses to do the same thing without "force".
+ * h713_disp_configured goes true at the end of h713_disp_run(), so a failure
+ * before that point cannot be cleaned up this way and says so instead of
+ * wedging the board.
+ */
+static int h713_disp_fail(int ret)
+{
+	if (h713_disp_configured) {
+		h713_disp_teardown("run failed, tearing down");
+	} else {
+		printf("H713 disp: run failed (%d) before the display sequence "
+		       "completed.\n"
+		       "           NOT tearing down: those blocks are still "
+		       "gated and reading them would hang the board.\n"
+		       "           Power-cycle if the panel is lit.\n", ret);
+	}
+	return ret;
+}
+
+
 
 /*
  * The measured fetch stride, from test_30: the edge sweep's five photographed
@@ -9675,12 +9715,12 @@ static int h713_disp_init_only(u32 project, bool release_mips, bool quiesce)
 
 	ret = h713_disp_load(project);
 	if (ret)
-		return ret;
+		return h713_disp_fail(ret);
 
 	ret = h713_disp_run(H713_DISP_LOGO_ADDR, project, true, true, false,
 			    false, false, true, release_mips);
 	if (ret)
-		return ret;
+		return h713_disp_fail(ret);
 
 	if (quiesce) {
 		h713_disp_quiesce_mips_owner();
@@ -9737,7 +9777,7 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 
 	ret = h713_disp_load(project);
 	if (ret)
-		return ret;
+		return h713_disp_fail(ret);
 
 	/*
 	 * Load the logo AFTER the display sequence, not before it.
@@ -9763,14 +9803,14 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 	if (vendor_logo && vendor_early) {
 		ret = h713_disp_publish_vendor_bootlogo(true, vendor_chroma);
 		if (ret)
-			return ret;
+			return h713_disp_fail(ret);
 	} else {
 		h713_disp_fill_pattern(0);
 	}
 	ret = h713_disp_run(H713_DISP_LOGO_ADDR, project, true, true, false,
 			    false, false, true, release_mips);
 	if (ret)
-		return ret;
+		return h713_disp_fail(ret);
 
 	if (quiesce) {
 		h713_disp_quiesce_mips_owner();
@@ -9851,7 +9891,7 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 
 		ret = h713_disp_reassert_osd(H713_DISP_LOGO_ADDR, project);
 		if (ret)
-			return ret;
+			return h713_disp_fail(ret);
 
 		writel(phy14, 0x051c0014);
 		writel(phy28, 0x051c0028);
@@ -9976,7 +10016,7 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		ret = h713_disp_publish_vendor_bootlogo(!vendor_early,
 						       vendor_chroma);
 		if (ret)
-			return ret;
+			return h713_disp_fail(ret);
 		h713_disp_chroma_marker(2);
 		/* Bounds measured from the file: rows 343..378, cols 368..912. */
 		h713_disp_verify_fb(343, 378, 368, 912, vendor_chroma);
@@ -10048,6 +10088,7 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 
 	printf("H713 panel: pattern test complete\n");
 	return 0;
+
 }
 
 /*
@@ -10074,7 +10115,7 @@ static int h713_disp_test(u32 project, u32 source_id, u32 level, u32 mode)
 
 	ret = h713_disp_load(project);
 	if (ret)
-		return ret;
+		return h713_disp_fail(ret);
 
 	printf("H713 disp: config patches\n");
 	h713_cfg_set(H713_CFG_OFF_SOURCE_ID, '0' + source_id, "source_id");
@@ -10085,7 +10126,7 @@ static int h713_disp_test(u32 project, u32 source_id, u32 level, u32 mode)
 	ret = h713_disp_run(H713_DISP_LOGO_ADDR, project, false, false, false,
 			    false, false, false, true);
 	if (ret)
-		return ret;
+		return h713_disp_fail(ret);
 
 	h713_disp_sample();
 
@@ -10226,6 +10267,24 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 	}
 
 	if (argc == 2 && !strcmp(argv[1], "teardown")) {
+		/*
+		 * Refuse on a cold boot rather than hang. This reads the AFBD
+		 * block first thing, and these blocks are gated until the
+		 * sequence has run -- reading them cold stalls the interconnect
+		 * and takes the board with it. h713_disp_dump has refused the
+		 * same thing for the same reason; this path never did, so
+		 * typing "h713_disp teardown" after a reset was a silent way to
+		 * lose the board.
+		 *
+		 * h713_disp_configured is never cleared, so teardown-twice
+		 * still works, which is the documented way to prove it.
+		 */
+		if (!h713_disp_configured) {
+			printf("H713 disp: display not configured this boot -- "
+			       "tearing down now would hang.\n"
+			       "           run panel-test or init first\n");
+			return CMD_RET_FAILURE;
+		}
 		h713_disp_teardown("requested from the prompt");
 		return CMD_RET_SUCCESS;
 	}
