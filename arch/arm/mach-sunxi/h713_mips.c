@@ -4558,6 +4558,26 @@ static const struct h713_panel_cfg h713_panel_cfg_board_b = {
 	.hbp = 40, .vbp = 20, .width = 1280,
 };
 
+/*
+ * This board's project ID, and it comes from the same panel_config.ini the
+ * struct above transcribes: "ProjectID = 52", which is 0x34.
+ *
+ * Bring-up ran 0x33 throughout, on no evidence. Stock's own log settles it --
+ * "Project id:0x34 version:25-1-6-3", then mips/ProjectID_0x0034.TSE -- so the
+ * config file and the running firmware agree, and 0x33 was a guess.
+ *
+ * It is a guess that cost nothing, which was checked rather than assumed: an
+ * A/B on 2026-08-06 found 0x33 and 0x34 select the same prologue and timing
+ * blocks, differing only in the DE block, and there only in 0x0525c038 once our
+ * patch table has run. The panel is indistinguishable. So every 0x33 result
+ * stands; see docs/mips-display-recovery.md.
+ *
+ * Prefer this for new work anyway. That equivalence covers the ARM's
+ * LogoRegData replay, and the ProjectID_*.TSE payloads -- which differ by 2688
+ * bytes and feed the MIPS -- are not exercised by any test we have.
+ */
+#define H713_DISP_BOARD_PROJECT_ID	0x34
+
 struct h713_panel_patch {
 	u32 reg;
 	u8  shift;
@@ -5169,6 +5189,16 @@ static int h713_disp_run(ulong blob, u32 project, bool skip_hdcp_wait,
 	printf("H713 disp: project 0x%02x -> prologue %u, timing %u, de %u\n",
 	       sel.project, sel.prologue, sel.timing, sel.de);
 
+	/*
+	 * Say so rather than silently obeying. This board declares 0x34 in both
+	 * panel_config.ini and stock's own log, and the whole bring-up ran 0x33
+	 * without anything noticing.
+	 */
+	if (project != H713_DISP_BOARD_PROJECT_ID)
+		printf("H713 disp: note: this board declares project 0x%02x "
+		       "(panel_config.ini ProjectID = 52)\n",
+		       H713_DISP_BOARD_PROJECT_ID);
+
 	ret = h713_disp_panel_patch(blob, &sel);
 	if (ret)
 		return ret;
@@ -5415,11 +5445,33 @@ static int h713_disp_read(const char *path, ulong addr, loff_t *len)
 	return 0;
 }
 
-/* The TSE window takes the vendor databases concatenated, project file last. */
+/*
+ * The TSE window takes the vendor databases concatenated, project file last.
+ *
+ * The order is stock's, read off its own fastlogo log rather than guessed:
+ * database.TSE (0x44f60) to 0x4be41000, pq_custom.TSE (0x3aa8) to 0x4be85f60,
+ * projecttable.TSE (0x568) to 0x4be89a08, then ProjectID_0x0034.TSE (0x4398)
+ * to 0x4be89f70 -- each address being the previous one plus its size, which is
+ * what pins the sequence.
+ *
+ * This used to read database, projecttable, ProjectID, pq_custom, so the
+ * comment above described stock while the code did something else.
+ *
+ * That was not harmless. Putting the variable-sized project file third moved
+ * every blob after it: pq_custom landed at 0x4be8b2e0 under project 0x33 and
+ * 0x4be8a860 under 0x34, differing by the 0xa80 the two ProjectID files differ
+ * by. Stock's order keeps the fixed-size databases at stable addresses and
+ * lets only the last file move. The firmware noticed -- its own allocations at
+ * afbd-mux +0x20 tracked the placement, and returned to their project-0x33
+ * values once this matched stock. The display rendered correctly throughout,
+ * so this was a latent divergence rather than a bug, but "the blobs are
+ * self-describing so order cannot matter" was wrong.
+ */
 static int h713_disp_load_tse(u32 project)
 {
 	static const char *const fixed[] = {
-		"mips/database.TSE", "mips/projecttable.TSE",
+		"mips/database.TSE", "mips/pq_custom.TSE",
+		"mips/projecttable.TSE",
 	};
 	char pid[40];
 	ulong addr = H713_MIPS_TSE_ADDR;
@@ -5437,11 +5489,6 @@ static int h713_disp_load_tse(u32 project)
 
 	snprintf(pid, sizeof(pid), "mips/ProjectID_0x%04x.TSE", project);
 	ret = h713_disp_read(pid, addr, &len);
-	if (ret)
-		return ret;
-	addr += len;
-
-	ret = h713_disp_read("mips/pq_custom.TSE", addr, &len);
 	if (ret)
 		return ret;
 	addr += len;
@@ -10027,6 +10074,8 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 
 U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "run stock's fastlogo display sequence for a project ID",
+	   "this board's project ID is 0x34 (panel_config.ini ProjectID = 52, and\n"
+	   "stock's own log); 0x33 renders identically but prefer 0x34 for new work\n"
 	   "test <project-id> [source] [level] [mode] - load, patch, run, sample, log\n"
 	   "                                      level 0..5 (ASSERT..VERBOSE), default 3\n"
 	   "                                      mode 0=sync 1=async 2=buf, default 2\n"
