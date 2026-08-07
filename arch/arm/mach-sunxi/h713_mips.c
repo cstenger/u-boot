@@ -2371,16 +2371,30 @@ static void h713_mips_stop(void)
 	h713_display_prepared = false;
 }
 
-static void h713_display_prepare(void)
+/*
+ * Make the display blocks safe to touch. Nothing else.
+ *
+ * SPL leaves the display bus clock/reset enabled, but the module clocks and
+ * their video2 parent are gated. Accessing the mixer or LVDS blocks before
+ * enabling this complete tree wedges the interconnect.
+ *
+ * Preserve the cold-boot divider and mux fields. On the bench they yield
+ * deint/panel=150 MHz, svp-dtl=200 MHz, and afbd=600 MHz.
+ *
+ * Split out of h713_display_prepare() so teardown can use it, which is what the
+ * vendor does: its shutdown log reads
+ * "ge2d 5240000.ge2d: acquire tvdisp clock on emergency shutdown" -- it turns
+ * the display clock ON in order to turn the display off. That is the answer to
+ * a problem our teardown had: it opens by READING the AFBD control register,
+ * so it could only ever run when the sequence had already completed.
+ *
+ * Every register here is in the CCU at 0x02001xxx, which is always clocked, so
+ * this is safe to call from any state. The gated blocks are the 0x05xxxxxx
+ * ones, and this is what ungates them. setbits is idempotent, so calling it
+ * when the tree is already up costs two delays and changes nothing.
+ */
+static void h713_display_clocks_on(void)
 {
-	/*
-	 * SPL leaves the display bus clock/reset enabled, but the module clocks
-	 * and their video2 parent are gated. Accessing the mixer or LVDS blocks
-	 * before enabling this complete tree wedges the interconnect.
-	 *
-	 * Preserve the cold-boot divider and mux fields. On the bench they yield
-	 * deint/panel=150 MHz, svp-dtl=200 MHz, and afbd=600 MHz.
-	 */
 	setbits_le32((void *)H713_DISPLAY_PLL_VIDEO2_REG, BIT(31));
 	mdelay(12);
 	setbits_le32((void *)H713_DISPLAY_DEINT_CLK_REG, BIT(31));
@@ -2389,6 +2403,11 @@ static void h713_display_prepare(void)
 	setbits_le32((void *)H713_DISPLAY_AFBD_CLK_REG, BIT(31));
 	setbits_le32((void *)H713_DISPLAY_BGR_REG, BIT(16) | BIT(0));
 	mdelay(12);
+}
+
+static void h713_display_prepare(void)
+{
+	h713_display_clocks_on();
 
 	/*
 	 * Recovered 1080p TVTOP routing. These values were bench-verified before
@@ -5922,6 +5941,21 @@ static void h713_disp_teardown(const char *why)
 
 	printf("H713 teardown: %s\n", why);
 
+	/*
+	 * 0. Acquire the display clocks before touching a display register.
+	 *
+	 * Straight from the vendor, whose shutdown log reads "ge2d: acquire
+	 * tvdisp clock on emergency shutdown" -- it turns the display clock ON
+	 * in order to turn the display off. Step 1 below READS the AFBD control
+	 * register, and those blocks wedge the interconnect when read gated, so
+	 * without this teardown could only run after a completed sequence and
+	 * had to refuse otherwise. With it, teardown works from any state.
+	 *
+	 * Idempotent and CCU-only, so it costs two delays on the common path
+	 * where everything is already running.
+	 */
+	h713_display_clocks_on();
+
 	/* 1. Stop scanout before anything downstream of it goes away. */
 	ctrl = readl(H713_DISP_AFBD_CTRL_REG);
 	writel(ctrl & ~BIT(0), H713_DISP_AFBD_CTRL_REG);
@@ -5979,25 +6013,16 @@ static void h713_disp_teardown(const char *why)
  * applies to init_only, whose whole purpose is to leave the display up for
  * scanrate/regscan/clkfind.
  *
- * The guard is not caution, it is a hang. h713_disp_teardown() opens by reading
- * the AFBD control register, and these blocks are gated until the sequence
- * completes -- reading them cold stalls the interconnect and hangs the board,
- * which is why h713_disp_dump refuses to do the same thing without "force".
- * h713_disp_configured goes true at the end of h713_disp_run(), so a failure
- * before that point cannot be cleaned up this way and says so instead of
- * wedging the board.
+ * This used to be guarded on h713_disp_configured, because teardown opens by
+ * reading the AFBD control register and those blocks hang the interconnect when
+ * read gated -- so a failure before the sequence completed could not be cleaned
+ * up at all. h713_disp_teardown() now acquires the display clocks first, the
+ * way the vendor's own shutdown does, so it works from any state and the guard
+ * is gone.
  */
 static int h713_disp_fail(int ret)
 {
-	if (h713_disp_configured) {
-		h713_disp_teardown("run failed, tearing down");
-	} else {
-		printf("H713 disp: run failed (%d) before the display sequence "
-		       "completed.\n"
-		       "           NOT tearing down: those blocks are still "
-		       "gated and reading them would hang the board.\n"
-		       "           Power-cycle if the panel is lit.\n", ret);
-	}
+	h713_disp_teardown("run failed, tearing down");
 	return ret;
 }
 
@@ -10268,23 +10293,11 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 
 	if (argc == 2 && !strcmp(argv[1], "teardown")) {
 		/*
-		 * Refuse on a cold boot rather than hang. This reads the AFBD
-		 * block first thing, and these blocks are gated until the
-		 * sequence has run -- reading them cold stalls the interconnect
-		 * and takes the board with it. h713_disp_dump has refused the
-		 * same thing for the same reason; this path never did, so
-		 * typing "h713_disp teardown" after a reset was a silent way to
-		 * lose the board.
-		 *
-		 * h713_disp_configured is never cleared, so teardown-twice
-		 * still works, which is the documented way to prove it.
+		 * Safe from a cold boot: teardown acquires the display clocks
+		 * before it reads anything. Briefly guarded here instead, until
+		 * the vendor's "acquire tvdisp clock on emergency shutdown"
+		 * showed that ungating is the fix rather than refusing.
 		 */
-		if (!h713_disp_configured) {
-			printf("H713 disp: display not configured this boot -- "
-			       "tearing down now would hang.\n"
-			       "           run panel-test or init first\n");
-			return CMD_RET_FAILURE;
-		}
 		h713_disp_teardown("requested from the prompt");
 		return CMD_RET_SUCCESS;
 	}
