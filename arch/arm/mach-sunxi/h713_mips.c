@@ -5619,6 +5619,22 @@ static void h713_disp_sample(void)
 #define H713_DISP_AFBD_READY_REG	0x05600144UL
 #define H713_DISP_AFBD_STATUS_REG	0x05600168UL
 #define H713_DISP_AFBD_STRIDE_REG	0x05600170UL
+/*
+ * AFBD +0x38, the source address. DE block 5 writes 0x6c100000 here, and
+ * fb-anim proved AFBD streams from it live rather than latching the surface at
+ * submission -- so this register is the page-flip lever for double buffering.
+ */
+#define H713_DISP_AFBD_SRC_REG		0x05600178UL
+/*
+ * The back buffer, 4 MiB after the front. Each surface is
+ * H713_DISP_EDGE_SPAN_WORDS * 4 = 3916800 bytes, so 4 MiB apart is the next
+ * aligned slot that does not overlap, and the pair ends well below the vendor
+ * BMP staging area at 0x6d000000.
+ *
+ * patches/kernel/0024 reserves uboot-scanout@6c100000 and its size was raised
+ * from 0x400000 to 0x800000 to cover both. Keep those two in step.
+ */
+#define H713_DISP_OSD_FB_ADDR_B		0x6c500000UL
 
 /*
  * The panel's declared power-down timings, from panel_config.ini:
@@ -7520,9 +7536,9 @@ static void h713_disp_fill_edge(u32 pitch)
 #define H713_DISP_ANIM_FRAMES		600
 #define H713_DISP_ANIM_REPORT		60
 
-static void h713_disp_fill_bar(u32 x)
+static void h713_disp_fill_bar(u32 x, ulong addr)
 {
-	u32 *fb = (u32 *)H713_DISP_OSD_FB_ADDR;
+	u32 *fb = (u32 *)addr;
 	/*
 	 * Same reasoning as h713_disp_fill_edge(): cover the whole span the
 	 * hardware may walk, not width * height, so no row ever fetches
@@ -7549,43 +7565,83 @@ static void h713_disp_fill_bar(u32 x)
 			fb[base + (x + k) % H713_DISP_OSD_WIDTH] = 0xffff0000;
 	}
 
-	flush_cache(H713_DISP_OSD_FB_ADDR, total * sizeof(u32));
+	flush_cache(addr, total * sizeof(u32));
 }
 
-static void h713_disp_anim_run(u32 frames)
+/*
+ * Double buffering, added 2026-08-07 because fb-anim's first run tore.
+ *
+ * The single-buffered path rewrites the surface AFBD is streaming from, so the
+ * raster sees a half-updated frame -- the bar arrives broken during motion and
+ * whole once it stops. That same observation is what proves AFBD does not latch
+ * the surface at submission: a snapshotted frame could not tear afterwards.
+ *
+ * So write the frame the hardware is *not* showing, point 0x05600178 at it, and
+ * commit. Completion is vsync-locked (measured to 0.04% of a frame period), so
+ * the flip lands on a frame boundary.
+ *
+ * fb-anim keeps the single-buffered behaviour deliberately. It is the recorded
+ * baseline, and keeping it makes fb-anim vs fb-anim-db a one-variable A/B on the
+ * same instrument rather than a comparison against a remembered result.
+ */
+static void h713_disp_anim_run(u32 frames, bool double_buffered)
 {
 	struct h713_disp_commit_stat st;
 	u32 f, x = 0, completed = 0, timeouts = 0, first_timeout = 0;
 	u64 wait_sum = 0, fill_sum = 0;
 	uint wait_min = ~0U, wait_max = 0, fill_min = ~0U, fill_max = 0;
 	ulong t_start, t_end;
+	ulong front = H713_DISP_OSD_FB_ADDR;
 	bool stopped = false;
 
 	if (!frames)
 		frames = H713_DISP_ANIM_FRAMES;
 
 	printf("H713 anim: %u frames, %u px bar stepping %u px/frame, wrapping "
-	       "every %u frames.\n"
+	       "every %u frames, %s.\n"
 	       "H713 anim: SMOOTH MOTION means sustained commits work. A STALL "
 	       "after k frames localises the handshake break -- the frame number "
 	       "is reported. TEARING shows as a horizontal discontinuity in the "
 	       "bar. Ctrl-C stops.\n",
 	       frames, H713_DISP_ANIM_BAR_PX, H713_DISP_ANIM_STEP_PX,
-	       H713_DISP_OSD_WIDTH / H713_DISP_ANIM_STEP_PX);
+	       H713_DISP_OSD_WIDTH / H713_DISP_ANIM_STEP_PX,
+	       double_buffered ? "DOUBLE-buffered (expect no tear)" :
+				 "SINGLE-buffered (expect a tear)");
 
 	t_start = timer_get_us();
 
 	for (f = 0; f < frames; f++) {
 		ulong t0;
+		ulong target;
 		uint fill_us;
 
 		x = (f * H713_DISP_ANIM_STEP_PX) % H713_DISP_OSD_WIDTH;
 
+		/*
+		 * Single-buffered draws into the live surface, which is the
+		 * whole point of the baseline. Double-buffered draws into the
+		 * one the hardware is not reading.
+		 */
+		target = !double_buffered ? H713_DISP_OSD_FB_ADDR :
+			 front == H713_DISP_OSD_FB_ADDR ?
+			 H713_DISP_OSD_FB_ADDR_B : H713_DISP_OSD_FB_ADDR;
+
 		t0 = timer_get_us();
-		h713_disp_fill_bar(x);
+		h713_disp_fill_bar(x, target);
 		fill_us = (uint)(timer_get_us() - t0);
 
+		/*
+		 * Publish the address before the submission, so the commit that
+		 * the raster completes at vsync is the one carrying the new
+		 * surface.
+		 */
+		if (double_buffered) {
+			writel((u32)target, H713_DISP_AFBD_SRC_REG);
+			dmb();
+		}
+
 		h713_disp_commit_osd_frame_quiet(&st);
+		front = target;
 
 		fill_sum += fill_us;
 		if (fill_us < fill_min)
@@ -7619,8 +7675,10 @@ static void h713_disp_anim_run(u32 frames)
 
 		if (f && !(f % H713_DISP_ANIM_REPORT))
 			printf("H713 anim: frame %u, bar x=%u, committed %u, "
-			       "timeouts %u, last wait %u us, fill %u us\n",
-			       f, x, completed, timeouts, st.wait_us, fill_us);
+			       "timeouts %u, last wait %u us, fill %u us, "
+			       "front=%08lx\n",
+			       f, x, completed, timeouts, st.wait_us, fill_us,
+			       front);
 
 		if (ctrlc()) {
 			printf("H713 anim: interrupted at frame %u\n", f);
@@ -7647,11 +7705,36 @@ static void h713_disp_anim_run(u32 frames)
 	       "fill min/mean/max %u/%lu/%u us\n",
 	       wait_min, (ulong)(wait_sum / frames), wait_max,
 	       fill_min, (ulong)(fill_sum / frames), fill_max);
+	/*
+	 * Leave the hardware where every other mode expects to find it. They
+	 * all write H713_DISP_OSD_FB_ADDR and none of them touch the source
+	 * register, so finishing on the back buffer would silently break the
+	 * next command in the session -- exactly the class of cross-run trap
+	 * that cost this bring-up four results before teardown existed.
+	 * Re-render the same frame into the front buffer so the picture does
+	 * not change while the state does.
+	 */
+	if (double_buffered && front != H713_DISP_OSD_FB_ADDR) {
+		struct h713_disp_commit_stat rst;
+
+		h713_disp_fill_bar(x, H713_DISP_OSD_FB_ADDR);
+		writel((u32)H713_DISP_OSD_FB_ADDR, H713_DISP_AFBD_SRC_REG);
+		dmb();
+		h713_disp_commit_osd_frame_quiet(&rst);
+		printf("H713 anim: front buffer restored to %08lx, reads back "
+		       "%08x\n", H713_DISP_OSD_FB_ADDR,
+		       readl(H713_DISP_AFBD_SRC_REG));
+	}
+
 	printf("H713 anim: PHOTOGRAPH NOW. Final bar x=%u (frame %u mod %u = "
 	       "%u). If the bar is not there, the panel is not showing the "
 	       "frame the ARM committed.\n",
 	       x, frames - 1, H713_DISP_OSD_WIDTH / H713_DISP_ANIM_STEP_PX,
 	       (frames - 1) % (H713_DISP_OSD_WIDTH / H713_DISP_ANIM_STEP_PX));
+	if (double_buffered)
+		printf("H713 anim: SCORING -- compare against 'fb-anim' on the "
+		       "same boot. The bar tearing during motion there and not "
+		       "here is the result; a still photograph cannot show it.\n");
 }
 
 static void h713_disp_edge_sweep(const u16 *list, uint count)
@@ -9623,7 +9706,8 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 				bool pitch_low, bool edge, bool edge_fine,
 				bool stride, bool stride_fix, bool band,
 				bool bl_sweep, bool vendor_early,
-				u32 stride_override, bool anim, u32 anim_frames)
+				u32 stride_override, bool anim, u32 anim_frames,
+				bool anim_db)
 {
 	int ret;
 
@@ -9813,8 +9897,8 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 	 */
 	h713_disp_clear_layer_xoff("after the DE replay");
 
-	if (anim) {
-		h713_disp_anim_run(anim_frames);
+	if (anim || anim_db) {
+		h713_disp_anim_run(anim_frames, anim_db);
 	} else if (bl_sweep) {
 		h713_disp_backlight_sweep();
 	} else if (band) {
@@ -10190,15 +10274,16 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		 */
 		const char *mode = argc >= 4 ? argv[3] : "";
 		bool anim = !strcmp(mode, "fb-anim");
+		bool anim_db = !strcmp(mode, "fb-anim-db");
 		/*
 		 * fb-anim takes a decimal frame count in the same slot. A
 		 * stride override would shear the bar and break the position ->
 		 * frame-number encoding, so the two are mutually exclusive by
 		 * construction rather than by a warning nobody reads.
 		 */
-		u32 anim_frames = (anim && argc == 5) ?
+		u32 anim_frames = ((anim || anim_db) && argc == 5) ?
 				   dectoul(argv[4], NULL) : 0;
-		u32 stride_override = (!anim && argc == 5) ?
+		u32 stride_override = (!anim && !anim_db && argc == 5) ?
 				       hextoul(argv[4], NULL) : 0;
 		bool noboot = !strcmp(mode, "noboot");
 		bool full   = !strcmp(mode, "full");
@@ -10247,7 +10332,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		    !tcon_solid && !tcon_solid_native && !tcon_dclk &&
 		    !tcon_solid_dclk_normal && !tcon_chroma && !tcon_chroma_62m &&
 		    !tcon_nsweep && !tcon_nsweep_hi && !hbands && !grid && !quads && !vbands && !pitch && !pitch_wide && !hbp && !pitch_low && !edge && !edge_fine && !stride && !stride_fix && !band &&
-		    !bl_sweep && !anim)
+		    !bl_sweep && !anim && !anim_db)
 			return CMD_RET_USAGE;
 		return h713_disp_panel_test(hextoul(argv[2], NULL), !noboot,
 					    full,
@@ -10256,7 +10341,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    tcon_solid || tcon_solid_native ||
 					    tcon_dclk || tcon_solid_dclk_normal ||
 					    tcon_chroma || tcon_chroma_62m ||
-					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads || vbands || pitch || pitch_wide || hbp || pitch_low || edge || edge_fine || stride || stride_fix || band || bl_sweep || anim,
+					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads || vbands || pitch || pitch_wide || hbp || pitch_low || edge || edge_fine || stride || stride_fix || band || bl_sweep || anim || anim_db,
 					    vendor_logo, vendor_chroma, plane_gate,
 					    hbp ? 16 :
 					    tcon_nsweep_hi ? 15 :
@@ -10270,7 +10355,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    tcon_checker ? 8 : 0,
 					    tcon_solid_native, hbands, grid, quads, vbands, pitch, pitch_wide, hbp, pitch_low, edge, edge_fine, stride, stride_fix, band,
 					    bl_sweep, vendor_early, stride_override,
-				    anim, anim_frames) ?
+				    anim, anim_frames, anim_db) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
@@ -10406,8 +10491,10 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "                                      fb-fix: pattern at the natural 1280, sweep for the register that unshears it\n"
 	   "                                      fb-band: solid fill, screen offset registers for the ~110px left band\n"
 	   "                                      bl-sweep: white field, step PWM2/PB4 duty 100..0 (the stock dimmer)\n"
-	   "                                      fb-anim: moving red bar on blue -- the ONLY test of sustained commits\n"
+	   "                                      fb-anim: moving red bar on blue, SINGLE-buffered -- tears, and that is the baseline\n"
 	   "                                               argv[5] is a decimal frame count (default 600); Ctrl-C stops\n"
+	   "                                      fb-anim-db: same bar, DOUBLE-buffered via the AFBD source address -- should not tear\n"
+	   "                                               run both on one boot; the A/B is the measurement\n"
 	   "h713_disp bl-gpio <hz> <duty%> <secs> - bit-bang PB5, the light's supply enable, to test whether the\n"
 	   "                                      on-board boost converter dims on PWM-of-enable. Self-terminating;\n"
 	   "                                      always restores PB5 high. PB5 also powers the fan: keep runs short.\n"
