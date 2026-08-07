@@ -5732,6 +5732,12 @@ static void h713_disp_sample(void)
 #define H713_PWM_CNT(ch)	(H713_PWM_BASE + 0x108 + (ch) * 0x20)
 
 #define H713_BL_PWM_CH		2
+/*
+ * Matches the vendor DTB. Note this must drop to <= 2.5 kHz if the planned
+ * inline MOSFET dimmer is ever fitted -- see docs/backlight-investigation.md,
+ * "The chosen path". Left at 25 kHz until then so the value keeps matching the
+ * measurement it is documented by (counter wraps at 960).
+ */
 #define H713_BL_PWM_HZ		25000
 /*
  * PB4's pwm2 function is mux **3**, not 2. Corrected 2026-08-05 after a sweep
