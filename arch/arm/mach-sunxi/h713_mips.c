@@ -6655,6 +6655,86 @@ static void h713_disp_fill_pattern(uint phase)
  * BMPs are bottom-up. Keeping that conversion literal makes this a control
  * for both the test-pattern contents and the presumed framebuffer byte order.
  */
+/*
+ * Isolating why a pre-run FAT read kills the display.
+ *
+ * vendor-logo-early reads 2.7 MB off FAT to 0x6d000000, SHA-256s it and
+ * converts it, all between h713_disp_load() and h713_disp_run(). The panel then
+ * stays dark -- with every register dump byte-identical to a working run,
+ * fbcheck proving the framebuffer correct, and the TCON chroma marker equally
+ * absent. The marker reaches the panel without touching the framebuffer path,
+ * so its absence means the panel is not lit at all: this is not a framebuffer
+ * fault. We have had a workaround since 2026-08-04 and never a cause.
+ *
+ * Two candidates are already dead, from evidence that exists:
+ *
+ *   - It is not "writing the framebuffer before run". The working path calls
+ *     h713_disp_fill_pattern(0) in exactly that slot and renders.
+ *   - It is not "touching FAT before run". h713_disp_load() reads ~1.5 MB off
+ *     the same filesystem immediately beforehand, on every path that works.
+ *
+ * That leaves three, and each of these probes isolates one. Every variant then
+ * calls fill_pattern(0) and runs normally, so the probe is the ONLY difference
+ * from a known-good run.
+ *
+ *   delay  seconds pass, nothing else            -> is it time?
+ *   read   the FAT read, no hash, no convert     -> is it the second read?
+ *   hash   the SHA-256 over resident memory      -> is it CPU/cache traffic?
+ *
+ * Score all three on the chroma marker, not on the picture.
+ */
+enum {
+	H713_PREREAD_NONE = 0,
+	H713_PREREAD_DELAY,
+	H713_PREREAD_READ,
+	H713_PREREAD_HASH,
+};
+
+static void h713_disp_preread_probe(uint kind, u32 ms)
+{
+	u8 digest[SHA256_SUM_LEN];
+	loff_t len = H713_DISP_VENDOR_BMP_SIZE;
+	const char *what = "?";
+	ulong t0 = timer_get_us();
+	int ret;
+
+	switch (kind) {
+	case H713_PREREAD_DELAY:
+		what = "delay only";
+		mdelay(ms);
+		break;
+
+	case H713_PREREAD_READ:
+		what = "FAT read, no hash";
+		ret = fs_set_blk_dev(H713_DISP_FS_IF, H713_DISP_FS_DEV,
+				     FS_TYPE_ANY);
+		if (!ret)
+			ret = fs_read("bootlogo.bmp",
+				      H713_DISP_VENDOR_BMP_ADDR, 0,
+				      H713_DISP_VENDOR_BMP_MAX, &len);
+		if (ret)
+			printf("H713 preread: read failed (%d); this step "
+			       "measures nothing\n", ret);
+		break;
+
+	case H713_PREREAD_HASH:
+		/*
+		 * Hashes whatever is resident -- the content is irrelevant,
+		 * the memory traffic is the variable. Run 'preread-read' first
+		 * in the same boot if you want it hashing the real file.
+		 */
+		what = "SHA-256 over resident memory, no read";
+		sha256_csum_wd((const u8 *)H713_DISP_VENDOR_BMP_ADDR,
+			       H713_DISP_VENDOR_BMP_SIZE, digest,
+			       CHUNKSZ_SHA256);
+		break;
+	}
+
+	printf("H713 preread: %s took %lu ms. If the chroma marker blinks after "
+	       "this, the panel lit and this is NOT the cause.\n",
+	       what, (timer_get_us() - t0) / 1000);
+}
+
 static int h713_disp_publish_vendor_bootlogo(bool load, bool chroma)
 {
 	struct bmp_header *hdr = (struct bmp_header *)H713_DISP_VENDOR_BMP_ADDR;
@@ -9925,7 +10005,8 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 				bool stride, bool stride_fix, bool band,
 				bool bl_sweep, bool vendor_early,
 				u32 stride_override, bool anim, u32 anim_frames,
-				bool anim_db, bool vsize)
+				bool anim_db, bool vsize, uint preread,
+				u32 preread_ms)
 {
 	int ret;
 
@@ -9983,6 +10064,13 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		if (ret)
 			return h713_disp_fail(ret);
 	} else {
+		/*
+		 * The probe goes here and nowhere else: everything after it is
+		 * byte-for-byte what a working run does, so any difference in
+		 * the outcome belongs to the probe.
+		 */
+		if (preread)
+			h713_disp_preread_probe(preread, preread_ms);
 		h713_disp_fill_pattern(0);
 	}
 	ret = h713_disp_run(H713_DISP_LOGO_ADDR, project, true, true, false,
@@ -10518,6 +10606,11 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		bool anim = !strcmp(mode, "fb-anim");
 		bool anim_db = !strcmp(mode, "fb-anim-db");
 		bool vsize = !strcmp(mode, "fb-vsize");
+		uint preread = !strcmp(mode, "preread-delay") ? H713_PREREAD_DELAY :
+			       !strcmp(mode, "preread-read") ? H713_PREREAD_READ :
+			       !strcmp(mode, "preread-hash") ? H713_PREREAD_HASH : 0;
+		u32 preread_ms = (preread && argc == 5) ?
+				  dectoul(argv[4], NULL) : 3000;
 		/*
 		 * fb-anim takes a decimal frame count in the same slot. A
 		 * stride override would shear the bar and break the position ->
@@ -10575,7 +10668,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		    !tcon_solid && !tcon_solid_native && !tcon_dclk &&
 		    !tcon_solid_dclk_normal && !tcon_chroma && !tcon_chroma_62m &&
 		    !tcon_nsweep && !tcon_nsweep_hi && !hbands && !grid && !quads && !vbands && !pitch && !pitch_wide && !hbp && !pitch_low && !edge && !edge_fine && !stride && !stride_fix && !band &&
-		    !bl_sweep && !anim && !anim_db && !vsize)
+		    !bl_sweep && !anim && !anim_db && !vsize && !preread)
 			return CMD_RET_USAGE;
 		return h713_disp_panel_test(hextoul(argv[2], NULL), !noboot,
 					    full,
@@ -10584,7 +10677,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    tcon_solid || tcon_solid_native ||
 					    tcon_dclk || tcon_solid_dclk_normal ||
 					    tcon_chroma || tcon_chroma_62m ||
-					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads || vbands || pitch || pitch_wide || hbp || pitch_low || edge || edge_fine || stride || stride_fix || band || bl_sweep || anim || anim_db || vsize,
+					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads || vbands || pitch || pitch_wide || hbp || pitch_low || edge || edge_fine || stride || stride_fix || band || bl_sweep || anim || anim_db || vsize || preread,
 					    vendor_logo, vendor_chroma, plane_gate,
 					    hbp ? 16 :
 					    tcon_nsweep_hi ? 15 :
@@ -10598,7 +10691,8 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    tcon_checker ? 8 : 0,
 					    tcon_solid_native, hbands, grid, quads, vbands, pitch, pitch_wide, hbp, pitch_low, edge, edge_fine, stride, stride_fix, band,
 					    bl_sweep, vendor_early, stride_override,
-				    anim, anim_frames, anim_db, vsize) ?
+				    anim, anim_frames, anim_db, vsize,
+				    preread, preread_ms) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
@@ -10738,6 +10832,8 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "                                               argv[5] is a decimal frame count (default 600); Ctrl-C stops\n"
 	   "                                      fb-anim-db: same bar, DOUBLE-buffered via the AFBD source address -- should not tear\n"
 	   "                                      fb-vsize: red/blue horizontal stripes, perturbs 0x05280084[31:16] both ways\n"
+	   "                                      preread-delay|preread-read|preread-hash: isolate why a pre-run FAT read kills the display\n"
+	   "                                               argv[5] is the delay in ms for preread-delay (default 3000)\n"
 	   "                                               run both on one boot; the A/B is the measurement\n"
 	   "h713_disp bl-gpio <hz> <duty%> <secs> - bit-bang PB5, the light's supply enable, to test whether the\n"
 	   "                                      on-board boost converter dims on PWM-of-enable. Self-terminating;\n"
