@@ -10404,6 +10404,79 @@ static int h713_disp_test(u32 project, u32 source_id, u32 level, u32 mode)
 	return 0;
 }
 
+/*
+ * Publish the vendor boot logo and leave it on the panel. The product's
+ * boot-logo step, and it is opt-in: `auto <id> logo`, not the `auto` default.
+ *
+ * The design call (2026-08-07): a projector should show a boot logo, and Linux
+ * preserves the U-Boot frame (verified 2026-08-07), so a logo published here
+ * persists through boot with no Linux display driver. But `auto` is not on the
+ * boot path -- the default bootcmd is `mmc read; bootm` -- so making render the
+ * default would only add a bootlogo.bmp dependency and ~1.5 s to a diagnostic
+ * command for no boot-behaviour gain. Product images add `h713_disp auto <id>
+ * logo` before `bootm`; the dev standalone boot stays fast and artifact-free.
+ *
+ * This is the `panel-test <id> vendor-logo` sequence with the diagnostics
+ * removed, not a new path. That mode runs with quiesce=true, so it does
+ * exactly: run (panel powered), quiesce the MIPS, latch the panel timing,
+ * re-assert the DE block with the firmware PHY/routing saved across it, apply
+ * the layer X-origin fix, then publish and commit the real logo. Item 4's
+ * successful Linux handoff used precisely this state -- MIPS quiesced, logo up
+ * -- which is why it is replicated rather than simplified. What is dropped is
+ * output only: the register dumps, the chroma markers, fbcheck, and the 15 s
+ * diagnostic dwell (fatal on a boot path).
+ */
+static int h713_disp_auto_logo(u32 project)
+{
+	u32 phy14, phy28, route54;
+	int ret;
+
+	/* Same rerun protection as panel-test: a second sequence this boot
+	 * must tear the first down or it initialises into a half-torn state. */
+	if (h713_panel_test_ran)
+		h713_disp_teardown("second run this boot, tearing down first");
+	h713_panel_test_ran = true;
+
+	ret = h713_disp_load(project);
+	if (ret)
+		return h713_disp_fail(ret);
+
+	/* Panel powered (stock_panel_power=true), MIPS released. */
+	ret = h713_disp_run(H713_DISP_LOGO_ADDR, project, true, true, false,
+			    false, false, true, true);
+	if (ret)
+		return h713_disp_fail(ret);
+
+	h713_disp_quiesce_mips_owner();
+	h713_disp_latch_panel_timing();
+
+	/* The DE replay re-asserts the OSD/AFBD path the framebuffer needs, but
+	 * clears three words the firmware set; save and restore them, exactly
+	 * as panel-test does. */
+	phy14 = readl(0x051c0014);
+	phy28 = readl(0x051c0028);
+	route54 = readl(0x05140054);
+	ret = h713_disp_reassert_osd(H713_DISP_LOGO_ADDR, project);
+	if (ret)
+		return h713_disp_fail(ret);
+	writel(phy14, 0x051c0014);
+	writel(phy28, 0x051c0028);
+	writel(route54, 0x05140054);
+	dmb();
+
+	h713_disp_clear_layer_xoff("after the DE replay");
+
+	/* The real logo: load=true, chroma=false (actual artwork, not the
+	 * red/blue measurement palette). */
+	ret = h713_disp_publish_vendor_bootlogo(true, false);
+	if (ret)
+		return h713_disp_fail(ret);
+	h713_disp_commit_osd_frame();
+
+	printf("H713 disp: boot logo published and committed\n");
+	return 0;
+}
+
 static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 			char *const argv[])
 {
@@ -10733,14 +10806,22 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 	if (argc >= 3 && !strcmp(argv[1], "auto")) {
 		u32 project = hextoul(argv[2], NULL);
 		bool nowait = false;
+		bool logo = false;
 		int i;
 
 		for (i = 3; i < argc; i++) {
 			if (!strcmp(argv[i], "nowait"))
 				nowait = true;
+			else if (!strcmp(argv[i], "logo"))
+				logo = true;
 			else
 				return CMD_RET_USAGE;
 		}
+
+		/* Opt-in boot logo; the default stays prep-only. */
+		if (logo)
+			return h713_disp_auto_logo(project) ?
+			       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 
 		if (h713_disp_load(project))
 			return CMD_RET_FAILURE;
@@ -10842,7 +10923,8 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "                                      vendor-logo-late: alias of vendor-logo-chroma; loading late is now the default\n"
 	   "                                      vendor-logo-early: loads before the display sequence -- known broken, kept to chase why\n"
 	   "       h713_disp panel-test <id> <mode> <stride>  - same, with AFBD 0x05600170 forced to <stride> bytes (hex)\n"
-	   "h713_disp auto <project-id> [nowait] - load from eMMC and run\n"
+	   "h713_disp auto <project-id> [nowait] [logo] - load from eMMC and run\n"
+	   "                                      logo: publish the vendor boot logo and leave it up (product boot step)\n"
 	   "h713_disp load <project-id>         - load from eMMC only\n"
 	   "h713_disp <blob-addr> <project-id> [nowait] - run against a staged blob\n"
 	   "h713_disp list <blob-addr>          - show every project's tables\n"
