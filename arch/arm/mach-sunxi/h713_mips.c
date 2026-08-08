@@ -6545,41 +6545,6 @@ static void h713_disp_verify_fb(uint expect_y0, uint expect_y1,
  * Hues rather than greys, because the optical path answers chroma far more
  * reliably than luminance.
  */
-/*
- * Four large red/blue horizontal stripes, for reading VERTICAL geometry.
- *
- * fb-band's solid fill answers "where does content start horizontally", which
- * is what the left-band hunt needed. 0x05280084[31:16] holds 720, so whatever
- * it is, it is a height -- and a solid fill cannot show a height changing.
- *
- * Four bands of 180 rows put boundaries at 180/360/540. Truncation, repetition
- * and a moved boundary are all directly readable, and four large features
- * survive a handheld photograph where fine ones alias into moire.
- */
-#define H713_DISP_HSTRIPE_ROWS	180
-
-static void h713_disp_fill_hstripes(void)
-{
-	u32 *fb = (u32 *)H713_DISP_OSD_FB_ADDR;
-	u32 total = H713_DISP_EDGE_SPAN_WORDS;
-	uint x, y;
-
-	/* Cover the whole span, so no row can fetch unwritten memory. */
-	for (x = 0; x < total; x++)
-		fb[x] = 0xff0000ff;
-
-	for (y = 0; y < H713_DISP_OSD_HEIGHT; y++) {
-		u32 colour = ((y / H713_DISP_HSTRIPE_ROWS) & 1) ?
-			     0xff0000ff : 0xffff0000;
-		u32 *row = fb + (ulong)y * H713_DISP_OSD_WIDTH;
-
-		for (x = 0; x < H713_DISP_OSD_WIDTH; x++)
-			row[x] = colour;
-	}
-
-	flush_cache(H713_DISP_OSD_FB_ADDR, total * sizeof(u32));
-}
-
 static void h713_disp_fill_hbands(void)
 {
 	static const u32 hues[] = {
@@ -6655,86 +6620,6 @@ static void h713_disp_fill_pattern(uint phase)
  * BMPs are bottom-up. Keeping that conversion literal makes this a control
  * for both the test-pattern contents and the presumed framebuffer byte order.
  */
-/*
- * Isolating why a pre-run FAT read kills the display.
- *
- * vendor-logo-early reads 2.7 MB off FAT to 0x6d000000, SHA-256s it and
- * converts it, all between h713_disp_load() and h713_disp_run(). The panel then
- * stays dark -- with every register dump byte-identical to a working run,
- * fbcheck proving the framebuffer correct, and the TCON chroma marker equally
- * absent. The marker reaches the panel without touching the framebuffer path,
- * so its absence means the panel is not lit at all: this is not a framebuffer
- * fault. We have had a workaround since 2026-08-04 and never a cause.
- *
- * Two candidates are already dead, from evidence that exists:
- *
- *   - It is not "writing the framebuffer before run". The working path calls
- *     h713_disp_fill_pattern(0) in exactly that slot and renders.
- *   - It is not "touching FAT before run". h713_disp_load() reads ~1.5 MB off
- *     the same filesystem immediately beforehand, on every path that works.
- *
- * That leaves three, and each of these probes isolates one. Every variant then
- * calls fill_pattern(0) and runs normally, so the probe is the ONLY difference
- * from a known-good run.
- *
- *   delay  seconds pass, nothing else            -> is it time?
- *   read   the FAT read, no hash, no convert     -> is it the second read?
- *   hash   the SHA-256 over resident memory      -> is it CPU/cache traffic?
- *
- * Score all three on the chroma marker, not on the picture.
- */
-enum {
-	H713_PREREAD_NONE = 0,
-	H713_PREREAD_DELAY,
-	H713_PREREAD_READ,
-	H713_PREREAD_HASH,
-};
-
-static void h713_disp_preread_probe(uint kind, u32 ms)
-{
-	u8 digest[SHA256_SUM_LEN];
-	loff_t len = H713_DISP_VENDOR_BMP_SIZE;
-	const char *what = "?";
-	ulong t0 = timer_get_us();
-	int ret;
-
-	switch (kind) {
-	case H713_PREREAD_DELAY:
-		what = "delay only";
-		mdelay(ms);
-		break;
-
-	case H713_PREREAD_READ:
-		what = "FAT read, no hash";
-		ret = fs_set_blk_dev(H713_DISP_FS_IF, H713_DISP_FS_DEV,
-				     FS_TYPE_ANY);
-		if (!ret)
-			ret = fs_read("bootlogo.bmp",
-				      H713_DISP_VENDOR_BMP_ADDR, 0,
-				      H713_DISP_VENDOR_BMP_MAX, &len);
-		if (ret)
-			printf("H713 preread: read failed (%d); this step "
-			       "measures nothing\n", ret);
-		break;
-
-	case H713_PREREAD_HASH:
-		/*
-		 * Hashes whatever is resident -- the content is irrelevant,
-		 * the memory traffic is the variable. Run 'preread-read' first
-		 * in the same boot if you want it hashing the real file.
-		 */
-		what = "SHA-256 over resident memory, no read";
-		sha256_csum_wd((const u8 *)H713_DISP_VENDOR_BMP_ADDR,
-			       H713_DISP_VENDOR_BMP_SIZE, digest,
-			       CHUNKSZ_SHA256);
-		break;
-	}
-
-	printf("H713 preread: %s took %lu ms. If the chroma marker blinks after "
-	       "this, the panel lit and this is NOT the cause.\n",
-	       what, (timer_get_us() - t0) / 1000);
-}
-
 /*
  * Convert a 1280x720 24-bit BMP at VENDOR_BMP_ADDR into the OSD framebuffer.
  *
@@ -8211,89 +8096,6 @@ static void h713_disp_backlight_sweep(void)
 	}
 	printf("H713 backlight: sweep complete, left at %u%%\n",
 	       duty[ARRAY_SIZE(duty) - 1]);
-}
-
-/*
- * The two-sided perturbation 0x05280084[31:16] has been owed since 2026-08-04.
- *
- * h713_disp_panel_patch omitted two of stock's sites on one argument: stock's
- * literal zero "may be a decode artefact rather than a real store, and writing
- * a zero we cannot justify is worse than leaving the vendor default in place."
- * For 0x0528008c that argument was wrong, and it was the entire framebuffer
- * fault -- the vendor default was another panel's 123. The same argument still
- * protects 0x05280084[31:16], which holds 720.
- *
- * So this does not ask "should we zero it". It asks what the field DOES, which
- * is the question test_32 answered for the origin by driving it to several
- * values and watching. Steps sit on both sides of 720 so a miss still measures:
- * a register that carries vertical geometry will move something at 360 and at
- * 1080 even if 0 turns out to be inert.
- *
- * 0x05280080[31:16] is screened alongside as a control. It holds the same
- * 02d00500, and if the neighbour moves the image while 0x84 does not, that is a
- * result about both.
- */
-static const struct h713_band_probe h713_vsize_probes[] = {
-	{ "control, nothing written",
-	  { 0, 0 }, 0, 0 },
-	{ "0x05280084[31:16] 720 -> 0, what stock appears to write",
-	  { 0x05280084, 0 }, 0xffff0000, 0 },
-	{ "0x05280084[31:16] 720 -> 360, half",
-	  { 0x05280084, 0 }, 0xffff0000, 360u << 16 },
-	{ "0x05280084[31:16] 720 -> 1080, above",
-	  { 0x05280084, 0 }, 0xffff0000, 1080u << 16 },
-	{ "CONTROL: the neighbour 0x05280080[31:16] 720 -> 360",
-	  { 0x05280080, 0 }, 0xffff0000, 360u << 16 },
-};
-
-static void h713_disp_vsize_sweep(void)
-{
-	uint i, j;
-
-	printf("H713 vsize: four red/blue horizontal stripes, 180 rows each, so "
-	       "boundaries sit at 180/360/540 with red at the top.\n"
-	       "H713 vsize: score EVERY step by the same three numbers -- how "
-	       "many stripes, where the last boundary is, and whether the bottom "
-	       "of the frame is still stripes. Truncation, repetition or a moved "
-	       "boundary names the register.\n"
-	       "H713 vsize: ALL FIVE IDENTICAL is the likely outcome and is a "
-	       "real result: 0x05280084[31:16] carries no vertical geometry, and "
-	       "the omission that has been flagged since 2026-08-04 was harmless. "
-	       "Record it either way.\n");
-
-	h713_disp_fill_hstripes();
-
-	for (i = 0; i < ARRAY_SIZE(h713_vsize_probes); i++) {
-		const struct h713_band_probe *p = &h713_vsize_probes[i];
-		u32 saved[2] = { 0, 0 };
-
-		for (j = 0; j < 2; j++) {
-			if (!p->addr[j])
-				continue;
-			saved[j] = readl(p->addr[j]);
-			writel((saved[j] & ~p->mask) | (p->value & p->mask),
-			       p->addr[j]);
-		}
-		dmb();
-
-		h713_disp_chroma_marker(i + 1);
-		h713_disp_commit_osd_frame();
-
-		printf("H713 vsize: step %u, %s", i + 1, p->what);
-		for (j = 0; j < 2; j++)
-			if (p->addr[j])
-				printf("; 0x%08x was %08x now %08x",
-				       p->addr[j], saved[j],
-				       readl(p->addr[j]));
-		printf("\n");
-		mdelay(H713_DISP_CHROMA_PHASE_MS);
-
-		for (j = 0; j < 2; j++)
-			if (p->addr[j])
-				writel(saved[j], p->addr[j]);
-		dmb();
-	}
-	printf("H713 vsize: sweep complete, all probed registers restored\n");
 }
 
 static void h713_disp_band_sweep(void)
@@ -10027,8 +9829,7 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 				bool stride, bool stride_fix, bool band,
 				bool bl_sweep, bool vendor_early,
 				u32 stride_override, bool anim, u32 anim_frames,
-				bool anim_db, bool vsize, uint preread,
-				u32 preread_ms)
+				bool anim_db)
 {
 	int ret;
 
@@ -10086,13 +9887,6 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		if (ret)
 			return h713_disp_fail(ret);
 	} else {
-		/*
-		 * The probe goes here and nowhere else: everything after it is
-		 * byte-for-byte what a working run does, so any difference in
-		 * the outcome belongs to the probe.
-		 */
-		if (preread)
-			h713_disp_preread_probe(preread, preread_ms);
 		h713_disp_fill_pattern(0);
 	}
 	ret = h713_disp_run(H713_DISP_LOGO_ADDR, project, true, true, false,
@@ -10225,9 +10019,7 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 	 */
 	h713_disp_clear_layer_xoff("after the DE replay");
 
-	if (vsize) {
-		h713_disp_vsize_sweep();
-	} else if (anim || anim_db) {
+	if (anim || anim_db) {
 		h713_disp_anim_run(anim_frames, anim_db);
 	} else if (bl_sweep) {
 		h713_disp_backlight_sweep();
@@ -10706,12 +10498,6 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		const char *mode = argc >= 4 ? argv[3] : "";
 		bool anim = !strcmp(mode, "fb-anim");
 		bool anim_db = !strcmp(mode, "fb-anim-db");
-		bool vsize = !strcmp(mode, "fb-vsize");
-		uint preread = !strcmp(mode, "preread-delay") ? H713_PREREAD_DELAY :
-			       !strcmp(mode, "preread-read") ? H713_PREREAD_READ :
-			       !strcmp(mode, "preread-hash") ? H713_PREREAD_HASH : 0;
-		u32 preread_ms = (preread && argc == 5) ?
-				  dectoul(argv[4], NULL) : 3000;
 		/*
 		 * fb-anim takes a decimal frame count in the same slot. A
 		 * stride override would shear the bar and break the position ->
@@ -10769,7 +10555,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		    !tcon_solid && !tcon_solid_native && !tcon_dclk &&
 		    !tcon_solid_dclk_normal && !tcon_chroma && !tcon_chroma_62m &&
 		    !tcon_nsweep && !tcon_nsweep_hi && !hbands && !grid && !quads && !vbands && !pitch && !pitch_wide && !hbp && !pitch_low && !edge && !edge_fine && !stride && !stride_fix && !band &&
-		    !bl_sweep && !anim && !anim_db && !vsize && !preread)
+		    !bl_sweep && !anim && !anim_db)
 			return CMD_RET_USAGE;
 		return h713_disp_panel_test(hextoul(argv[2], NULL), !noboot,
 					    full,
@@ -10778,7 +10564,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    tcon_solid || tcon_solid_native ||
 					    tcon_dclk || tcon_solid_dclk_normal ||
 					    tcon_chroma || tcon_chroma_62m ||
-					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads || vbands || pitch || pitch_wide || hbp || pitch_low || edge || edge_fine || stride || stride_fix || band || bl_sweep || anim || anim_db || vsize || preread,
+					    tcon_nsweep || tcon_nsweep_hi || hbands || grid || quads || vbands || pitch || pitch_wide || hbp || pitch_low || edge || edge_fine || stride || stride_fix || band || bl_sweep || anim || anim_db,
 					    vendor_logo, vendor_chroma, plane_gate,
 					    hbp ? 16 :
 					    tcon_nsweep_hi ? 15 :
@@ -10792,8 +10578,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 					    tcon_checker ? 8 : 0,
 					    tcon_solid_native, hbands, grid, quads, vbands, pitch, pitch_wide, hbp, pitch_low, edge, edge_fine, stride, stride_fix, band,
 					    bl_sweep, vendor_early, stride_override,
-				    anim, anim_frames, anim_db, vsize,
-				    preread, preread_ms) ?
+				    anim, anim_frames, anim_db) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
@@ -10945,9 +10730,7 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "                                      fb-anim: moving red bar on blue, SINGLE-buffered -- tears, and that is the baseline\n"
 	   "                                               argv[5] is a decimal frame count (default 600); Ctrl-C stops\n"
 	   "                                      fb-anim-db: same bar, DOUBLE-buffered via the AFBD source address -- should not tear\n"
-	   "                                      fb-vsize: red/blue horizontal stripes, perturbs 0x05280084[31:16] both ways\n"
-	   "                                      preread-delay|preread-read|preread-hash: isolate why a pre-run FAT read kills the display\n"
-	   "                                               argv[5] is the delay in ms for preread-delay (default 3000)\n"
+
 	   "                                               run both on one boot; the A/B is the measurement\n"
 	   "h713_disp bl-gpio <hz> <duty%> <secs> - bit-bang PB5, the light's supply enable, to test whether the\n"
 	   "                                      on-board boost converter dims on PWM-of-enable. Self-terminating;\n"
