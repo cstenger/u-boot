@@ -6735,7 +6735,18 @@ static void h713_disp_preread_probe(uint kind, u32 ms)
 	       what, (timer_get_us() - t0) / 1000);
 }
 
-static int h713_disp_publish_vendor_bootlogo(bool load, bool chroma)
+/*
+ * Convert a 1280x720 24-bit BMP at VENDOR_BMP_ADDR into the OSD framebuffer.
+ *
+ * verify_vendor gates the bring-up guard -- exact size and SHA-256 against the
+ * known-good stock asset -- and is on for "bootlogo.bmp", off for a custom
+ * logo the operator supplies (`auto <id> logo <file>`). The BMP *format* checks
+ * are hardware constraints and run either way: 1280x720, one plane, 24 bpp,
+ * uncompressed. A custom image that is not exactly that is refused, not
+ * mangled.
+ */
+static int h713_disp_publish_bmp(bool load, const char *path,
+				 bool verify_vendor, bool chroma)
 {
 	struct bmp_header *hdr = (struct bmp_header *)H713_DISP_VENDOR_BMP_ADDR;
 	u8 digest[SHA256_SUM_LEN];
@@ -6752,38 +6763,43 @@ static int h713_disp_publish_vendor_bootlogo(bool load, bool chroma)
 		ret = fs_set_blk_dev(H713_DISP_FS_IF, H713_DISP_FS_DEV,
 				     FS_TYPE_ANY);
 		if (ret) {
-			printf("H713 panel: cannot select %s %s for bootlogo.bmp\n",
-			       H713_DISP_FS_IF, H713_DISP_FS_DEV);
+			printf("H713 panel: cannot select %s %s for %s\n",
+			       H713_DISP_FS_IF, H713_DISP_FS_DEV, path);
 			return ret;
 		}
-		ret = fs_read("bootlogo.bmp", H713_DISP_VENDOR_BMP_ADDR, 0,
+		ret = fs_read(path, H713_DISP_VENDOR_BMP_ADDR, 0,
 			      H713_DISP_VENDOR_BMP_MAX, &len);
 		if (ret) {
-			printf("H713 panel: cannot read Board-B bootlogo.bmp\n");
+			printf("H713 panel: cannot read %s\n", path);
 			return ret;
 		}
-		printf("  %-28s -> 0x%08lx  %llu bytes\n", "bootlogo.bmp",
+		printf("  %-28s -> 0x%08lx  %llu bytes\n", path,
 		       H713_DISP_VENDOR_BMP_ADDR, len);
 	}
 
-	if (len != H713_DISP_VENDOR_BMP_SIZE) {
-		printf("H713 panel: bootlogo.bmp is %llu bytes, expected %lu\n",
-		       len, H713_DISP_VENDOR_BMP_SIZE);
-		return -EINVAL;
-	}
-
-	sha256_csum_wd((const u8 *)H713_DISP_VENDOR_BMP_ADDR, len, digest,
-		       CHUNKSZ_SHA256);
-	printf("H713 panel: Board-B bootlogo.bmp SHA-256 ");
-	h713_mips_print_digest(digest);
-	printf("\n");
-	if (memcmp(digest, h713_vendor_bootlogo_sha256, sizeof(digest))) {
-		printf("H713 panel: refusing non-vendor bootlogo.bmp\n");
-		return -EKEYREJECTED;
+	if (verify_vendor) {
+		if (len != H713_DISP_VENDOR_BMP_SIZE) {
+			printf("H713 panel: %s is %llu bytes, expected %lu\n",
+			       path, len, H713_DISP_VENDOR_BMP_SIZE);
+			return -EINVAL;
+		}
+		sha256_csum_wd((const u8 *)H713_DISP_VENDOR_BMP_ADDR, len,
+			       digest, CHUNKSZ_SHA256);
+		printf("H713 panel: %s SHA-256 ", path);
+		h713_mips_print_digest(digest);
+		printf("\n");
+		if (memcmp(digest, h713_vendor_bootlogo_sha256,
+			   sizeof(digest))) {
+			printf("H713 panel: refusing non-vendor %s\n", path);
+			return -EKEYREJECTED;
+		}
+	} else {
+		printf("H713 panel: custom logo %s, %llu bytes (hash not "
+		       "checked)\n", path, len);
 	}
 
 	if (hdr->signature[0] != 'B' || hdr->signature[1] != 'M') {
-		printf("H713 panel: vendor bootlogo has no BMP signature\n");
+		printf("H713 panel: %s has no BMP signature\n", path);
 		return -EINVAL;
 	}
 	data_offset = get_unaligned_le32(&hdr->data_offset);
@@ -6796,16 +6812,17 @@ static int h713_disp_publish_vendor_bootlogo(bool load, bool chroma)
 	    (height != H713_DISP_OSD_HEIGHT &&
 	     height != -H713_DISP_OSD_HEIGHT) ||
 	    planes != 1 || bpp != 24 || compression != BMP_BI_RGB) {
-		printf("H713 panel: unexpected vendor BMP layout: %dx%d, "
-		       "%u plane(s), %u bpp, compression %u\n",
-		       width, height, planes, bpp, compression);
+		printf("H713 panel: %s: unsupported BMP layout %dx%d, %u "
+		       "plane(s), %u bpp, compression %u -- need 1280x720, "
+		       "1 plane, 24 bpp, uncompressed\n",
+		       path, width, height, planes, bpp, compression);
 		return -EINVAL;
 	}
 
 	row_bytes = ALIGN(H713_DISP_OSD_WIDTH * 3, BMP_DATA_ALIGN);
 	if (data_offset > len ||
 	    (u64)row_bytes * H713_DISP_OSD_HEIGHT > len - data_offset) {
-		printf("H713 panel: vendor BMP pixel array is truncated\n");
+		printf("H713 panel: %s pixel array is truncated\n", path);
 		return -EINVAL;
 	}
 	pixels = (u8 *)H713_DISP_VENDOR_BMP_ADDR + data_offset;
@@ -6836,11 +6853,16 @@ static int h713_disp_publish_vendor_bootlogo(bool load, bool chroma)
 	}
 
 	flush_cache(H713_DISP_OSD_FB_ADDR, H713_DISP_OSD_SIZE);
-	printf("H713 panel: exact Board-B vendor bootlogo published at "
-	       "0x%08lx (stock 24-bit BMP -> %s)\n",
-	       H713_DISP_OSD_FB_ADDR,
+	printf("H713 panel: %s published at 0x%08lx (24-bit BMP -> %s)\n",
+	       path, H713_DISP_OSD_FB_ADDR,
 	       chroma ? "red where lit, blue where not" : "0xffRRGGBB");
 	return 0;
+}
+
+/* The stock asset, hash-checked. Thin wrapper kept so callers read clearly. */
+static int h713_disp_publish_vendor_bootlogo(bool load, bool chroma)
+{
+	return h713_disp_publish_bmp(load, "bootlogo.bmp", true, chroma);
 }
 
 /*
@@ -10426,7 +10448,7 @@ static int h713_disp_test(u32 project, u32 source_id, u32 level, u32 mode)
  * output only: the register dumps, the chroma markers, fbcheck, and the 15 s
  * diagnostic dwell (fatal on a boot path).
  */
-static int h713_disp_auto_logo(u32 project)
+static int h713_disp_auto_logo(u32 project, const char *logo_file)
 {
 	u32 phy14, phy28, route54;
 	int ret;
@@ -10466,9 +10488,15 @@ static int h713_disp_auto_logo(u32 project)
 
 	h713_disp_clear_layer_xoff("after the DE replay");
 
-	/* The real logo: load=true, chroma=false (actual artwork, not the
-	 * red/blue measurement palette). */
-	ret = h713_disp_publish_vendor_bootlogo(true, false);
+	/*
+	 * Publish the real artwork (chroma=false). A custom file is taken as-is
+	 * with no hash check; the default hashes the stock asset. Format is
+	 * validated either way -- 1280x720, 24 bpp, uncompressed.
+	 */
+	if (logo_file)
+		ret = h713_disp_publish_bmp(true, logo_file, false, false);
+	else
+		ret = h713_disp_publish_vendor_bootlogo(true, false);
 	if (ret)
 		return h713_disp_fail(ret);
 	h713_disp_commit_osd_frame();
@@ -10807,6 +10835,7 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		u32 project = hextoul(argv[2], NULL);
 		bool nowait = false;
 		bool logo = false;
+		const char *logo_file = NULL;
 		int i;
 
 		for (i = 3; i < argc; i++) {
@@ -10814,13 +10843,17 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 				nowait = true;
 			else if (!strcmp(argv[i], "logo"))
 				logo = true;
+			else if (logo && !logo_file)
+				/* A token after "logo" is a custom BMP on the
+				 * FAT, published without the vendor hash. */
+				logo_file = argv[i];
 			else
 				return CMD_RET_USAGE;
 		}
 
 		/* Opt-in boot logo; the default stays prep-only. */
 		if (logo)
-			return h713_disp_auto_logo(project) ?
+			return h713_disp_auto_logo(project, logo_file) ?
 			       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 
 		if (h713_disp_load(project))
@@ -10923,8 +10956,10 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "                                      vendor-logo-late: alias of vendor-logo-chroma; loading late is now the default\n"
 	   "                                      vendor-logo-early: loads before the display sequence -- known broken, kept to chase why\n"
 	   "       h713_disp panel-test <id> <mode> <stride>  - same, with AFBD 0x05600170 forced to <stride> bytes (hex)\n"
-	   "h713_disp auto <project-id> [nowait] [logo] - load from eMMC and run\n"
-	   "                                      logo: publish the vendor boot logo and leave it up (product boot step)\n"
+	   "h713_disp auto <project-id> [nowait] [logo [file.bmp]] - load from eMMC and run\n"
+	   "                                      logo: publish the boot logo and leave it up (product boot step)\n"
+	   "                                            optional file.bmp on mmc 1:2 is a custom 1280x720 24-bit logo (no hash);\n"
+	   "                                            default is the hashed vendor bootlogo.bmp\n"
 	   "h713_disp load <project-id>         - load from eMMC only\n"
 	   "h713_disp <blob-addr> <project-id> [nowait] - run against a staged blob\n"
 	   "h713_disp list <blob-addr>          - show every project's tables\n"
