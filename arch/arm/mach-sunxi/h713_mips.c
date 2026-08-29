@@ -112,6 +112,7 @@
 #define H713_MIPS_SOURCE_TRACE_OLD_OFF	(H713_MIPS_TRACE_OFF + 0x2c)
 #define H713_MIPS_SOURCE_TRACE_QUEUE_OFF	(H713_MIPS_TRACE_OFF + 0x30)
 #define H713_MIPS_SOURCE_TRACE_WORKER_OFF (H713_MIPS_TRACE_OFF + 0x34)
+#define H713_MIPS_VP_INIT_TRACE_OFF	(H713_MIPS_TRACE_OFF + 0x38)
 #define H713_MIPS_COMM_TRACE_MAGIC	0x434f4d4d
 #define H713_MIPS_STABILITY_SECONDS	60
 #define H713_MIPS_DIAG_OFF		0x00041000UL
@@ -1917,6 +1918,17 @@ static const struct h713_mips_patch h713_mips_trace_patches[] = {
  *   5201  source worker dequeued a source-change event
  *   5202  source worker found new source equal to its current source
  *   5203  source worker completed the source transition
+ *
+ * THal_Vp_Init's registered adapter gets one more persistent slot.  Its
+ * three stock inputs are [0, 1, physical address of a 0xd800-byte buffer].
+ * These markers distinguish an internal initializer failure from a bad bulk
+ * destination or the callback-install tail without changing any arguments:
+ *
+ *   7101  adapter entered; calling the local state reset
+ *   7102  local state reset returned; calling the VP initializer
+ *   7103  VP initializer returned; loading the caller's physical buffer
+ *   7104  0xd800-byte copy returned
+ *   7105  output prepared; entering callback installation
  */
 static const struct h713_mips_patch h713_mips_comm_trace_patches[] = {
 	/* Release semaphore acquired -> marker a002 -> original logger. */
@@ -2352,6 +2364,52 @@ static const struct h713_mips_patch h713_mips_comm_trace_patches[] = {
 	{ 0x4b1009ac, 0x00000000, 0x0ac424cf }, /* j 0x8b10933c */
 	{ 0x4b1009b0, 0x00000000, 0x00000000 },
 	{ 0x4b1095a0, 0x1000ff66, 0x0ac40268 }, /* j 0x8b1009a0 */
+
+	/* THal_Vp_Init entry -> marker 7101 -> local state reset. */
+	{ 0x4b1009c0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b1009c4, 0x00000000, 0x341b7101 },
+	{ 0x4b1009c8, 0x00000000, 0xaf5b0038 },
+	{ 0x4b1009cc, 0x00000000, 0x0ec5275c }, /* jal 0x8b149d70 */
+	{ 0x4b1009d0, 0x00000000, 0x00000000 },
+	{ 0x4b1009d4, 0x00000000, 0x0ac427c8 }, /* j 0x8b109f20 */
+	{ 0x4b1009d8, 0x00000000, 0x00000000 },
+	{ 0x4b109f18, 0x0ec5275c, 0x0ac40270 }, /* j 0x8b1009c0 */
+
+	/* State reset returned -> marker 7102 -> local VP initializer. */
+	{ 0x4b1009e0, 0x00000000, 0x3c1aae34 },
+	{ 0x4b1009e4, 0x00000000, 0x341b7102 },
+	{ 0x4b1009e8, 0x00000000, 0xaf5b0038 },
+	{ 0x4b1009ec, 0x00000000, 0x0ec525d5 }, /* jal 0x8b149754 */
+	{ 0x4b1009f0, 0x00000000, 0x00000000 },
+	{ 0x4b1009f4, 0x00000000, 0x0ac427ca }, /* j 0x8b109f28 */
+	{ 0x4b1009f8, 0x00000000, 0x00000000 },
+	{ 0x4b109f20, 0x0ec525d5, 0x0ac40278 }, /* j 0x8b1009e0 */
+
+	/* VP initializer returned -> marker 7103 -> original buffer load. */
+	{ 0x4b100a00, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100a04, 0x00000000, 0x341b7103 },
+	{ 0x4b100a08, 0x00000000, 0xaf5b0038 },
+	{ 0x4b100a0c, 0x00000000, 0x8e24000c }, /* lw a0, 0xc(s1) */
+	{ 0x4b100a10, 0x00000000, 0x03e00008 }, /* jr ra */
+	{ 0x4b100a14, 0x00000000, 0x00000000 },
+	{ 0x4b109f28, 0x8e24000c, 0x0ec40280 }, /* jal 0x8b100a00 */
+
+	/* Bulk copy returned -> marker 7104 -> original result setup. */
+	{ 0x4b100a20, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100a24, 0x00000000, 0x341b7104 },
+	{ 0x4b100a28, 0x00000000, 0xaf5b0038 },
+	{ 0x4b100a2c, 0x00000000, 0x24020001 }, /* addiu v0, zero, 1 */
+	{ 0x4b100a30, 0x00000000, 0x03e00008 }, /* jr ra */
+	{ 0x4b100a34, 0x00000000, 0x00000000 },
+	{ 0x4b109f50, 0x24020001, 0x0ec40288 }, /* jal 0x8b100a20 */
+
+	/* Output prepared -> marker 7105 -> original callback-install tail. */
+	{ 0x4b100a40, 0x00000000, 0x3c1aae34 },
+	{ 0x4b100a44, 0x00000000, 0x341b7105 },
+	{ 0x4b100a48, 0x00000000, 0xaf5b0038 },
+	{ 0x4b100a4c, 0x00000000, 0x0ac5305d }, /* j 0x8b14c174 */
+	{ 0x4b100a50, 0x00000000, 0x00000000 },
+	{ 0x4b109f74, 0x0ac5305d, 0x0ac40290 }, /* j 0x8b100a40 */
 };
 
 static void h713_mips_print_digest(const u8 *digest)
@@ -2974,6 +3032,26 @@ static const char *h713_mips_source_trace_stage_name(u32 stage)
 	}
 }
 
+static const char *h713_mips_vp_init_trace_stage_name(u32 stage)
+{
+	switch (stage) {
+	case 0:
+		return "not entered";
+	case 0x7101:
+		return "calling local state reset";
+	case 0x7102:
+		return "calling local VP initializer";
+	case 0x7103:
+		return "loading output-buffer physical address";
+	case 0x7104:
+		return "bulk state copy returned";
+	case 0x7105:
+		return "entering callback installation";
+	default:
+		return "unknown VP-init stage";
+	}
+}
+
 static void h713_mips_print_comm_trace(void)
 {
 	u32 magic = h713_mips_read_shmem(H713_MIPS_COMM_TRACE_MAGIC_OFF);
@@ -2991,6 +3069,7 @@ static void h713_mips_print_comm_trace(void)
 		H713_MIPS_SOURCE_TRACE_QUEUE_OFF);
 	u32 source_worker = h713_mips_read_shmem(
 		H713_MIPS_SOURCE_TRACE_WORKER_OFF);
+	u32 vp_init_stage = h713_mips_read_shmem(H713_MIPS_VP_INIT_TRACE_OFF);
 
 	if (magic != H713_MIPS_COMM_TRACE_MAGIC) {
 		printf("H713 comm trace: not installed for this boot "
@@ -3005,6 +3084,8 @@ static void h713_mips_print_comm_trace(void)
 	       queue_status, queue_status == 0 ? " (success)" : "");
 	printf("H713 comm trace: RETURN_ACK=0x%04x (%s)\n", ack_stage,
 	       h713_mips_comm_trace_stage_name(ack_stage));
+	printf("H713 VP-init trace: stage=0x%04x (%s)\n", vp_init_stage,
+	       h713_mips_vp_init_trace_stage_name(vp_init_stage));
 	printf("H713 source trace: callback=0x%04x (%s), worker=0x%04x (%s), "
 	       "event=%u new=%u old=%u queue=%08x%s\n", source_stage,
 	       h713_mips_source_trace_stage_name(source_stage), source_worker,
@@ -3046,6 +3127,7 @@ static int h713_mips_apply_comm_trace(void)
 	writel(~0U, trace + 0x2c);
 	writel(~0U, trace + 0x30);
 	writel(0, trace + 0x34);
+	writel(0, trace + 0x38);
 	flush_cache(trace, CONFIG_SYS_CACHELINE_SIZE);
 	flush_cache(H713_MIPS_FW_ADDR, H713_MIPS_FW_WINDOW_SIZE);
 	h713_comm_trace_active = true;
