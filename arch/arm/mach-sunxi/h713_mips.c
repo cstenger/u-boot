@@ -4738,9 +4738,25 @@ static int h713_disp_panel_patch(ulong blob, const struct h713_disp_sel *sel)
 		{ 0x0588000c, 12, 0x3,    c->dual_port },
 		/* AFBD fetch: mirror mode */
 		{ 0x05600140,  2, 0x3,    c->mirror_mode },
-		/* mixer geometry and blanking */
-		{ 0x0525c000, 16, 0xffff, c->vtotal },
-		{ 0x0525c000,  0, 0xffff, c->htotal },
+		/*
+		 * mixer geometry and blanking
+		 *
+		 * The total registers encode total-minus-one. Measured
+		 * 2026-08-29 against stock Android playing video: stock holds
+		 * 0x02F7054F here (1359/759) where we held 0x02F80550
+		 * (1360/760), for the same 1280x720 panel. The same word and
+		 * the same discrepancy appear independently at the DE's copy
+		 * below, which is what turns this from a dismissible odd value
+		 * into a convention error.
+		 *
+		 * The minus-one convention is not unique to this register --
+		 * AFBD's size at 0x05600020 reads 0x02CF04FF, 1279x719, for a
+		 * 1280x720 frame. It is per-field, not per-block: width at
+		 * 0x0525c034 below is a plain 1280 and already matches stock
+		 * exactly.
+		 */
+		{ 0x0525c000, 16, 0xffff, c->vtotal - 1 },
+		{ 0x0525c000,  0, 0xffff, c->htotal - 1 },
 		{ 0x0525c004,  8, 0xff,   c->hsync },
 		{ 0x0525c004,  0, 0xff,   c->vsync },
 		{ 0x0525c01c,  0, 0xffff, c->hsync + c->hbp },
@@ -4756,8 +4772,8 @@ static int h713_disp_panel_patch(ulong blob, const struct h713_disp_sel *sel)
 		 * 1440x741 beneath a mixer at 1360x760 -- visible in a live
 		 * dump as de +0x10 holding the unpatched 0x02e4059f.
 		 */
-		{ 0x0524c010, 16, 0xffff, c->vtotal },
-		{ 0x0524c010,  0, 0xffff, c->htotal },
+		{ 0x0524c010, 16, 0xffff, c->vtotal - 1 },
+		{ 0x0524c010,  0, 0xffff, c->htotal - 1 },
 		/* display engine */
 		{ 0x0524c004, 16, 0xffff, c->width },
 		{ 0x0524c004,  0, 0xffff, c->vsync + c->vbp },
@@ -6998,6 +7014,15 @@ static void h713_disp_latch_panel_timing(void)
 	u32 mode = readl(0x0588001c);
 
 	writel((mode & ~0x7) | 0x4, 0x0588001c);
+	/*
+	 * Deliberately NOT changed to total-minus-one alongside the mixer and
+	 * DE copies. Those two were corrected against a measured stock value;
+	 * this register was outside the eleven windows the 2026-08-29 sweep
+	 * captured, so stock's value here is unknown and matching it would be
+	 * a guess. Capture 0x05880020 on stock before touching it -- and note
+	 * the comment above reads HT=1360 straight out of this word, so a
+	 * silent change here would also invalidate that porch arithmetic.
+	 */
 	writel(0x02f80550, 0x05880020);	/* 1360x760 total */
 	writel(0x02d00500, 0x05880024);	/* 1280x720 active */
 	writel(0x00140028, 0x05880028);
