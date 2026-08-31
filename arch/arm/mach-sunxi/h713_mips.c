@@ -5459,23 +5459,29 @@ static void h713_disp_probe_contested(const char *when)
  * through the ordinary sequence, on every path, and survives the DE replay.
  *
  * This stays because it costs nothing and it *reports*. If the patch lands,
- * the register already reads 0 and these calls are silent. If they ever print,
- * the record patch did not take -- most likely the record's own mask no longer
- * admits [15:0] -- and that is worth knowing on the console rather than
- * rediscovering from a photograph.
+ * the register already reads the panel's value and these calls are silent. If
+ * they ever print, the record patch did not take -- most likely the record's
+ * own mask no longer admits [15:0] -- and that is worth knowing on the console
+ * rather than rediscovering from a photograph.
+ *
+ * It enforces the *panel's* origin, not a literal zero. Zero is board B's
+ * value; an HY310 wants 55. Hard-coding the zero here quietly undid the record
+ * patch on that board after every DE replay, which showed up as a narrow
+ * bright band at the right-hand edge of the projection.
  */
-static void h713_disp_clear_layer_xoff(const char *when)
+static void h713_disp_enforce_layer_xoff(const char *when)
 {
+	u32 want = h713_disp_panel->layer_x;
 	u32 was;
 
 	if (h713_disp_keep_layer_xoff)
 		return;
 
 	was = readl(H713_DISP_LAYER_XOFF_REG);
-	if (!was)
+	if (was == want)
 		return;
 
-	writel(0, H713_DISP_LAYER_XOFF_REG);
+	writel(want, H713_DISP_LAYER_XOFF_REG);
 	dmb();
 	printf("H713 panel: layer X origin 0x%08lx was %08x %s -- the record "
 	       "patch did not take; forced to %08x\n",
@@ -5613,7 +5619,7 @@ static int h713_disp_run(ulong blob, u32 project, bool skip_hdcp_wait,
 	h713_disp_configured = true;
 	printf("H713 disp: sequence complete, LVDS FIFO status=0x%08x\n",
 	       readl(0x05880fe0));
-	h713_disp_clear_layer_xoff("at the end of the sequence");
+	h713_disp_enforce_layer_xoff("at the end of the sequence");
 
 	/*
 	 * Readiness is a property of a released coprocessor. With the MIPS
@@ -10336,7 +10342,7 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 	 * every mode except fb-band, which needs the untouched value for its
 	 * own control step.
 	 */
-	h713_disp_clear_layer_xoff("after the DE replay");
+	h713_disp_enforce_layer_xoff("after the DE replay");
 
 	if (anim || anim_db) {
 		h713_disp_anim_run(anim_frames, anim_db);
@@ -10597,7 +10603,7 @@ static int h713_disp_auto_logo(u32 project, const char *logo_file)
 	writel(route54, 0x05140054);
 	dmb();
 
-	h713_disp_clear_layer_xoff("after the DE replay");
+	h713_disp_enforce_layer_xoff("after the DE replay");
 
 	/*
 	 * Publish the real artwork (chroma=false). A custom file is taken as-is
