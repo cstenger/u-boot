@@ -4878,6 +4878,39 @@ static int h713_disp_stock_panel_power(void)
 	setbits_le32((void *)H713_PH_DATA, BIT(16));
 	mdelay(5);
 
+	/*
+	 * The other four panel lines the vendor bootloader drives.
+	 *
+	 * Its device tree, tvtop@1, names six and gives every one of them
+	 * <phandle bank pin mux pull drive data> with mux 1 (output) and
+	 * data 1:
+	 *
+	 *	panel_power_en  PH19    panel_gpio_0    PH16
+	 *	panel_bl_en     PB5     panel_gpio_1    PH15
+	 *	                        panel_gpio_2    PH8
+	 *	                        panel_gpio_3    PH9
+	 *
+	 * Three of those are already driven -- PB5, PH16, and PF6, which
+	 * appears in neither the bootloader nor the kernel device tree and so
+	 * belongs to board B alone. On an HY310 the remaining four were left
+	 * unconfigured: `gpio status PH19` read back "func" with no direction
+	 * at all, and the image came up minutes late and then flickered away.
+	 * Panel power is not something to leave to a pin's reset default.
+	 */
+	if (h713_disp_panel == &h713_panel_cfg_hy310) {
+		static const u8 pins[] = { 19, 15, 8, 9 };
+		uint i;
+
+		for (i = 0; i < ARRAY_SIZE(pins); i++) {
+			setbits_le32((void *)H713_PH_DATA, BIT(pins[i]));
+			sunxi_gpio_set_cfgpin(SUNXI_GPH(pins[i]),
+					      SUNXI_GPIO_OUTPUT);
+		}
+		mdelay(5);
+		printf("H713 panel: vendor panel lines PH19/PH15/PH8/PH9 "
+		       "driven high (PH_DAT=%08x)\n", readl(H713_PH_DATA));
+	}
+
 	pf_dat = readl(H713_PF_DATA);
 	ph_dat = readl(H713_PH_DATA);
 	printf("H713 panel: stock GPIO phase complete: "
