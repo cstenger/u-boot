@@ -24,6 +24,7 @@
 #include <u-boot/sha256.h>
 
 #define H713_MIPS_FW_ADDR		0x4b100000UL
+/* First row's size; the starting value for h713_mips_fw_size. */
 #define H713_MIPS_FW_SIZE		0x00132910UL
 #define H713_MIPS_FW_WINDOW_SIZE	0x00500000UL
 #define H713_MIPS_BSS_START		0x4b232c00UL
@@ -149,24 +150,269 @@
 #define H713_TVCAP_BGR_REG		0x02001d88UL
 
 /*
- * The board's own display.bin, read from its stock bootloader partition. An
- * earlier pin (16c74a28..., 0x132b18 bytes) came from a different firmware
- * revision in a captured dump and does not match this hardware; every run
- * against it was executing a mismatched image.
+ * Board B's panel description, as stock assembles it.
+ *
+ * Stock parses its runtime DT into a flat 35-entry u32 array, then overwrites
+ * the same array from /panel_config.ini -- the two name tables at stock
+ * 0x4a05ae30 (DT) and 0x4a05a4fc (INI) are index-for-index parallel, which is
+ * what makes the override work. The values below are that merged result:
+ * panel_config.ini (Reserve0_a, sha256 7bffff88..., extracted to
+ * local/mips-display/board-b-mips/panel_config.ini) over the runtime TOC1 DT.
+ *
+ * Only two fields actually differ between the two sources -- dual_port and
+ * ssc_en -- and both are recorded here at their post-INI value.
+ *
+ * PanelLvds0Pol/PanelLvds1Pol are absent from *both* sources, so stock leaves
+ * their array slots untouched and its patch helper skips them. They are
+ * deliberately not modelled here.
  */
-static const u8 h713_mips_fw_sha256[SHA256_SUM_LEN] = {
-	0x43, 0x80, 0xf1, 0xb3, 0xed, 0x7b, 0x62, 0xaa,
-	0x50, 0x58, 0x2e, 0x7c, 0xb1, 0x6a, 0x87, 0xbd,
-	0xfa, 0xce, 0x1b, 0x43, 0x00, 0x57, 0x8f, 0xe3,
-	0x63, 0x1a, 0x41, 0x63, 0x54, 0xda, 0x30, 0xce,
+struct h713_panel_cfg {
+	u32 mapping;		/* DT panel_protocol      */
+	u32 color_depth;		/* DT panel_bitwidth      */
+	u32 odd_even;		/* DT panel_data_swap     */
+	u32 dual_port;		/* DT 1 -> INI 0          */
+	u32 mirror_mode;
+	u32 inv_de, inv_hsync, inv_vsync, inv_dclk;
+	u32 de_current, odd_current, even_current;
+	u32 ssc_en;		/* DT 1 -> INI 0          */
+	u32 pll_n_plus_1;	/* display PLL 0x058c0014[15:8] + 1 */
+	/*
+	 * htotal and vtotal go into 0x0525c000 and 0x0524c010 as they stand,
+	 * and those registers hold total MINUS ONE.
+	 */
+	u32 htotal, vtotal, hsync, vsync, hbp, vbp, width;
+	/*
+	 * Active height. Not derivable from the fields above -- the register
+	 * table never carries it -- but the OSD surface has to be sized
+	 * somehow, so name it.
+	 */
+	u32 height;
+	/*
+	 * 0x05800000[4:3]. This used to be fed from color_depth, which cannot
+	 * be what the field wants: 8 & 3 is zero on any board, so the write
+	 * carried no information. It reads as an encoding selector like the
+	 * XML's lvds_format. Board B keeps the zero it has been running;
+	 * 1 is what an HY310's stock bootloader leaves there.
+	 */
+	u32 lvds_bitsel;
+	/* 0x0528008c, the layer's pixel X origin. */
+	u32 layer_x;
+	/*
+	 * 0x058c0018, the spread-spectrum waveform, and the mask that says
+	 * whether this panel has one at all. A zero mask means the record is
+	 * left exactly as the vendor tables have it, which is the only honest
+	 * default for a board whose value has never been read.
+	 */
+	u32 ssc_mask;
+	u32 ssc_reg;
+	/*
+	 * Whether this panel writes the active height into 0x05280084[31:16].
+	 * Zero leaves the record alone, which is what board B's own note asks
+	 * for: "Do not change it on this reasoning alone."
+	 */
+	u32 layer_h_mask;
 };
 
-/* Board-B bootloader_a/bootlogo.bmp from the 2026-07-05 full-board dump. */
-static const u8 h713_vendor_bootlogo_sha256[SHA256_SUM_LEN] = {
-	0xe8, 0x12, 0xcd, 0x92, 0x8c, 0x67, 0xb8, 0x96,
-	0x08, 0xc7, 0x42, 0x4a, 0xc8, 0x00, 0x66, 0xc1,
-	0x96, 0x33, 0xe7, 0x6b, 0x15, 0x03, 0x78, 0xab,
-	0xf4, 0xde, 0x9d, 0x62, 0x69, 0x8e, 0xb2, 0x2c,
+static const struct h713_panel_cfg h713_panel_cfg_board_b = {
+	.mapping = 0, .color_depth = 8, .odd_even = 0,
+	.dual_port = 0, .mirror_mode = 0,
+	.inv_de = 0, .inv_hsync = 0, .inv_vsync = 0, .inv_dclk = 1,
+	.de_current = 47, .odd_current = 7, .even_current = 7,
+	.ssc_en = 0,
+	/*
+	 * The vendor table leaves the display PLL at N+1 = 43, which is
+	 * 24 * 43 = 1032 MHz and, through the measured /14, 73.71 MHz of DCLK
+	 * against the 62 MHz panel_config.ini asks for -- 18.9% fast. Sweeping
+	 * the PLL with the chroma checker found the panel decodes cleanly at
+	 * N+1 = 36: 864 MHz, 61.71 MHz of DCLK, 0.46% low, 59.71 Hz. At 43 the
+	 * projected image is a uniform blur; at 36 it is a crisp checkerboard.
+	 * That sweep is also what established K = 14 in the first place.
+	 */
+	.pll_n_plus_1 = 36,
+	.htotal = 1360, .vtotal = 760, .hsync = 20, .vsync = 2,
+	.hbp = 40, .vbp = 20, .width = 1280, .height = 720,
+	/* All three chosen so this board's registers do not move. */
+	.lvds_bitsel = 0, .layer_x = 0, .ssc_mask = 0, .ssc_reg = 0,
+	.layer_h_mask = 0,
+};
+
+/*
+ * The HY310's panel: 1920x1080, project ID 0x30.
+ *
+ * Everything below is read off a live stock bootloader on that board while
+ * its logo was on the wall. That is possible because its boot0 and ours sit
+ * in different places on the eMMC, so both can be resident and one 32 KiB
+ * write to LBA 16 switches between them.
+ *
+ *	0525c000  045f084f   2127 / 1119, i.e. 2128 x 1120 minus one
+ *	0525c004  00002c05   hsync 44, vsync 5
+ *	0525c01c  07800084   132 = 44 + 88
+ *	0525c020  04380019    25 =  5 + 20
+ *	0528008c  00000037   layer X origin 55
+ *	05800000  01e0a40c   the [4:3] selector is 1
+ *	058c0014  b9002800   N = 40, and bit 24 -- ssc_en -- set
+ *	058c0018  c8d0362f   the spread-spectrum waveform
+ *
+ * The device's own display_cfg.xml agrees: hde 1920, vde 1080, htotal
+ * typical 2128 (min 2044, max 2208), vtotal typical 1120 (min 1100, max
+ * 1150), hs 44, vs 5, h_back_porch 88, pclk typical 143001600. It gives a
+ * range and the firmware picks within it.
+ *
+ * The TCON meanwhile runs 2200 x 1125, in stock as much as here. The mixer
+ * and the TCON are not meant to agree.
+ *
+ * PLL: 24 * 41 = 984 MHz. The stock boot log states it outright -- "ssc
+ * percent:10 wave bottom:0x362f, wave step:0x8d, n:41, ssc_freq:31500
+ * reg_value:0xc8d0362f" -- and spread spectrum is on, which is why ssc_reg
+ * is carried rather than left at the vendor default.
+ *
+ * dual_port is 1 here where board B has 0.
+ */
+static const struct h713_panel_cfg h713_panel_cfg_hy310 = {
+	.mapping = 0, .color_depth = 8, .odd_even = 0,
+	.dual_port = 1, .mirror_mode = 0,
+	.inv_de = 0, .inv_hsync = 0, .inv_vsync = 0, .inv_dclk = 1,
+	.de_current = 47, .odd_current = 7, .even_current = 7,
+	.ssc_en = 1,
+	.pll_n_plus_1 = 41,
+	.htotal = 2127, .vtotal = 1119, .hsync = 44, .vsync = 5,
+	.hbp = 88, .vbp = 20, .width = 1920, .height = 1080,
+	.lvds_bitsel = 1, .layer_x = 55,
+	.ssc_mask = 0xffffffff, .ssc_reg = 0xc8d0362f,
+	.layer_h_mask = 0xffff,
+};
+
+/*
+ * The panel in force. Set from the board table once a display command knows
+ * its project ID; board B's until then, so the diagnostics that run before any
+ * selection keep the geometry they were written against.
+ */
+static const struct h713_panel_cfg *h713_disp_panel = &h713_panel_cfg_board_b;
+
+/*
+ * Everything that varies with the display.bin revision, in one place.
+ *
+ * These were three separate constants -- an expected size, a pinned digest and
+ * a patch address -- so a board carrying a different firmware failed three
+ * times in a row, each with its own message and each needing its own edit.
+ * They are properties of the image, so keep them together and pick the row by
+ * digest.
+ */
+struct h713_mips_fw_rev {
+	const char *board;
+	/*
+	 * What the board says about itself *in software*. The project ID comes
+	 * from its own projecttable.TSE, which the firmware loads anyway, and
+	 * the digest pins the display.bin revision.
+	 *
+	 * The names are silkscreen and nothing reads them: the vendor device
+	 * tree carries only model = "sun50iw12", the same on every board in
+	 * this family. So the names are for people and these two numbers are
+	 * what the code can actually discriminate on.
+	 *
+	 * The panel belongs here for the same reason as the firmware fields:
+	 * it is a property of the device. A NULL panel means no description
+	 * exists yet and the default stands.
+	 */
+	u32 project_id;
+	const struct h713_panel_cfg *panel;
+	ulong size;
+	ulong hdcp_wait_va;
+	u8 digest[SHA256_SUM_LEN];
+};
+
+static const struct h713_mips_fw_rev h713_mips_fw_revs[] = {
+	{
+		/* Read from this board's own stock bootloader partition. */
+		.board = "HY200 QZ713DF_A1",
+		.project_id = 0x34,
+		.panel = &h713_panel_cfg_board_b,
+		.size = 0x132910,
+		.hdcp_wait_va = 0x4b13d6f8,
+		.digest = {
+			0x43, 0x80, 0xf1, 0xb3, 0xed, 0x7b, 0x62, 0xaa,
+			0x50, 0x58, 0x2e, 0x7c, 0xb1, 0x6a, 0x87, 0xbd,
+			0xfa, 0xce, 0x1b, 0x43, 0x00, 0x57, 0x8f, 0xe3,
+			0x63, 0x1a, 0x41, 0x63, 0x54, 0xda, 0x30, 0xce,
+		},
+	},
+	{
+		/*
+		 * The revision the note above called "a different firmware
+		 * revision in a captured dump". It is indeed different, and it
+		 * is what ships on an HY310: read off that board's own eMMC,
+		 * matching its ProjectID_0x0030 TSE group. The HDCP wait
+		 * address is the one already documented for it.
+		 */
+		.board = "HY310 (QZ713 V3.1)",
+		.project_id = 0x30,
+		.panel = &h713_panel_cfg_hy310,
+		.size = 0x132b18,
+		.hdcp_wait_va = 0x4b13d0a4,
+		.digest = {
+			0x16, 0xc7, 0x4a, 0x28, 0x18, 0x7f, 0x34, 0x2d,
+			0xe6, 0x57, 0x82, 0x8f, 0xab, 0x65, 0x14, 0x5b,
+			0x14, 0x0a, 0xc9, 0x41, 0x1c, 0x40, 0xcc, 0xcc,
+			0x02, 0xee, 0xd2, 0x50, 0x47, 0x47, 0x2e, 0xe9,
+		},
+	},
+};
+
+/* Set by h713_mips_verify() once the image is identified. */
+static const struct h713_mips_fw_rev *h713_mips_fw;
+
+/*
+ * Two ways into the same table, because the two things that identify a board
+ * arrive at different times: the display.bin digest only once the image is
+ * loaded, the project ID as soon as a display command is typed.
+ */
+static const struct h713_mips_fw_rev *h713_board_by_project(u32 project)
+{
+	uint i;
+
+	for (i = 0; i < ARRAY_SIZE(h713_mips_fw_revs); i++)
+		if (h713_mips_fw_revs[i].project_id == project)
+			return &h713_mips_fw_revs[i];
+
+	return NULL;
+}
+
+/*
+ * The size is needed before the image can be hashed, so it starts at the
+ * first row's value and is replaced by the file's own size once that is
+ * known. h713_mips_clear_workspace() erases from the end of the firmware, and
+ * a value that is too small takes the tail of the image with it.
+ */
+static ulong h713_mips_fw_size = H713_MIPS_FW_SIZE;
+
+/*
+ * Known stock boot logos. The asset is board-specific in geometry as well as
+ * content, and the geometry is simply each board's own panel. A single pinned
+ * size plus a single pinned digest rejected the other board twice before
+ * anything ever looked at the file.
+ */
+static const struct {
+	const char *board;
+	u8 digest[SHA256_SUM_LEN];
+} h713_vendor_bootlogos[] = {
+	{
+		/* bootloader_a/bootlogo.bmp, 2026-07-05 full-board dump. */
+		"HY200 QZ713DF_A1", {
+			0xe8, 0x12, 0xcd, 0x92, 0x8c, 0x67, 0xb8, 0x96,
+			0x08, 0xc7, 0x42, 0x4a, 0xc8, 0x00, 0x66, 0xc1,
+			0x96, 0x33, 0xe7, 0x6b, 0x15, 0x03, 0x78, 0xab,
+			0xf4, 0xde, 0x9d, 0x62, 0x69, 0x8e, 0xb2, 0x2c,
+		},
+	},
+	{
+		/* mips/bootlogo.bmp on an HY310: 1920x1080, 6220854 bytes. */
+		"HY310 (QZ713 V3.1)", {
+			0x96, 0x84, 0xef, 0x71, 0x48, 0x3e, 0xb1, 0x99,
+			0x01, 0xad, 0xf2, 0x5e, 0x55, 0xad, 0x61, 0x7e,
+			0xb2, 0xb4, 0x1d, 0x70, 0x65, 0xd9, 0xe2, 0x57,
+			0xe1, 0x08, 0x1c, 0x5c, 0x26, 0x09, 0x50, 0x33,
+		},
+	},
 };
 
 static bool h713_display_prepared;
@@ -2525,7 +2771,7 @@ static void h713_tvcap_prepare(void)
  */
 static void h713_mips_clear_workspace(void)
 {
-	ulong tail = H713_MIPS_FW_ADDR + H713_MIPS_FW_SIZE;
+	ulong tail = H713_MIPS_FW_ADDR + h713_mips_fw_size;
 
 	memset((void *)tail, 0, H713_MIPS_CFG_ADDR - tail);
 	memset((void *)H713_MIPS_FB_ADDR, 0, H713_MIPS_FB_SIZE);
@@ -3265,20 +3511,28 @@ static int h713_mips_verify(void)
 {
 	u8 digest[SHA256_SUM_LEN];
 
-	sha256_csum_wd((const u8 *)H713_MIPS_FW_ADDR, H713_MIPS_FW_SIZE,
+	uint i;
+
+	sha256_csum_wd((const u8 *)H713_MIPS_FW_ADDR, h713_mips_fw_size,
 		       digest, CHUNKSZ_SHA256);
 
 	printf("H713 MIPS: display.bin SHA-256 ");
 	h713_mips_print_digest(digest);
 	printf("\n");
 
-	if (memcmp(digest, h713_mips_fw_sha256, sizeof(digest))) {
-		printf("H713 MIPS: firmware identity rejected\n");
-		return -EPERM;
+	for (i = 0; i < ARRAY_SIZE(h713_mips_fw_revs); i++) {
+		if (memcmp(digest, h713_mips_fw_revs[i].digest,
+			   SHA256_SUM_LEN))
+			continue;
+
+		h713_mips_fw = &h713_mips_fw_revs[i];
+		printf("H713 MIPS: firmware identity accepted (%s)\n",
+		       h713_mips_fw->board);
+		return 0;
 	}
 
-	printf("H713 MIPS: firmware identity accepted\n");
-	return 0;
+	printf("H713 MIPS: firmware identity rejected\n");
+	return -EPERM;
 }
 
 static int h713_mips_load(const char *ifname, const char *dev,
@@ -3286,6 +3540,7 @@ static int h713_mips_load(const char *ifname, const char *dev,
 {
 	loff_t file_size;
 	loff_t len_read;
+	uint i;
 	int ret;
 
 	ret = fs_set_blk_dev(ifname, dev, FS_TYPE_ANY);
@@ -3300,11 +3555,20 @@ static int h713_mips_load(const char *ifname, const char *dev,
 		return ret;
 	}
 
-	if (file_size != H713_MIPS_FW_SIZE) {
-		printf("H713 MIPS: rejected size 0x%llx (expected 0x%lx)\n",
-		       file_size, H713_MIPS_FW_SIZE);
+	/*
+	 * Accept any size a known revision declares. The digest decides
+	 * afterwards; refusing here on one revision's size just turns an
+	 * identity check into a size check.
+	 */
+	for (i = 0; i < ARRAY_SIZE(h713_mips_fw_revs); i++)
+		if ((ulong)file_size == h713_mips_fw_revs[i].size)
+			break;
+	if (i == ARRAY_SIZE(h713_mips_fw_revs)) {
+		printf("H713 MIPS: rejected size 0x%llx, no revision declares it\n",
+		       file_size);
 		return -EINVAL;
 	}
+	h713_mips_fw_size = (ulong)file_size;
 
 	h713_mips_stop();
 	memset((void *)H713_MIPS_FW_ADDR, 0, H713_MIPS_FW_WINDOW_SIZE);
@@ -3349,8 +3613,8 @@ static int h713_mips_start(void)
 	 * tail. Match the filesystem load path so BSS/heap never inherit stale
 	 * DRAM from an earlier boot.
 	 */
-	memset((void *)(H713_MIPS_FW_ADDR + H713_MIPS_FW_SIZE), 0,
-	       H713_MIPS_FW_WINDOW_SIZE - H713_MIPS_FW_SIZE);
+	memset((void *)(H713_MIPS_FW_ADDR + h713_mips_fw_size), 0,
+	       H713_MIPS_FW_WINDOW_SIZE - h713_mips_fw_size);
 	flush_cache(H713_MIPS_FW_ADDR, H713_MIPS_FW_WINDOW_SIZE);
 
 	/*
@@ -3421,6 +3685,7 @@ static int h713_mips_start(void)
  * this board actually carries. The guard below compares the instruction before
  * writing, so a wrong offset reports rather than corrupting the firmware.
  */
+/* The first row's site; the fallback for an unidentified image. */
 #define H713_MIPS_HDCP_WAIT_INSN	0x4b13d6f8UL
 #define H713_MIPS_HDCP_WAIT_ORIG	0x2c630033
 #define H713_MIPS_HDCP_WAIT_NONE	0x2c630000
@@ -3443,15 +3708,18 @@ static int h713_mips_release_raw(bool skip_hdcp_wait, bool publish_shmem,
 		return -EINVAL;
 
 	if (skip_hdcp_wait) {
-		u32 insn = readl(H713_MIPS_HDCP_WAIT_INSN);
+		ulong va = h713_mips_fw ? h713_mips_fw->hdcp_wait_va
+					: H713_MIPS_HDCP_WAIT_INSN;
+		u32 insn = readl(va);
 
 		if (insn != H713_MIPS_HDCP_WAIT_ORIG) {
-			printf("H713 MIPS: HDCP wait site is 0x%08x, expected 0x%08x\n",
-			       insn, H713_MIPS_HDCP_WAIT_ORIG);
+			printf("H713 MIPS: HDCP wait site 0x%08lx is 0x%08x, expected 0x%08x\n",
+			       va, insn, H713_MIPS_HDCP_WAIT_ORIG);
 			return -EINVAL;
 		}
-		writel(H713_MIPS_HDCP_WAIT_NONE, H713_MIPS_HDCP_WAIT_INSN);
-		printf("H713 MIPS: HDCP key-load wait defeated\n");
+		writel(H713_MIPS_HDCP_WAIT_NONE, va);
+		printf("H713 MIPS: HDCP key-load wait defeated at 0x%08lx\n",
+		       va);
 	}
 
 	if (publish_shmem)
@@ -4436,6 +4704,7 @@ static bool h713_disp_configured;
 static int h713_disp_lookup(ulong blob, u32 project,
 			    struct h713_disp_sel *sel)
 {
+	const struct h713_mips_fw_rev *board;
 	int i;
 
 	for (i = 0; i < h713_disp_desc_count(blob); i++) {
@@ -4461,6 +4730,23 @@ static int h713_disp_lookup(ulong blob, u32 project,
 			       "tables (%u/%u/%u)\n", id, sel->prologue,
 			       sel->timing, sel->de);
 			return -EINVAL;
+		}
+
+		/*
+		 * The project ID names the board, so this is where the panel
+		 * becomes known. Everything downstream reads it from here: the
+		 * register patch table, the OSD surface geometry, the logo.
+		 */
+		board = h713_board_by_project(id);
+		if (board && board->panel) {
+			h713_disp_panel = board->panel;
+			printf("H713 disp: project 0x%02x is %s, panel %ux%u\n",
+			       id, board->board, h713_disp_panel->width,
+			       h713_disp_panel->height);
+		} else {
+			printf("H713 disp: project 0x%02x has no panel of its "
+			       "own -- keeping %ux%u\n", id,
+			       h713_disp_panel->width, h713_disp_panel->height);
 		}
 		return 0;
 	}
@@ -4592,6 +4878,39 @@ static int h713_disp_stock_panel_power(void)
 	setbits_le32((void *)H713_PH_DATA, BIT(16));
 	mdelay(5);
 
+	/*
+	 * The other four panel lines the vendor bootloader drives.
+	 *
+	 * Its device tree, tvtop@1, names six and gives every one of them
+	 * <phandle bank pin mux pull drive data> with mux 1 (output) and
+	 * data 1:
+	 *
+	 *	panel_power_en  PH19    panel_gpio_0    PH16
+	 *	panel_bl_en     PB5     panel_gpio_1    PH15
+	 *	                        panel_gpio_2    PH8
+	 *	                        panel_gpio_3    PH9
+	 *
+	 * Three of those are already driven -- PB5, PH16, and PF6, which
+	 * appears in neither the bootloader nor the kernel device tree and so
+	 * belongs to board B alone. On an HY310 the remaining four were left
+	 * unconfigured: `gpio status PH19` read back "func" with no direction
+	 * at all, and the image came up minutes late and then flickered away.
+	 * Panel power is not something to leave to a pin's reset default.
+	 */
+	if (h713_disp_panel == &h713_panel_cfg_hy310) {
+		static const u8 pins[] = { 19, 15, 8, 9 };
+		uint i;
+
+		for (i = 0; i < ARRAY_SIZE(pins); i++) {
+			setbits_le32((void *)H713_PH_DATA, BIT(pins[i]));
+			sunxi_gpio_set_cfgpin(SUNXI_GPH(pins[i]),
+					      SUNXI_GPIO_OUTPUT);
+		}
+		mdelay(5);
+		printf("H713 panel: vendor panel lines PH19/PH15/PH8/PH9 "
+		       "driven high (PH_DAT=%08x)\n", readl(H713_PH_DATA));
+	}
+
 	pf_dat = readl(H713_PF_DATA);
 	ph_dat = readl(H713_PH_DATA);
 	printf("H713 panel: stock GPIO phase complete: "
@@ -4610,55 +4929,6 @@ static int h713_disp_stock_panel_power(void)
  * register definitions it needs: see h713_disp_teardown().
  */
 
-/*
- * Board B's panel description, as stock assembles it.
- *
- * Stock parses its runtime DT into a flat 35-entry u32 array, then overwrites
- * the same array from /panel_config.ini -- the two name tables at stock
- * 0x4a05ae30 (DT) and 0x4a05a4fc (INI) are index-for-index parallel, which is
- * what makes the override work. The values below are that merged result:
- * panel_config.ini (Reserve0_a, sha256 7bffff88..., extracted to
- * local/mips-display/board-b-mips/panel_config.ini) over the runtime TOC1 DT.
- *
- * Only two fields actually differ between the two sources -- dual_port and
- * ssc_en -- and both are recorded here at their post-INI value.
- *
- * PanelLvds0Pol/PanelLvds1Pol are absent from *both* sources, so stock leaves
- * their array slots untouched and its patch helper skips them. They are
- * deliberately not modelled here.
- */
-struct h713_panel_cfg {
-	u32 mapping;		/* DT panel_protocol      */
-	u32 color_depth;		/* DT panel_bitwidth      */
-	u32 odd_even;		/* DT panel_data_swap     */
-	u32 dual_port;		/* DT 1 -> INI 0          */
-	u32 mirror_mode;
-	u32 inv_de, inv_hsync, inv_vsync, inv_dclk;
-	u32 de_current, odd_current, even_current;
-	u32 ssc_en;		/* DT 1 -> INI 0          */
-	u32 pll_n_plus_1;	/* display PLL 0x058c0014[15:8] + 1 */
-	u32 htotal, vtotal, hsync, vsync, hbp, vbp, width;
-};
-
-static const struct h713_panel_cfg h713_panel_cfg_board_b = {
-	.mapping = 0, .color_depth = 8, .odd_even = 0,
-	.dual_port = 0, .mirror_mode = 0,
-	.inv_de = 0, .inv_hsync = 0, .inv_vsync = 0, .inv_dclk = 1,
-	.de_current = 47, .odd_current = 7, .even_current = 7,
-	.ssc_en = 0,
-	/*
-	 * The vendor table leaves the display PLL at N+1 = 43, which is
-	 * 24 * 43 = 1032 MHz and, through the measured /14, 73.71 MHz of DCLK
-	 * against the 62 MHz panel_config.ini asks for -- 18.9% fast. Sweeping
-	 * the PLL with the chroma checker found the panel decodes cleanly at
-	 * N+1 = 36: 864 MHz, 61.71 MHz of DCLK, 0.46% low, 59.71 Hz. At 43 the
-	 * projected image is a uniform blur; at 36 it is a crisp checkerboard.
-	 * That sweep is also what established K = 14 in the first place.
-	 */
-	.pll_n_plus_1 = 36,
-	.htotal = 1360, .vtotal = 760, .hsync = 20, .vsync = 2,
-	.hbp = 40, .vbp = 20, .width = 1280,
-};
 
 /*
  * This board's project ID, and it comes from the same panel_config.ini the
@@ -4716,13 +4986,20 @@ struct h713_panel_patch {
  */
 static int h713_disp_panel_patch(ulong blob, const struct h713_disp_sel *sel)
 {
-	const struct h713_panel_cfg *c = &h713_panel_cfg_board_b;
+	const struct h713_panel_cfg *c = h713_disp_panel;
 	const struct h713_panel_patch tbl[] = {
 		/* LVDS lane/map: protocol, bit width, swap and inversions */
 		/* Display PLL N: the panel decodes only near 864 MHz. */
 		{ 0x058c0014,  8, 0xff,   c->pll_n_plus_1 - 1 },
+		/*
+		 * The spread-spectrum waveform, if this panel declares one.
+		 * Board B's mask is zero, so the entry is skipped there and
+		 * its record keeps whatever the vendor tables hold -- which
+		 * has never been read on that board and must not be guessed.
+		 */
+		{ 0x058c0018,  0, c->ssc_mask, c->ssc_reg },
 		{ 0x05800000,  6, 0x3,    c->mapping },
-		{ 0x05800000,  3, 0x3,    c->color_depth },
+		{ 0x05800000,  3, 0x3,    c->lvds_bitsel },
 		{ 0x05800000, 14, 0x1,    c->odd_even },
 		{ 0x05800000, 16, 0x1,    c->inv_hsync },
 		{ 0x05800000, 17, 0x1,    c->inv_vsync },
@@ -4763,11 +5040,27 @@ static int h713_disp_panel_patch(ulong blob, const struct h713_disp_sel *sel)
 		{ 0x0524c004,  0, 0xffff, c->vsync + c->vbp },
 		{ 0x0524c014,  8, 0xff,   c->vsync },
 		{ 0x05280084,  0, 0xffff, c->width },
+		/*
+		 * The upper half, which the note above leaves alone because
+		 * stock appears to zero it there. On an HY310 a live stock
+		 * bootloader reads 04380780, i.e. the active height. Those two
+		 * observations are about different boards and need not agree.
+		 *
+		 * The same note asks not to change this on reasoning alone, so
+		 * board B's mask is zero and its record is untouched until a
+		 * perturbation on that hardware says otherwise. Only the panel
+		 * that was measured writes it.
+		 */
+		{ 0x05280084, 16, c->layer_h_mask, c->height },
 		{ 0x05280088,  0, 0xffff, c->vsync + c->vbp },
 		/*
-		 * The layer's pixel X origin, restored 2026-08-04. Stock writes
-		 * a literal zero here and this table omitted it, on the grounds
-		 * that an unjustifiable zero was worse than the vendor default.
+		 * The layer's pixel X origin, restored 2026-08-04.
+		 *
+		 * The zero above came from board B's own sweep -- test_32
+		 * showed it puts content at column 0 there -- so it is that
+		 * panel's answer and it stays. A live stock bootloader on an
+		 * HY310 reads 0x37 = 55 for its panel. Two boards, two values;
+		 * the register is per-panel and not a constant either way.
 		 * The vendor default is another panel's, and it is 123 -- which
 		 * is precisely the pale band that sat at the left of every
 		 * framebuffer photograph in this bring-up, and, through the
@@ -4783,7 +5076,7 @@ static int h713_disp_panel_patch(ulong blob, const struct h713_disp_sel *sel)
 		 * the fact also survives h713_disp_reassert_osd, which replays
 		 * DE block 5 from this same blob.
 		 */
-		{ 0x0528008c,  0, 0xffff, 0 },
+		{ 0x0528008c,  0, 0xffff, c->layer_x },
 	};
 	const struct h713_disp_block *ranges[] = {
 		&h713_disp_prologue[sel->prologue - 1],
@@ -4827,6 +5120,9 @@ static int h713_disp_panel_patch(ulong blob, const struct h713_disp_sel *sel)
 				u32 window, updated;
 
 				if (tbl[i].reg != rec.addr)
+					continue;
+				/* No field: this panel does not patch it. */
+				if (!tbl[i].fieldmask)
 					continue;
 
 				window = tbl[i].fieldmask << tbl[i].shift;
@@ -5252,23 +5548,29 @@ static void h713_disp_probe_contested(const char *when)
  * through the ordinary sequence, on every path, and survives the DE replay.
  *
  * This stays because it costs nothing and it *reports*. If the patch lands,
- * the register already reads 0 and these calls are silent. If they ever print,
- * the record patch did not take -- most likely the record's own mask no longer
- * admits [15:0] -- and that is worth knowing on the console rather than
- * rediscovering from a photograph.
+ * the register already reads the panel's value and these calls are silent. If
+ * they ever print, the record patch did not take -- most likely the record's
+ * own mask no longer admits [15:0] -- and that is worth knowing on the console
+ * rather than rediscovering from a photograph.
+ *
+ * It enforces the *panel's* origin, not a literal zero. Zero is board B's
+ * value; an HY310 wants 55. Hard-coding the zero here quietly undid the record
+ * patch on that board after every DE replay, which showed up as a narrow
+ * bright band at the right-hand edge of the projection.
  */
-static void h713_disp_clear_layer_xoff(const char *when)
+static void h713_disp_enforce_layer_xoff(const char *when)
 {
+	u32 want = h713_disp_panel->layer_x;
 	u32 was;
 
 	if (h713_disp_keep_layer_xoff)
 		return;
 
 	was = readl(H713_DISP_LAYER_XOFF_REG);
-	if (!was)
+	if (was == want)
 		return;
 
-	writel(0, H713_DISP_LAYER_XOFF_REG);
+	writel(want, H713_DISP_LAYER_XOFF_REG);
 	dmb();
 	printf("H713 panel: layer X origin 0x%08lx was %08x %s -- the record "
 	       "patch did not take; forced to %08x\n",
@@ -5406,7 +5708,7 @@ static int h713_disp_run(ulong blob, u32 project, bool skip_hdcp_wait,
 	h713_disp_configured = true;
 	printf("H713 disp: sequence complete, LVDS FIFO status=0x%08x\n",
 	       readl(0x05880fe0));
-	h713_disp_clear_layer_xoff("at the end of the sequence");
+	h713_disp_enforce_layer_xoff("at the end of the sequence");
 
 	/*
 	 * Readiness is a property of a released coprocessor. With the MIPS
@@ -5613,6 +5915,7 @@ static int h713_disp_load_tse(u32 project)
 static int h713_disp_load(u32 project)
 {
 	loff_t len;
+	uint i;
 	int ret;
 
 	printf("H713 disp: loading vendor artifacts from %s %s\n",
@@ -5625,11 +5928,21 @@ static int h713_disp_load(u32 project)
 	ret = h713_disp_read("mips/display.bin", H713_MIPS_FW_ADDR, &len);
 	if (ret)
 		return ret;
-	if (len != H713_MIPS_FW_SIZE) {
-		printf("H713 disp: display.bin is %llu bytes, expected 0x%lx\n",
-		       len, H713_MIPS_FW_SIZE);
+	/*
+	 * Any size a known revision declares; the digest decides which one it
+	 * is. Taking the size from the file rather than from a constant also
+	 * keeps h713_mips_clear_workspace() from erasing the tail of a larger
+	 * image on the next run.
+	 */
+	for (i = 0; i < ARRAY_SIZE(h713_mips_fw_revs); i++)
+		if ((ulong)len == h713_mips_fw_revs[i].size)
+			break;
+	if (i == ARRAY_SIZE(h713_mips_fw_revs)) {
+		printf("H713 disp: display.bin is %llu bytes, no revision declares that size\n",
+		       len);
 		return -EINVAL;
 	}
+	h713_mips_fw_size = (ulong)len;
 
 	ret = h713_disp_read("mips/display_cfg.xml", H713_MIPS_CFG_ADDR, &len);
 	if (ret)
@@ -5709,8 +6022,12 @@ static void h713_disp_sample(void)
 }
 
 #define H713_DISP_OSD_FB_ADDR		0x6c100000UL
-#define H713_DISP_OSD_WIDTH		1280
-#define H713_DISP_OSD_HEIGHT		720
+/*
+ * The OSD surface is the active panel, not a constant. It was 1280x720 here
+ * because that is board B's panel.
+ */
+#define H713_DISP_OSD_WIDTH		(h713_disp_panel->width)
+#define H713_DISP_OSD_HEIGHT		(h713_disp_panel->height)
 #define H713_DISP_OSD_STRIDE		(H713_DISP_OSD_WIDTH * sizeof(u32))
 #define H713_DISP_OSD_SIZE		(H713_DISP_OSD_STRIDE * \
 					 H713_DISP_OSD_HEIGHT)
@@ -5727,15 +6044,17 @@ static void h713_disp_sample(void)
  */
 #define H713_DISP_AFBD_SRC_REG		0x05600178UL
 /*
- * The back buffer, 4 MiB after the front. Each surface is
- * H713_DISP_EDGE_SPAN_WORDS * 4 = 3916800 bytes, so 4 MiB apart is the next
- * aligned slot that does not overlap, and the pair ends well below the vendor
- * BMP staging area at 0x6d000000.
+ * The back buffer, one megabyte-aligned surface after the front. On board B
+ * that is 4 MiB and works out to the 0x6c500000 this used to hard-code; a
+ * 1920x1080 surface is 8294400 bytes and the back buffer lands at 0x6c900000.
  *
- * patches/kernel/0024 reserves uboot-scanout@6c100000 and its size was raised
- * from 0x400000 to 0x800000 to cover both. Keep those two in step.
+ * patches/kernel/0024 reserves uboot-scanout@6c100000 at 0x800000, which
+ * covers both 720p surfaces but only *one* 1080p surface. Double-buffered
+ * 1080p needs that raised to 0x1000000. The single-buffered path, which is
+ * what the boot logo uses, is unaffected.
  */
-#define H713_DISP_OSD_FB_ADDR_B		0x6c500000UL
+#define H713_DISP_OSD_FB_ADDR_B		(H713_DISP_OSD_FB_ADDR + \
+					 ALIGN(H713_DISP_OSD_SIZE, 0x100000UL))
 
 /*
  * The panel's declared power-down timings, from panel_config.ini:
@@ -6159,14 +6478,20 @@ static bool h713_disp_readable(const char *what)
  * everything in the memory map -- the next region down ends at 0x4e800000.
  */
 #define H713_DISP_EDGE_PITCH		1237
+/* Board B's htotal. The edge sweeps were written against that panel. */
 #define H713_DISP_EDGE_SPAN_PX		1360
 #define H713_DISP_EDGE_SPAN_WORDS	(H713_DISP_EDGE_SPAN_PX * \
 					 H713_DISP_OSD_HEIGHT)
 #define H713_DISP_LVDS_SCAN_REG		0x05880000UL
 #define H713_DISP_LVDS_LANE_REG		0x05800000UL
-#define H713_DISP_VENDOR_BMP_ADDR	0x6d000000UL
+/*
+ * Moved up from 0x6d000000: a double-buffered 1080p pair reaches 0x6d100000,
+ * which would have run into the staging area.
+ */
+#define H713_DISP_VENDOR_BMP_ADDR	0x6e000000UL
 #define H713_DISP_VENDOR_BMP_SIZE	2764854UL
-#define H713_DISP_VENDOR_BMP_MAX	0x00400000UL
+/* A 1920x1080 24-bit BMP is 6220854 bytes and does not fit in 4 MiB. */
+#define H713_DISP_VENDOR_BMP_MAX	0x00800000UL
 #define H713_DISP_PANEL_BLUE_RGB0	0x051c00b0UL
 #define H713_DISP_PANEL_BLUE_RGB1	0x051c00b4UL
 #define H713_DISP_PANEL_BLUE_CTRL	0x051c00b8UL
@@ -6687,8 +7012,9 @@ static void h713_disp_fill_pattern(uint phase)
 
 	flush_cache(H713_DISP_OSD_FB_ADDR, H713_DISP_OSD_SIZE);
 	printf("H713 panel: pattern %u published at 0x%08lx "
-	       "(1280x720 ARGB8888, stride 0x%x)\n",
-	       phase, H713_DISP_OSD_FB_ADDR, (uint)H713_DISP_OSD_STRIDE);
+	       "(%ux%u ARGB8888, stride 0x%x)\n",
+	       phase, H713_DISP_OSD_FB_ADDR, H713_DISP_OSD_WIDTH,
+	       H713_DISP_OSD_HEIGHT, (uint)H713_DISP_OSD_STRIDE);
 }
 
 /*
@@ -6745,21 +7071,28 @@ static int h713_disp_publish_bmp(bool load, const char *path,
 	}
 
 	if (verify_vendor) {
-		if (len != H713_DISP_VENDOR_BMP_SIZE) {
-			printf("H713 panel: %s is %llu bytes, expected %lu\n",
-			       path, len, H713_DISP_VENDOR_BMP_SIZE);
-			return -EINVAL;
-		}
+		uint i;
+
+		/*
+		 * No size check: the digest is the identity, and each board's
+		 * asset is its own panel's size. Checking one board's byte
+		 * count first only turns an identity check into a size check.
+		 */
 		sha256_csum_wd((const u8 *)H713_DISP_VENDOR_BMP_ADDR, len,
 			       digest, CHUNKSZ_SHA256);
 		printf("H713 panel: %s SHA-256 ", path);
 		h713_mips_print_digest(digest);
 		printf("\n");
-		if (memcmp(digest, h713_vendor_bootlogo_sha256,
-			   sizeof(digest))) {
+		for (i = 0; i < ARRAY_SIZE(h713_vendor_bootlogos); i++)
+			if (!memcmp(digest, h713_vendor_bootlogos[i].digest,
+				    SHA256_SUM_LEN))
+				break;
+		if (i == ARRAY_SIZE(h713_vendor_bootlogos)) {
 			printf("H713 panel: refusing non-vendor %s\n", path);
 			return -EKEYREJECTED;
 		}
+		printf("H713 panel: stock logo recognised (%s)\n",
+		       h713_vendor_bootlogos[i].board);
 	} else {
 		printf("H713 panel: custom logo %s, %llu bytes (hash not "
 		       "checked)\n", path, len);
@@ -6780,9 +7113,10 @@ static int h713_disp_publish_bmp(bool load, const char *path,
 	     height != -H713_DISP_OSD_HEIGHT) ||
 	    planes != 1 || bpp != 24 || compression != BMP_BI_RGB) {
 		printf("H713 panel: %s: unsupported BMP layout %dx%d, %u "
-		       "plane(s), %u bpp, compression %u -- need 1280x720, "
-		       "1 plane, 24 bpp, uncompressed\n",
-		       path, width, height, planes, bpp, compression);
+		       "plane(s), %u bpp, compression %u -- need 1 plane, "
+		       "24 bpp, uncompressed, %ux%u\n",
+		       path, width, height, planes, bpp, compression,
+		       H713_DISP_OSD_WIDTH, H713_DISP_OSD_HEIGHT);
 		return -EINVAL;
 	}
 
@@ -6994,24 +7328,51 @@ static void h713_disp_panel_control_test(void)
  */
 static void h713_disp_latch_panel_timing(void)
 {
-	u32 ctl = readl(0x0588000c);
+	const bool board_b = (h713_disp_panel == &h713_panel_cfg_board_b);
+	u32 live_total  = readl(0x05880020);
+	u32 live_active = readl(0x05880024);
+	u32 ctl  = readl(0x0588000c);
 	u32 mode = readl(0x0588001c);
 
-	writel((mode & ~0x7) | 0x4, 0x0588001c);
-	writel(0x02f80550, 0x05880020);	/* 1360x760 total */
-	writel(0x02d00500, 0x05880024);	/* 1280x720 active */
-	writel(0x00140028, 0x05880028);
-	writel(0x80000014, 0x0588002c);
-	writel(0x80010003, 0x05880030);
+	printf("H713 panel: firmware left %ux%u active, %ux%u total\n",
+	       live_active & 0xffff, live_active >> 16,
+	       live_total & 0xffff, live_total >> 16);
+
+	/*
+	 * Overwriting the timing is board B's repair: its panel is 1280x720,
+	 * the firmware programs 1080p regardless, so the values have to be
+	 * forced back afterwards. On a panel that really is 1920x1080 the
+	 * firmware's values are the correct ones and board B's would drive a
+	 * 720p raster into a 1080p panel.
+	 *
+	 * The latch pulse below belongs to neither board in particular: it is
+	 * what re-commits the TCON once the coprocessor is parked. Skip the
+	 * values, never the commit -- returning early from here to avoid the
+	 * 720p values takes the latch with it, and the panel goes from a wrong
+	 * picture to no picture at all.
+	 */
+	if (board_b) {
+		writel((mode & ~0x7) | 0x4, 0x0588001c);
+		writel(0x02f80550, 0x05880020);	/* 1360x760 total */
+		writel(0x02d00500, 0x05880024);	/* 1280x720 active */
+		writel(0x00140028, 0x05880028);
+		writel(0x80000014, 0x0588002c);
+		writel(0x80010003, 0x05880030);
+	} else {
+		printf("H713 panel: TCON 1c=%08x 20=%08x 24=%08x 28=%08x "
+		       "2c=%08x 30=%08x; mixer %08x (these differ by design)\n",
+		       mode, live_total, live_active, readl(0x05880028),
+		       readl(0x0588002c), readl(0x05880030),
+		       readl(0x0525c000));
+	}
+
 	writel(ctl | BIT(0), 0x0588000c);
 	udelay(1);
 	writel(ctl & ~BIT(0), 0x0588000c);
 
-	printf("H713 panel: 720p timing latched: %08x %08x %08x "
-	       "%08x %08x %08x\n",
-	       readl(0x0588001c), readl(0x05880020),
-	       readl(0x05880024), readl(0x05880028),
-	       readl(0x0588002c), readl(0x05880030));
+	printf("H713 panel: timing latched: %08x %08x %08x %08x %08x %08x\n",
+	       readl(0x0588001c), readl(0x05880020), readl(0x05880024),
+	       readl(0x05880028), readl(0x0588002c), readl(0x05880030));
 }
 
 /*
@@ -7643,7 +8004,9 @@ static void h713_disp_hbp_sweep(void)
 		printf("H713 hbp: step %u, back porch %u (0x05880028=%08x), "
 		       "front porch becomes %d; observe the band\n",
 		       i + 1, hbp_val, readl(0x05880028),
-		       1360 - 1280 - (int)(saved_porch >> 16) - (int)hbp_val);
+		       (int)h713_disp_panel->htotal + 1 -
+		       (int)h713_disp_panel->width -
+		       (int)(saved_porch >> 16) - (int)hbp_val);
 		mdelay(H713_DISP_CHROMA_PHASE_MS);
 		h713_disp_boardb_tcon_generator_off(saved_ctrl, saved_mode);
 	}
@@ -7946,7 +8309,8 @@ static void h713_disp_edge_sweep(const u16 *list, uint count)
 	uint i;
 
 	printf("H713 edge: COUNT THE DIAGONAL RED/BLUE STRIPES in each step. "
-	       "N stripes down the frame means the pitch is wrong by N*P/720 px "
+	       "N stripes down the frame means the pitch is wrong by "
+	       "N*P/height px "
 	       "-- so every step measures it, and the six must agree. Fewest "
 	       "stripes is closest; opposite leans bracket the answer. Several "
 	       "stripes is the measurement, not a failed step. The pale band "
@@ -7960,7 +8324,8 @@ static void h713_disp_edge_sweep(const u16 *list, uint count)
 		h713_disp_commit_osd_frame();
 		printf("H713 edge: step %u, assumed pitch %u px; each stripe = "
 		       "%u.%02u px of error, so |true - %u| = stripes * that\n",
-		       i + 1, p, p * 100 / 720 / 100, p * 100 / 720 % 100, p);
+		       i + 1, p, p * 100 / H713_DISP_OSD_HEIGHT / 100,
+	       p * 100 / H713_DISP_OSD_HEIGHT % 100, p);
 		mdelay(H713_DISP_CHROMA_PHASE_MS);
 	}
 	printf("H713 edge: sweep complete\n");
@@ -8037,7 +8402,9 @@ static void h713_disp_stride_sweep(void)
 		printf("H713 stride: step %u, register %08x (%u px), reads back "
 		       "%08x; predicted %u stripe(s) if live, 0 if inert\n",
 		       i + 1, px * 4, px, readl(H713_DISP_AFBD_STRIDE_REG),
-		       720 * (px > 1280 ? px - 1280 : 1280 - px) /
+		       H713_DISP_OSD_HEIGHT *
+		       (px > H713_DISP_OSD_WIDTH ? px - H713_DISP_OSD_WIDTH
+						 : H713_DISP_OSD_WIDTH - px) /
 		       H713_DISP_EDGE_PITCH);
 		mdelay(H713_DISP_CHROMA_PHASE_MS);
 	}
@@ -9877,6 +10244,15 @@ static int h713_disp_init_only(u32 project, bool release_mips, bool quiesce)
 {
 	int ret;
 
+	/*
+	 * This path launches the firmware too, so it owes the same one-launch
+	 * marker that panel-test and auto set. Without it a following `auto`
+	 * finds the flag clear, skips the teardown, and loads display.bin on
+	 * top of a running coprocessor -- which keeps writing into the image
+	 * while it is being hashed, so the digest matches no build at all.
+	 */
+	h713_panel_test_ran = true;
+
 	ret = h713_disp_load(project);
 	if (ret)
 		return h713_disp_fail(ret);
@@ -10099,7 +10475,7 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 	 * every mode except fb-band, which needs the untouched value for its
 	 * own control step.
 	 */
-	h713_disp_clear_layer_xoff("after the DE replay");
+	h713_disp_enforce_layer_xoff("after the DE replay");
 
 	if (anim || anim_db) {
 		h713_disp_anim_run(anim_frames, anim_db);
@@ -10128,7 +10504,7 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 				      ARRAY_SIZE(h713_pitch_sweep));
 	} else if (vbands) {
 		h713_disp_fill_vbands();
-		printf("H713 panel: VERTICAL BAND PROBE at panel 720p timing; "
+		printf("H713 panel: VERTICAL BAND PROBE at the panel's own timing; "
 		       "one frame, holding %u ms\n",
 		       H713_DISP_STATIC_FRAME_DWELL_MS);
 		h713_disp_commit_osd_frame();
@@ -10136,21 +10512,21 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		mdelay(H713_DISP_STATIC_FRAME_DWELL_MS);
 	} else if (quads) {
 		h713_disp_fill_quads();
-		printf("H713 panel: QUADRANT TEST at panel 720p timing; one "
+		printf("H713 panel: QUADRANT TEST at the panel's own timing; one "
 		       "frame, holding %u ms\n", H713_DISP_STATIC_FRAME_DWELL_MS);
 		h713_disp_commit_osd_frame();
 		printf("H713 panel: QUADRANTS COMMITTED; photograph now\n");
 		mdelay(H713_DISP_STATIC_FRAME_DWELL_MS);
 	} else if (grid) {
 		h713_disp_fill_grid();
-		printf("H713 panel: GEOMETRY GRID at panel 720p timing; one "
+		printf("H713 panel: GEOMETRY GRID at the panel's own timing; one "
 		       "frame, holding %u ms\n", H713_DISP_STATIC_FRAME_DWELL_MS);
 		h713_disp_commit_osd_frame();
 		printf("H713 panel: GRID COMMITTED; photograph now\n");
 		mdelay(H713_DISP_STATIC_FRAME_DWELL_MS);
 	} else if (hbands) {
 		h713_disp_fill_hbands();
-		printf("H713 panel: HORIZONTAL BAND PROBE at panel 720p timing; "
+		printf("H713 panel: HORIZONTAL BAND PROBE at the panel's own timing; "
 		       "one frame, holding %u ms\n",
 		       H713_DISP_STATIC_FRAME_DWELL_MS);
 		h713_disp_commit_osd_frame();
@@ -10184,7 +10560,7 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		h713_disp_chroma_marker(2);
 		/* Bounds measured from the file: rows 343..378, cols 368..912. */
 		h713_disp_verify_fb(343, 378, 368, 912, vendor_chroma);
-		printf("H713 panel: EXACT VENDOR LOGO TEST at panel 720p timing; "
+		printf("H713 panel: EXACT VENDOR LOGO TEST at the panel's own timing; "
 		       "one frame, holding %u ms\n",
 		       H713_DISP_STATIC_FRAME_DWELL_MS);
 		h713_disp_commit_osd_frame();
@@ -10225,7 +10601,7 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 		 * Rotating phases add no information until a first bar frame is
 		 * visible, and made hand-recorded gate observations ambiguous.
 		 */
-		printf("H713 panel: STATIC BAR TEST at panel 720p timing; "
+		printf("H713 panel: STATIC BAR TEST at the panel's own timing; "
 		       "one frame, holding %u ms\n",
 		       H713_DISP_STATIC_FRAME_DWELL_MS);
 		h713_disp_fill_pattern(0);
@@ -10235,7 +10611,7 @@ static int h713_disp_panel_test(u32 project, bool release_mips, bool full,
 	} else {
 		/* Cheap, and its scan column is the only raster-liveness signal. */
 		h713_disp_afbd_enable_probe();
-		printf("H713 panel: moving OSD at panel 720p timing, "
+		printf("H713 panel: moving OSD at the panel's own timing, "
 		       "%u frames x %u ms\n",
 		       full ? H713_DISP_OSD_FRAMES : 4,
 		       full ? H713_DISP_OSD_DWELL_MS : 3000);
@@ -10360,7 +10736,7 @@ static int h713_disp_auto_logo(u32 project, const char *logo_file)
 	writel(route54, 0x05140054);
 	dmb();
 
-	h713_disp_clear_layer_xoff("after the DE replay");
+	h713_disp_enforce_layer_xoff("after the DE replay");
 
 	/*
 	 * Publish the real artwork (chroma=false). A custom file is taken as-is
@@ -10779,7 +11155,7 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "h713_disp comm-pq-test chan=<hex> pid=<hex>\n"
 	   "                                    - guarded picture-mode get/set-same/get\n"
 	   "h713_disp panel-test <project-id> [noboot|full|quiesce|vendor-logo|plane-gate|tcon-checker|tcon-checker-mono|tcon-solid|tcon-solid-native|tcon-dclk|tcon-solid-dclk-normal]\n"
-	   "                                    - 720p colours, power controls, OSD\n"
+	   "                                    - panel-sized colours, power controls, OSD\n"
 	   "                                      noboot: hold MIPS in reset, ARM only\n"
 	   "                                      full:   add the settled long-form phases\n"
 	   "                                      quiesce: init, reset MIPS core, test OSD\n"
@@ -10823,7 +11199,7 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "       h713_disp panel-test <id> <mode> <stride>  - same, with AFBD 0x05600170 forced to <stride> bytes (hex)\n"
 	   "h713_disp auto <project-id> [nowait] [logo [file.bmp]] - load from eMMC and run\n"
 	   "                                      logo: publish the boot logo and leave it up (product boot step)\n"
-	   "                                            optional file.bmp on mmc 1:2 is a custom 1280x720 24-bit logo (no hash);\n"
+	   "                                            optional file.bmp on mmc 1:2 is a custom 24-bit logo the panel's own size (no hash);\n"
 	   "                                            default is the hashed vendor bootlogo.bmp\n"
 	   "h713_disp load <project-id>         - load from eMMC only\n"
 	   "h713_disp <blob-addr> <project-id> [nowait] - run against a staged blob\n"

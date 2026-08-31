@@ -82,6 +82,7 @@ struct sun4i_usb_phy_cfg {
 	bool phy0_dual_route;
 	bool siddq_in_base;
 	bool needs_phy2_siddq;
+	bool pmu_enable_bit0;
 	int missing_phys;
 };
 
@@ -290,6 +291,10 @@ static int sun4i_usb_phy_init(struct phy *phy)
 		val &= ~data->cfg->hci_phy_ctl_clear;
 		writel(val, usb_phy->pmu + REG_HCI_PHY_CTL);
 	}
+
+	/* H713: PMU base register bit 0 must be set to enable PHY */
+	if (usb_phy->pmu && data->cfg->pmu_enable_bit0)
+		writel(readl(usb_phy->pmu) | BIT(0), usb_phy->pmu);
 
 	if (data->cfg->siddq_in_base) {
 		if (phy->id == 0) {
@@ -639,6 +644,31 @@ static const struct sun4i_usb_phy_cfg sun50i_h6_cfg = {
 	.missing_phys = BIT(1) | BIT(2),
 };
 
+/*
+ * H713 has three USB PHYs, but U-Boot's H713 CCU reuses the D1 gate/reset
+ * tables, which only reach port 1.  Describe two here; port 2 needs CCU work
+ * first.  pmu_enable_bit0 is the H713 quirk from the well0nez kernel series
+ * (patch 0005): BIT(0) of the PMU base must be set or the PHY stays down.
+ */
+static const struct sun4i_usb_phy_cfg sun50i_h713_cfg = {
+	.num_phys = 2,
+	.phyctl_offset = REG_PHYCTL_A33,
+	.dedicated_clocks = true,
+	.phy0_dual_route = true,
+	.siddq_in_base = true,
+	.pmu_enable_bit0 = true,
+	/*
+	 * The HCI PHYs come out of reset with SIDDQ (power-down) set, and
+	 * nothing else clears it once the vendor boot0 is gone: the stock
+	 * U-Boot does `bic r3, r3, #8` on pmu+REG_HCI_PHY_CTL, confirmed by
+	 * disassembling it at 0x4a045ee8.  The well0nez kernel cfg can omit
+	 * this because on that stack the vendor U-Boot ran first and had
+	 * already cleared it -- their own usb.md says the kernel relies on
+	 * U-Boot's PHY init.  Here U-Boot *is* the first stage, so it has to.
+	 */
+	.hci_phy_ctl_clear = PHY_CTL_SIDDQ,
+};
+
 static const struct sun4i_usb_phy_cfg sun50i_h616_cfg = {
 	.num_phys = 4,
 	.disc_thresh = 3,
@@ -672,6 +702,7 @@ static const struct udevice_id sun4i_usb_phy_ids[] = {
 	{ .compatible = "allwinner,sun50i-a64-usb-phy", .data = (ulong)&sun50i_a64_cfg},
 	{ .compatible = "allwinner,sun50i-h6-usb-phy", .data = (ulong)&sun50i_h6_cfg},
 	{ .compatible = "allwinner,sun50i-h616-usb-phy", .data = (ulong)&sun50i_h616_cfg },
+	{ .compatible = "allwinner,sun50i-h713-usb-phy", .data = (ulong)&sun50i_h713_cfg },
 	{ .compatible = "allwinner,suniv-f1c100s-usb-phy", .data = (ulong)&suniv_f1c100s_cfg },
 	{ }
 };

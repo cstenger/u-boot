@@ -118,6 +118,7 @@ extern const struct ccu_desc a80_ccu_desc;
 extern const struct ccu_desc a80_mmc_clk_desc;
 extern const struct ccu_desc a83t_ccu_desc;
 extern const struct ccu_desc d1_ccu_desc;
+extern const struct ccu_desc h713_ccu_desc;
 extern const struct ccu_desc f1c100s_ccu_desc;
 extern const struct ccu_desc h3_ccu_desc;
 extern const struct ccu_desc h6_ccu_desc;
@@ -208,7 +209,7 @@ static const struct udevice_id sunxi_clk_ids[] = {
 	 * dedicated binding exists.
 	 */
 	{ .compatible = "allwinner,sun50i-h713-ccu",
-	  .data = (ulong)&d1_ccu_desc },
+	  .data = (ulong)&h713_ccu_desc },
 #endif
 #ifdef CONFIG_CLK_SUN50I_H6
 	{ .compatible = "allwinner,sun50i-h6-ccu",
