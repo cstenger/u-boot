@@ -109,6 +109,21 @@
 			#reset-cells = <1>;
 		};
 
+		/*
+		 * R_PIO, the PL/PM banks in the always-on block.  Needed for
+		 * PL3, the USB-A socket's VBUS enable: without a driver behind
+		 * the bank a gpio_request() on PL just fails and the socket
+		 * stays unpowered, which looks like "cannot reset port 1!?".
+		 */
+		r_pio: pinctrl@7022000 {
+			compatible = "allwinner,sun50i-h713-r-pinctrl";
+			reg = <0x07022000 0x400>;
+			clocks = <&osc24M>;
+			clock-names = "hosc";
+			gpio-controller;
+			#gpio-cells = <3>;
+		};
+
 		pio: pinctrl@2000000 {
 			compatible = "allwinner,sun50i-h713-pinctrl";
 			reg = <0x02000000 0x800>;
@@ -221,7 +236,7 @@
 		};
 
 		usbphy: phy@4100400 {
-			compatible = "allwinner,sun20i-d1-usb-phy";
+			compatible = "allwinner,sun50i-h713-usb-phy";
 			reg = <0x04100400 0x100>,
 			      <0x04101800 0x100>,
 			      <0x04200800 0x100>;
