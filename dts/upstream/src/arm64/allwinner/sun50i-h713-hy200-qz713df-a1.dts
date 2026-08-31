@@ -254,6 +254,48 @@
 			#phy-cells = <1>;
 		};
 
+		ehci0: usb@4101000 {
+			compatible = "allwinner,sun50i-h6-ehci", "generic-ehci";
+			reg = <0x04101000 0x100>;
+			clocks = <&ccu CLK_BUS_EHCI0>;
+			resets = <&ccu RST_BUS_EHCI0>;
+			phys = <&usbphy 0>;
+			phy-names = "usb";
+			status = "okay";
+		};
+
+		ohci0: usb@4101400 {
+			compatible = "allwinner,sun50i-h6-ohci", "generic-ohci";
+			reg = <0x04101400 0x100>;
+			clocks = <&ccu CLK_BUS_OHCI0>, <&ccu CLK_USB_OHCI0>;
+			resets = <&ccu RST_BUS_OHCI0>;
+			phys = <&usbphy 0>;
+			phy-names = "usb";
+			status = "okay";
+		};
+
+		/* The case's USB-A socket is on port 1 -- stock Android
+		 * enumerates devices under 4200000.ehci1-controller. */
+		ehci1: usb@4200000 {
+			compatible = "allwinner,sun50i-h6-ehci", "generic-ehci";
+			reg = <0x04200000 0x100>;
+			clocks = <&ccu CLK_BUS_EHCI1>;
+			resets = <&ccu RST_BUS_EHCI1>;
+			phys = <&usbphy 1>;
+			phy-names = "usb";
+			status = "okay";
+		};
+
+		ohci1: usb@4200400 {
+			compatible = "allwinner,sun50i-h6-ohci", "generic-ohci";
+			reg = <0x04200400 0x100>;
+			clocks = <&ccu CLK_BUS_OHCI1>, <&ccu CLK_USB_OHCI1>;
+			resets = <&ccu RST_BUS_OHCI1>;
+			phys = <&usbphy 1>;
+			phy-names = "usb";
+			status = "okay";
+		};
+
 		watchdog: watchdog@2051000 {
 			/*
 			 * Key-protected sun55i register layout (ctrl 0x0c,
