@@ -10244,6 +10244,15 @@ static int h713_disp_init_only(u32 project, bool release_mips, bool quiesce)
 {
 	int ret;
 
+	/*
+	 * This path launches the firmware too, so it owes the same one-launch
+	 * marker that panel-test and auto set. Without it a following `auto`
+	 * finds the flag clear, skips the teardown, and loads display.bin on
+	 * top of a running coprocessor -- which keeps writing into the image
+	 * while it is being hashed, so the digest matches no build at all.
+	 */
+	h713_panel_test_ran = true;
+
 	ret = h713_disp_load(project);
 	if (ret)
 		return h713_disp_fail(ret);
