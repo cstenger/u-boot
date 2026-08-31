@@ -7237,24 +7237,51 @@ static void h713_disp_panel_control_test(void)
  */
 static void h713_disp_latch_panel_timing(void)
 {
-	u32 ctl = readl(0x0588000c);
+	const bool board_b = (h713_disp_panel == &h713_panel_cfg_board_b);
+	u32 live_total  = readl(0x05880020);
+	u32 live_active = readl(0x05880024);
+	u32 ctl  = readl(0x0588000c);
 	u32 mode = readl(0x0588001c);
 
-	writel((mode & ~0x7) | 0x4, 0x0588001c);
-	writel(0x02f80550, 0x05880020);	/* 1360x760 total */
-	writel(0x02d00500, 0x05880024);	/* 1280x720 active */
-	writel(0x00140028, 0x05880028);
-	writel(0x80000014, 0x0588002c);
-	writel(0x80010003, 0x05880030);
+	printf("H713 panel: firmware left %ux%u active, %ux%u total\n",
+	       live_active & 0xffff, live_active >> 16,
+	       live_total & 0xffff, live_total >> 16);
+
+	/*
+	 * Overwriting the timing is board B's repair: its panel is 1280x720,
+	 * the firmware programs 1080p regardless, so the values have to be
+	 * forced back afterwards. On a panel that really is 1920x1080 the
+	 * firmware's values are the correct ones and board B's would drive a
+	 * 720p raster into a 1080p panel.
+	 *
+	 * The latch pulse below belongs to neither board in particular: it is
+	 * what re-commits the TCON once the coprocessor is parked. Skip the
+	 * values, never the commit -- returning early from here to avoid the
+	 * 720p values takes the latch with it, and the panel goes from a wrong
+	 * picture to no picture at all.
+	 */
+	if (board_b) {
+		writel((mode & ~0x7) | 0x4, 0x0588001c);
+		writel(0x02f80550, 0x05880020);	/* 1360x760 total */
+		writel(0x02d00500, 0x05880024);	/* 1280x720 active */
+		writel(0x00140028, 0x05880028);
+		writel(0x80000014, 0x0588002c);
+		writel(0x80010003, 0x05880030);
+	} else {
+		printf("H713 panel: TCON 1c=%08x 20=%08x 24=%08x 28=%08x "
+		       "2c=%08x 30=%08x; mixer %08x (these differ by design)\n",
+		       mode, live_total, live_active, readl(0x05880028),
+		       readl(0x0588002c), readl(0x05880030),
+		       readl(0x0525c000));
+	}
+
 	writel(ctl | BIT(0), 0x0588000c);
 	udelay(1);
 	writel(ctl & ~BIT(0), 0x0588000c);
 
-	printf("H713 panel: 720p timing latched: %08x %08x %08x "
-	       "%08x %08x %08x\n",
-	       readl(0x0588001c), readl(0x05880020),
-	       readl(0x05880024), readl(0x05880028),
-	       readl(0x0588002c), readl(0x05880030));
+	printf("H713 panel: timing latched: %08x %08x %08x %08x %08x %08x\n",
+	       readl(0x0588001c), readl(0x05880020), readl(0x05880024),
+	       readl(0x05880028), readl(0x0588002c), readl(0x05880030));
 }
 
 /*
