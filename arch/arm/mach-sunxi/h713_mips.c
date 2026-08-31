@@ -24,6 +24,7 @@
 #include <u-boot/sha256.h>
 
 #define H713_MIPS_FW_ADDR		0x4b100000UL
+/* First row's size; the starting value for h713_mips_fw_size. */
 #define H713_MIPS_FW_SIZE		0x00132910UL
 #define H713_MIPS_FW_WINDOW_SIZE	0x00500000UL
 #define H713_MIPS_BSS_START		0x4b232c00UL
@@ -149,17 +150,64 @@
 #define H713_TVCAP_BGR_REG		0x02001d88UL
 
 /*
- * The board's own display.bin, read from its stock bootloader partition. An
- * earlier pin (16c74a28..., 0x132b18 bytes) came from a different firmware
- * revision in a captured dump and does not match this hardware; every run
- * against it was executing a mismatched image.
+ * Everything that varies with the display.bin revision, in one place.
+ *
+ * These were three separate constants -- an expected size, a pinned digest and
+ * a patch address -- so a board carrying a different firmware failed three
+ * times in a row, each with its own message and each needing its own edit.
+ * They are properties of the image, so keep them together and pick the row by
+ * digest.
  */
-static const u8 h713_mips_fw_sha256[SHA256_SUM_LEN] = {
-	0x43, 0x80, 0xf1, 0xb3, 0xed, 0x7b, 0x62, 0xaa,
-	0x50, 0x58, 0x2e, 0x7c, 0xb1, 0x6a, 0x87, 0xbd,
-	0xfa, 0xce, 0x1b, 0x43, 0x00, 0x57, 0x8f, 0xe3,
-	0x63, 0x1a, 0x41, 0x63, 0x54, 0xda, 0x30, 0xce,
+struct h713_mips_fw_rev {
+	const char *board;
+	ulong size;
+	ulong hdcp_wait_va;
+	u8 digest[SHA256_SUM_LEN];
 };
+
+static const struct h713_mips_fw_rev h713_mips_fw_revs[] = {
+	{
+		/* Read from this board's own stock bootloader partition. */
+		.board = "HY200 QZ713DF_A1",
+		.size = 0x132910,
+		.hdcp_wait_va = 0x4b13d6f8,
+		.digest = {
+			0x43, 0x80, 0xf1, 0xb3, 0xed, 0x7b, 0x62, 0xaa,
+			0x50, 0x58, 0x2e, 0x7c, 0xb1, 0x6a, 0x87, 0xbd,
+			0xfa, 0xce, 0x1b, 0x43, 0x00, 0x57, 0x8f, 0xe3,
+			0x63, 0x1a, 0x41, 0x63, 0x54, 0xda, 0x30, 0xce,
+		},
+	},
+	{
+		/*
+		 * The revision the note above called "a different firmware
+		 * revision in a captured dump". It is indeed different, and it
+		 * is what ships on an HY310: read off that board's own eMMC,
+		 * matching its ProjectID_0x0030 TSE group. The HDCP wait
+		 * address is the one already documented for it.
+		 */
+		.board = "HY310 (QZ713 V3.1)",
+		.size = 0x132b18,
+		.hdcp_wait_va = 0x4b13d0a4,
+		.digest = {
+			0x16, 0xc7, 0x4a, 0x28, 0x18, 0x7f, 0x34, 0x2d,
+			0xe6, 0x57, 0x82, 0x8f, 0xab, 0x65, 0x14, 0x5b,
+			0x14, 0x0a, 0xc9, 0x41, 0x1c, 0x40, 0xcc, 0xcc,
+			0x02, 0xee, 0xd2, 0x50, 0x47, 0x47, 0x2e, 0xe9,
+		},
+	},
+};
+
+/* Set by h713_mips_verify() once the image is identified. */
+static const struct h713_mips_fw_rev *h713_mips_fw;
+
+/*
+ * The size is needed before the image can be hashed, so it starts at the
+ * first row's value and is replaced by the file's own size once that is
+ * known. h713_mips_clear_workspace() erases from the end of the firmware, and
+ * a value that is too small takes the tail of the image with it.
+ */
+static ulong h713_mips_fw_size = H713_MIPS_FW_SIZE;
 
 /* Board-B bootloader_a/bootlogo.bmp from the 2026-07-05 full-board dump. */
 static const u8 h713_vendor_bootlogo_sha256[SHA256_SUM_LEN] = {
@@ -2525,7 +2573,7 @@ static void h713_tvcap_prepare(void)
  */
 static void h713_mips_clear_workspace(void)
 {
-	ulong tail = H713_MIPS_FW_ADDR + H713_MIPS_FW_SIZE;
+	ulong tail = H713_MIPS_FW_ADDR + h713_mips_fw_size;
 
 	memset((void *)tail, 0, H713_MIPS_CFG_ADDR - tail);
 	memset((void *)H713_MIPS_FB_ADDR, 0, H713_MIPS_FB_SIZE);
@@ -3265,20 +3313,28 @@ static int h713_mips_verify(void)
 {
 	u8 digest[SHA256_SUM_LEN];
 
-	sha256_csum_wd((const u8 *)H713_MIPS_FW_ADDR, H713_MIPS_FW_SIZE,
+	uint i;
+
+	sha256_csum_wd((const u8 *)H713_MIPS_FW_ADDR, h713_mips_fw_size,
 		       digest, CHUNKSZ_SHA256);
 
 	printf("H713 MIPS: display.bin SHA-256 ");
 	h713_mips_print_digest(digest);
 	printf("\n");
 
-	if (memcmp(digest, h713_mips_fw_sha256, sizeof(digest))) {
-		printf("H713 MIPS: firmware identity rejected\n");
-		return -EPERM;
+	for (i = 0; i < ARRAY_SIZE(h713_mips_fw_revs); i++) {
+		if (memcmp(digest, h713_mips_fw_revs[i].digest,
+			   SHA256_SUM_LEN))
+			continue;
+
+		h713_mips_fw = &h713_mips_fw_revs[i];
+		printf("H713 MIPS: firmware identity accepted (%s)\n",
+		       h713_mips_fw->board);
+		return 0;
 	}
 
-	printf("H713 MIPS: firmware identity accepted\n");
-	return 0;
+	printf("H713 MIPS: firmware identity rejected\n");
+	return -EPERM;
 }
 
 static int h713_mips_load(const char *ifname, const char *dev,
@@ -3286,6 +3342,7 @@ static int h713_mips_load(const char *ifname, const char *dev,
 {
 	loff_t file_size;
 	loff_t len_read;
+	uint i;
 	int ret;
 
 	ret = fs_set_blk_dev(ifname, dev, FS_TYPE_ANY);
@@ -3300,11 +3357,20 @@ static int h713_mips_load(const char *ifname, const char *dev,
 		return ret;
 	}
 
-	if (file_size != H713_MIPS_FW_SIZE) {
-		printf("H713 MIPS: rejected size 0x%llx (expected 0x%lx)\n",
-		       file_size, H713_MIPS_FW_SIZE);
+	/*
+	 * Accept any size a known revision declares. The digest decides
+	 * afterwards; refusing here on one revision's size just turns an
+	 * identity check into a size check.
+	 */
+	for (i = 0; i < ARRAY_SIZE(h713_mips_fw_revs); i++)
+		if ((ulong)file_size == h713_mips_fw_revs[i].size)
+			break;
+	if (i == ARRAY_SIZE(h713_mips_fw_revs)) {
+		printf("H713 MIPS: rejected size 0x%llx, no revision declares it\n",
+		       file_size);
 		return -EINVAL;
 	}
+	h713_mips_fw_size = (ulong)file_size;
 
 	h713_mips_stop();
 	memset((void *)H713_MIPS_FW_ADDR, 0, H713_MIPS_FW_WINDOW_SIZE);
@@ -3349,8 +3415,8 @@ static int h713_mips_start(void)
 	 * tail. Match the filesystem load path so BSS/heap never inherit stale
 	 * DRAM from an earlier boot.
 	 */
-	memset((void *)(H713_MIPS_FW_ADDR + H713_MIPS_FW_SIZE), 0,
-	       H713_MIPS_FW_WINDOW_SIZE - H713_MIPS_FW_SIZE);
+	memset((void *)(H713_MIPS_FW_ADDR + h713_mips_fw_size), 0,
+	       H713_MIPS_FW_WINDOW_SIZE - h713_mips_fw_size);
 	flush_cache(H713_MIPS_FW_ADDR, H713_MIPS_FW_WINDOW_SIZE);
 
 	/*
@@ -3421,6 +3487,7 @@ static int h713_mips_start(void)
  * this board actually carries. The guard below compares the instruction before
  * writing, so a wrong offset reports rather than corrupting the firmware.
  */
+/* The first row's site; the fallback for an unidentified image. */
 #define H713_MIPS_HDCP_WAIT_INSN	0x4b13d6f8UL
 #define H713_MIPS_HDCP_WAIT_ORIG	0x2c630033
 #define H713_MIPS_HDCP_WAIT_NONE	0x2c630000
@@ -3443,15 +3510,18 @@ static int h713_mips_release_raw(bool skip_hdcp_wait, bool publish_shmem,
 		return -EINVAL;
 
 	if (skip_hdcp_wait) {
-		u32 insn = readl(H713_MIPS_HDCP_WAIT_INSN);
+		ulong va = h713_mips_fw ? h713_mips_fw->hdcp_wait_va
+					: H713_MIPS_HDCP_WAIT_INSN;
+		u32 insn = readl(va);
 
 		if (insn != H713_MIPS_HDCP_WAIT_ORIG) {
-			printf("H713 MIPS: HDCP wait site is 0x%08x, expected 0x%08x\n",
-			       insn, H713_MIPS_HDCP_WAIT_ORIG);
+			printf("H713 MIPS: HDCP wait site 0x%08lx is 0x%08x, expected 0x%08x\n",
+			       va, insn, H713_MIPS_HDCP_WAIT_ORIG);
 			return -EINVAL;
 		}
-		writel(H713_MIPS_HDCP_WAIT_NONE, H713_MIPS_HDCP_WAIT_INSN);
-		printf("H713 MIPS: HDCP key-load wait defeated\n");
+		writel(H713_MIPS_HDCP_WAIT_NONE, va);
+		printf("H713 MIPS: HDCP key-load wait defeated at 0x%08lx\n",
+		       va);
 	}
 
 	if (publish_shmem)
@@ -5613,6 +5683,7 @@ static int h713_disp_load_tse(u32 project)
 static int h713_disp_load(u32 project)
 {
 	loff_t len;
+	uint i;
 	int ret;
 
 	printf("H713 disp: loading vendor artifacts from %s %s\n",
@@ -5625,11 +5696,21 @@ static int h713_disp_load(u32 project)
 	ret = h713_disp_read("mips/display.bin", H713_MIPS_FW_ADDR, &len);
 	if (ret)
 		return ret;
-	if (len != H713_MIPS_FW_SIZE) {
-		printf("H713 disp: display.bin is %llu bytes, expected 0x%lx\n",
-		       len, H713_MIPS_FW_SIZE);
+	/*
+	 * Any size a known revision declares; the digest decides which one it
+	 * is. Taking the size from the file rather than from a constant also
+	 * keeps h713_mips_clear_workspace() from erasing the tail of a larger
+	 * image on the next run.
+	 */
+	for (i = 0; i < ARRAY_SIZE(h713_mips_fw_revs); i++)
+		if ((ulong)len == h713_mips_fw_revs[i].size)
+			break;
+	if (i == ARRAY_SIZE(h713_mips_fw_revs)) {
+		printf("H713 disp: display.bin is %llu bytes, no revision declares that size\n",
+		       len);
 		return -EINVAL;
 	}
+	h713_mips_fw_size = (ulong)len;
 
 	ret = h713_disp_read("mips/display_cfg.xml", H713_MIPS_CFG_ADDR, &len);
 	if (ret)
