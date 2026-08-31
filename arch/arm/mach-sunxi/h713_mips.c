@@ -237,6 +237,52 @@ static const struct h713_panel_cfg h713_panel_cfg_board_b = {
 };
 
 /*
+ * The HY310's panel: 1920x1080, project ID 0x30.
+ *
+ * Everything below is read off a live stock bootloader on that board while
+ * its logo was on the wall. That is possible because its boot0 and ours sit
+ * in different places on the eMMC, so both can be resident and one 32 KiB
+ * write to LBA 16 switches between them.
+ *
+ *	0525c000  045f084f   2127 / 1119, i.e. 2128 x 1120 minus one
+ *	0525c004  00002c05   hsync 44, vsync 5
+ *	0525c01c  07800084   132 = 44 + 88
+ *	0525c020  04380019    25 =  5 + 20
+ *	0528008c  00000037   layer X origin 55
+ *	05800000  01e0a40c   the [4:3] selector is 1
+ *	058c0014  b9002800   N = 40, and bit 24 -- ssc_en -- set
+ *	058c0018  c8d0362f   the spread-spectrum waveform
+ *
+ * The device's own display_cfg.xml agrees: hde 1920, vde 1080, htotal
+ * typical 2128 (min 2044, max 2208), vtotal typical 1120 (min 1100, max
+ * 1150), hs 44, vs 5, h_back_porch 88, pclk typical 143001600. It gives a
+ * range and the firmware picks within it.
+ *
+ * The TCON meanwhile runs 2200 x 1125, in stock as much as here. The mixer
+ * and the TCON are not meant to agree.
+ *
+ * PLL: 24 * 41 = 984 MHz. The stock boot log states it outright -- "ssc
+ * percent:10 wave bottom:0x362f, wave step:0x8d, n:41, ssc_freq:31500
+ * reg_value:0xc8d0362f" -- and spread spectrum is on, which is why ssc_reg
+ * is carried rather than left at the vendor default.
+ *
+ * dual_port is 1 here where board B has 0.
+ */
+static const struct h713_panel_cfg h713_panel_cfg_hy310 = {
+	.mapping = 0, .color_depth = 8, .odd_even = 0,
+	.dual_port = 1, .mirror_mode = 0,
+	.inv_de = 0, .inv_hsync = 0, .inv_vsync = 0, .inv_dclk = 1,
+	.de_current = 47, .odd_current = 7, .even_current = 7,
+	.ssc_en = 1,
+	.pll_n_plus_1 = 41,
+	.htotal = 2127, .vtotal = 1119, .hsync = 44, .vsync = 5,
+	.hbp = 88, .vbp = 20, .width = 1920, .height = 1080,
+	.lvds_bitsel = 1, .layer_x = 55,
+	.ssc_mask = 0xffffffff, .ssc_reg = 0xc8d0362f,
+	.layer_h_mask = 0xffff,
+};
+
+/*
  * The panel in force. Set from the board table once a display command knows
  * its project ID; board B's until then, so the diagnostics that run before any
  * selection keep the geometry they were written against.
@@ -300,6 +346,7 @@ static const struct h713_mips_fw_rev h713_mips_fw_revs[] = {
 		 */
 		.board = "HY310 (QZ713 V3.1)",
 		.project_id = 0x30,
+		.panel = &h713_panel_cfg_hy310,
 		.size = 0x132b18,
 		.hdcp_wait_va = 0x4b13d0a4,
 		.digest = {
@@ -355,6 +402,15 @@ static const struct {
 			0x08, 0xc7, 0x42, 0x4a, 0xc8, 0x00, 0x66, 0xc1,
 			0x96, 0x33, 0xe7, 0x6b, 0x15, 0x03, 0x78, 0xab,
 			0xf4, 0xde, 0x9d, 0x62, 0x69, 0x8e, 0xb2, 0x2c,
+		},
+	},
+	{
+		/* mips/bootlogo.bmp on an HY310: 1920x1080, 6220854 bytes. */
+		"HY310 (QZ713 V3.1)", {
+			0x96, 0x84, 0xef, 0x71, 0x48, 0x3e, 0xb1, 0x99,
+			0x01, 0xad, 0xf2, 0x5e, 0x55, 0xad, 0x61, 0x7e,
+			0xb2, 0xb4, 0x1d, 0x70, 0x65, 0xd9, 0xe2, 0x57,
+			0xe1, 0x08, 0x1c, 0x5c, 0x26, 0x09, 0x50, 0x33,
 		},
 	},
 };
