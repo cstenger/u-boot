@@ -188,15 +188,29 @@ struct h713_panel_cfg {
 	 */
 	u32 height;
 	/*
-	 * 0x05800000[4:3]. This used to be fed from color_depth, which is
-	 * wrong twice over: 8 & 3 is zero, and the field is an encoding
-	 * selector like the XML's lvds_format rather than a bit count.
+	 * 0x05800000[4:3]. This used to be fed from color_depth, which cannot
+	 * be what the field wants: 8 & 3 is zero on any board, so the write
+	 * carried no information. It reads as an encoding selector like the
+	 * XML's lvds_format. Board B keeps the zero it has been running;
+	 * 1 is what an HY310's stock bootloader leaves there.
 	 */
 	u32 lvds_bitsel;
 	/* 0x0528008c, the layer's pixel X origin. */
 	u32 layer_x;
-	/* 0x058c0018, the spread-spectrum waveform. */
+	/*
+	 * 0x058c0018, the spread-spectrum waveform, and the mask that says
+	 * whether this panel has one at all. A zero mask means the record is
+	 * left exactly as the vendor tables have it, which is the only honest
+	 * default for a board whose value has never been read.
+	 */
+	u32 ssc_mask;
 	u32 ssc_reg;
+	/*
+	 * Whether this panel writes the active height into 0x05280084[31:16].
+	 * Zero leaves the record alone, which is what board B's own note asks
+	 * for: "Do not change it on this reasoning alone."
+	 */
+	u32 layer_h_mask;
 };
 
 static const struct h713_panel_cfg h713_panel_cfg_board_b = {
@@ -218,7 +232,8 @@ static const struct h713_panel_cfg h713_panel_cfg_board_b = {
 	.htotal = 1360, .vtotal = 760, .hsync = 20, .vsync = 2,
 	.hbp = 40, .vbp = 20, .width = 1280, .height = 720,
 	/* All three chosen so this board's registers do not move. */
-	.lvds_bitsel = 0, .layer_x = 0, .ssc_reg = 0xc950311e,
+	.lvds_bitsel = 0, .layer_x = 0, .ssc_mask = 0, .ssc_reg = 0,
+	.layer_h_mask = 0,
 };
 
 /*
@@ -4887,8 +4902,15 @@ static int h713_disp_panel_patch(ulong blob, const struct h713_disp_sel *sel)
 		/* LVDS lane/map: protocol, bit width, swap and inversions */
 		/* Display PLL N: the panel decodes only near 864 MHz. */
 		{ 0x058c0014,  8, 0xff,   c->pll_n_plus_1 - 1 },
+		/*
+		 * The spread-spectrum waveform, if this panel declares one.
+		 * Board B's mask is zero, so the entry is skipped there and
+		 * its record keeps whatever the vendor tables hold -- which
+		 * has never been read on that board and must not be guessed.
+		 */
+		{ 0x058c0018,  0, c->ssc_mask, c->ssc_reg },
 		{ 0x05800000,  6, 0x3,    c->mapping },
-		{ 0x05800000,  3, 0x3,    c->color_depth },
+		{ 0x05800000,  3, 0x3,    c->lvds_bitsel },
 		{ 0x05800000, 14, 0x1,    c->odd_even },
 		{ 0x05800000, 16, 0x1,    c->inv_hsync },
 		{ 0x05800000, 17, 0x1,    c->inv_vsync },
@@ -4929,11 +4951,27 @@ static int h713_disp_panel_patch(ulong blob, const struct h713_disp_sel *sel)
 		{ 0x0524c004,  0, 0xffff, c->vsync + c->vbp },
 		{ 0x0524c014,  8, 0xff,   c->vsync },
 		{ 0x05280084,  0, 0xffff, c->width },
+		/*
+		 * The upper half, which the note above leaves alone because
+		 * stock appears to zero it there. On an HY310 a live stock
+		 * bootloader reads 04380780, i.e. the active height. Those two
+		 * observations are about different boards and need not agree.
+		 *
+		 * The same note asks not to change this on reasoning alone, so
+		 * board B's mask is zero and its record is untouched until a
+		 * perturbation on that hardware says otherwise. Only the panel
+		 * that was measured writes it.
+		 */
+		{ 0x05280084, 16, c->layer_h_mask, c->height },
 		{ 0x05280088,  0, 0xffff, c->vsync + c->vbp },
 		/*
-		 * The layer's pixel X origin, restored 2026-08-04. Stock writes
-		 * a literal zero here and this table omitted it, on the grounds
-		 * that an unjustifiable zero was worse than the vendor default.
+		 * The layer's pixel X origin, restored 2026-08-04.
+		 *
+		 * The zero above came from board B's own sweep -- test_32
+		 * showed it puts content at column 0 there -- so it is that
+		 * panel's answer and it stays. A live stock bootloader on an
+		 * HY310 reads 0x37 = 55 for its panel. Two boards, two values;
+		 * the register is per-panel and not a constant either way.
 		 * The vendor default is another panel's, and it is 123 -- which
 		 * is precisely the pale band that sat at the left of every
 		 * framebuffer photograph in this bring-up, and, through the
@@ -4949,7 +4987,7 @@ static int h713_disp_panel_patch(ulong blob, const struct h713_disp_sel *sel)
 		 * the fact also survives h713_disp_reassert_osd, which replays
 		 * DE block 5 from this same blob.
 		 */
-		{ 0x0528008c,  0, 0xffff, 0 },
+		{ 0x0528008c,  0, 0xffff, c->layer_x },
 	};
 	const struct h713_disp_block *ranges[] = {
 		&h713_disp_prologue[sel->prologue - 1],
@@ -4993,6 +5031,9 @@ static int h713_disp_panel_patch(ulong blob, const struct h713_disp_sel *sel)
 				u32 window, updated;
 
 				if (tbl[i].reg != rec.addr)
+					continue;
+				/* No field: this panel does not patch it. */
+				if (!tbl[i].fieldmask)
 					continue;
 
 				window = tbl[i].fieldmask << tbl[i].shift;
