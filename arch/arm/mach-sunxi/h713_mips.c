@@ -113,6 +113,12 @@
 #define H713_MIPS_SOURCE_TRACE_QUEUE_OFF	(H713_MIPS_TRACE_OFF + 0x30)
 #define H713_MIPS_SOURCE_TRACE_WORKER_OFF (H713_MIPS_TRACE_OFF + 0x34)
 #define H713_MIPS_VP_INIT_TRACE_OFF	(H713_MIPS_TRACE_OFF + 0x38)
+#define H713_MIPS_FRAME_TRACE_STAGE_OFF	(H713_MIPS_TRACE_OFF + 0x40)
+#define H713_MIPS_FRAME_TRACE_DIRTY_OFF	(H713_MIPS_TRACE_OFF + 0x44)
+#define H713_MIPS_FRAME_TRACE_MODE_OFF	(H713_MIPS_TRACE_OFF + 0x48)
+#define H713_MIPS_FRAME_TRACE_CTRL_OFF	(H713_MIPS_TRACE_OFF + 0x4c)
+#define H713_MIPS_FRAME_TRACE_LATCH_OFF	(H713_MIPS_TRACE_OFF + 0x50)
+#define H713_MIPS_FRAME_TRACE_DIRTY_LATCH_OFF (H713_MIPS_TRACE_OFF + 0x54)
 #define H713_MIPS_COMM_TRACE_MAGIC	0x434f4d4d
 #define H713_MIPS_STABILITY_SECONDS	60
 #define H713_MIPS_DIAG_OFF		0x00041000UL
@@ -1929,6 +1935,20 @@ static const struct h713_mips_patch h713_mips_trace_patches[] = {
  *   7103  VP initializer returned; loading the caller's physical buffer
  *   7104  0xd800-byte copy returned
  *   7105  output prepared; entering callback installation
+ *
+ * The PanelWinNode frame path has a final persistent stage as well.  Its
+ * virtual update method receives a dirty-bit mask and only invokes the AFBD
+ * frame programmer when bit 0x800 is set.  The programmer finishes by setting
+ * source-0's commit latch at 0xba600014 and the AFBD dirty bit at 0xba60006c:
+ *
+ *   6101  PanelWinNode dirty bit 0x800 selected the AFBD frame programmer
+ *   6102  source-0 control programmed; commit-latch store executed
+ *   6103  source-0 commit and AFBD dirty writes completed
+ *
+ * trace+0x44 records the complete dirty mask, +0x48 the PanelWinNode source
+ * mode at object+0x60, +0x4c the final source-0 control word, and +0x50/+0x54
+ * the immediate commit/dirty-latch readbacks.  These stores use only t8/t9 and
+ * preserve every displaced stock instruction.
  */
 static const struct h713_mips_patch h713_mips_comm_trace_patches[] = {
 	/* Release semaphore acquired -> marker a002 -> original logger. */
@@ -2410,6 +2430,41 @@ static const struct h713_mips_patch h713_mips_comm_trace_patches[] = {
 	{ 0x4b100a4c, 0x00000000, 0x0ac5305d }, /* j 0x8b14c174 */
 	{ 0x4b100a50, 0x00000000, 0x00000000 },
 	{ 0x4b109f74, 0x0ac5305d, 0x0ac40290 }, /* j 0x8b100a40 */
+
+	/* PanelWinNode dirty bit 0x800 -> capture mask/mode -> frame programmer. */
+	{ 0x4b100a60, 0x00000000, 0x3c18ae34 }, /* lui t8, 0xae34 */
+	{ 0x4b100a64, 0x00000000, 0x34196101 }, /* ori t9, zero, 0x6101 */
+	{ 0x4b100a68, 0x00000000, 0xaf190040 }, /* sw t9, 0x40(t8) */
+	{ 0x4b100a6c, 0x00000000, 0xaf110044 }, /* sw s1, 0x44(t8) */
+	{ 0x4b100a70, 0x00000000, 0x8e190060 }, /* lw t9, 0x60(s0) */
+	{ 0x4b100a74, 0x00000000, 0xaf190048 }, /* sw t9, 0x48(t8) */
+	{ 0x4b100a78, 0x00000000, 0x0ac6914e }, /* j 0x8b1a4538 */
+	{ 0x4b100a7c, 0x00000000, 0x02002025 }, /* move a0, s0 */
+	{ 0x4b1a4dc0, 0x0ec6914e, 0x0ec40298 }, /* jal 0x8b100a60 */
+
+	/* Preserve source-0 commit store and capture final control first. */
+	{ 0x4b100a80, 0x00000000, 0xac450014 }, /* sw a1, 0x14(v0) */
+	{ 0x4b100a84, 0x00000000, 0x3c18ae34 }, /* lui t8, 0xae34 */
+	{ 0x4b100a88, 0x00000000, 0x34196102 }, /* ori t9, zero, 0x6102 */
+	{ 0x4b100a8c, 0x00000000, 0xaf190040 }, /* sw t9, 0x40(t8) */
+	{ 0x4b100a90, 0x00000000, 0x8c590010 }, /* lw t9, 0x10(v0) */
+	{ 0x4b100a94, 0x00000000, 0xaf19004c }, /* sw t9, 0x4c(t8) */
+	{ 0x4b100a98, 0x00000000, 0x03e00008 }, /* jr ra */
+	{ 0x4b100a9c, 0x00000000, 0x00000000 },
+	{ 0x4b1a47d0, 0xac450014, 0x0ec402a0 }, /* jal 0x8b100a80 */
+
+	/* Preserve AFBD dirty store, then capture immediate latch readbacks. */
+	{ 0x4b100aa0, 0x00000000, 0xac43006c }, /* sw v1, 0x6c(v0) */
+	{ 0x4b100aa4, 0x00000000, 0x3c18ae34 }, /* lui t8, 0xae34 */
+	{ 0x4b100aa8, 0x00000000, 0x34196103 }, /* ori t9, zero, 0x6103 */
+	{ 0x4b100aac, 0x00000000, 0xaf190040 }, /* sw t9, 0x40(t8) */
+	{ 0x4b100ab0, 0x00000000, 0x8c590014 }, /* lw t9, 0x14(v0) */
+	{ 0x4b100ab4, 0x00000000, 0xaf190050 }, /* sw t9, 0x50(t8) */
+	{ 0x4b100ab8, 0x00000000, 0x8c59006c }, /* lw t9, 0x6c(v0) */
+	{ 0x4b100abc, 0x00000000, 0xaf190054 }, /* sw t9, 0x54(t8) */
+	{ 0x4b100ac0, 0x00000000, 0x03e00008 }, /* jr ra */
+	{ 0x4b100ac4, 0x00000000, 0x00000000 },
+	{ 0x4b1a47dc, 0xac43006c, 0x0ec402a8 }, /* jal 0x8b100aa0 */
 };
 
 static void h713_mips_print_digest(const u8 *digest)
@@ -3052,6 +3107,22 @@ static const char *h713_mips_vp_init_trace_stage_name(u32 stage)
 	}
 }
 
+static const char *h713_mips_frame_trace_stage_name(u32 stage)
+{
+	switch (stage) {
+	case 0:
+		return "not observed";
+	case 0x6101:
+		return "PanelWinNode selected AFBD frame update";
+	case 0x6102:
+		return "source control programmed; commit-latch store executed";
+	case 0x6103:
+		return "source commit and AFBD dirty writes completed";
+	default:
+		return "unknown frame stage";
+	}
+}
+
 static void h713_mips_print_comm_trace(void)
 {
 	u32 magic = h713_mips_read_shmem(H713_MIPS_COMM_TRACE_MAGIC_OFF);
@@ -3070,6 +3141,13 @@ static void h713_mips_print_comm_trace(void)
 	u32 source_worker = h713_mips_read_shmem(
 		H713_MIPS_SOURCE_TRACE_WORKER_OFF);
 	u32 vp_init_stage = h713_mips_read_shmem(H713_MIPS_VP_INIT_TRACE_OFF);
+	u32 frame_stage = h713_mips_read_shmem(H713_MIPS_FRAME_TRACE_STAGE_OFF);
+	u32 frame_dirty = h713_mips_read_shmem(H713_MIPS_FRAME_TRACE_DIRTY_OFF);
+	u32 frame_mode = h713_mips_read_shmem(H713_MIPS_FRAME_TRACE_MODE_OFF);
+	u32 frame_ctrl = h713_mips_read_shmem(H713_MIPS_FRAME_TRACE_CTRL_OFF);
+	u32 frame_latch = h713_mips_read_shmem(H713_MIPS_FRAME_TRACE_LATCH_OFF);
+	u32 frame_dirty_latch = h713_mips_read_shmem(
+		H713_MIPS_FRAME_TRACE_DIRTY_LATCH_OFF);
 
 	if (magic != H713_MIPS_COMM_TRACE_MAGIC) {
 		printf("H713 comm trace: not installed for this boot "
@@ -3092,6 +3170,10 @@ static void h713_mips_print_comm_trace(void)
 	       h713_mips_source_trace_stage_name(source_worker), source_event,
 	       source_new, source_old, source_queue,
 	       source_stage >= 0x5102 && source_queue == 0 ? " (success)" : "");
+	printf("H713 frame trace: stage=0x%04x (%s), dirty=%08x mode=%08x "
+	       "ctrl=%08x commit=%08x dirty-latch=%08x\n", frame_stage,
+	       h713_mips_frame_trace_stage_name(frame_stage), frame_dirty,
+	       frame_mode, frame_ctrl, frame_latch, frame_dirty_latch);
 }
 
 static int h713_mips_apply_comm_trace(void)
@@ -3128,6 +3210,12 @@ static int h713_mips_apply_comm_trace(void)
 	writel(~0U, trace + 0x30);
 	writel(0, trace + 0x34);
 	writel(0, trace + 0x38);
+	writel(0, trace + 0x40);
+	writel(0, trace + 0x44);
+	writel(~0U, trace + 0x48);
+	writel(0, trace + 0x4c);
+	writel(~0U, trace + 0x50);
+	writel(~0U, trace + 0x54);
 	flush_cache(trace, CONFIG_SYS_CACHELINE_SIZE);
 	flush_cache(H713_MIPS_FW_ADDR, H713_MIPS_FW_WINDOW_SIZE);
 	h713_comm_trace_active = true;
