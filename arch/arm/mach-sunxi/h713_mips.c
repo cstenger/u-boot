@@ -10410,7 +10410,24 @@ static int h713_disp_test(u32 project, u32 source_id, u32 level, u32 mode)
  * output only: the register dumps, the chroma markers, fbcheck, and the 15 s
  * diagnostic dwell (fatal on a boot path).
  */
-static int h713_disp_auto_logo(u32 project, const char *logo_file)
+/*
+ * `quiesce == false` is the scaler experiment, not a boot mode. Every existing
+ * ARM-side render parks the MIPS first, so "an image on the glass AND the MIPS
+ * running" cannot be reached from the command surface at all -- which blocks
+ * the one test that can decide whether the scaler at 0x05000000 lives in the
+ * firmware's window layer. Measured 2026-09-04: preboot `auto <id> logo` leaves
+ * the core quiesced, `init` leaves it running but renders nothing, and
+ * `panel-test <id> vendor-logo` renders for 15 s and also quiesces.
+ *
+ * Expect contention, and read it as data rather than as a bug. With the core
+ * running, firmware display ownership may rewrite the DE/OSD/AFBD words this
+ * path programs -- that is exactly the hazard the quiesce exists to remove, and
+ * it is why every other caller keeps it. If the logo does not survive to the
+ * prompt, that is itself the answer: the firmware owns those registers, and the
+ * ARM-side framebuffer route and the live window layer are mutually exclusive.
+ */
+static int h713_disp_auto_logo_mode(u32 project, const char *logo_file,
+				    bool quiesce)
 {
 	u32 phy14, phy28, route54;
 	int ret;
@@ -10431,7 +10448,11 @@ static int h713_disp_auto_logo(u32 project, const char *logo_file)
 	if (ret)
 		return h713_disp_fail(ret);
 
-	h713_disp_quiesce_mips_owner();
+	if (quiesce)
+		h713_disp_quiesce_mips_owner();
+	else
+		printf("H713 panel: MIPS core LEFT RUNNING; reset=%08x status=%08x\n",
+		       readl(H713_MIPS_RESET_REG), readl(H713_MIPS_STATUS_REG));
 	h713_disp_latch_panel_timing();
 
 	/* The DE replay re-asserts the OSD/AFBD path the framebuffer needs, but
@@ -10464,7 +10485,35 @@ static int h713_disp_auto_logo(u32 project, const char *logo_file)
 	h713_disp_commit_osd_frame();
 
 	printf("H713 disp: boot logo published and committed\n");
+
+	/*
+	 * Sample the raster twice after the commit. With the core running this
+	 * is the only cheap evidence that the firmware has not taken the display
+	 * back: a scan counter that is zero or frozen means whatever is on the
+	 * glass is not being scanned, and no ratio test against it would mean
+	 * anything.
+	 */
+	if (!quiesce) {
+		u32 scan_a = readl(H713_DISP_LVDS_SCAN_REG);
+		u32 scan_b;
+
+		mdelay(40);
+		scan_b = readl(H713_DISP_LVDS_SCAN_REG);
+		printf("H713 disp: MIPS still running: reset=%08x status=%08x "
+		       "scan=%08x->%08x\n", readl(H713_MIPS_RESET_REG),
+		       readl(H713_MIPS_STATUS_REG), scan_a, scan_b);
+		if (!scan_a || scan_a == scan_b)
+			printf("H713 disp: WARNING: raster not proven live; a "
+			       "visual result here is not a verdict\n");
+		printf("H713 disp: logo is up with the window layer running. "
+		       "Poke 0x05000174/0x05000274 now.\n");
+	}
 	return 0;
+}
+
+static int h713_disp_auto_logo(u32 project, const char *logo_file)
+{
+	return h713_disp_auto_logo_mode(project, logo_file, true);
 }
 
 static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
@@ -10785,6 +10834,22 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
+	/*
+	 * The same sequence as `auto <id> logo`, but the MIPS core is left
+	 * running. Diagnostic only -- never a boot path. It exists because the
+	 * scaler test needs an image on the glass WITH the window layer live,
+	 * and no other command produces that combination.
+	 */
+	if (argc >= 3 && !strcmp(argv[1], "logo-live")) {
+		u32 project = hextoul(argv[2], NULL);
+		const char *logo_file = argc > 3 ? argv[3] : NULL;
+
+		if (argc > 4)
+			return CMD_RET_USAGE;
+		return h713_disp_auto_logo_mode(project, logo_file, false) ?
+		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
+	}
+
 	/* Load everything from eMMC, then run: one command from power-on. */
 	if (argc >= 3 && !strcmp(argv[1], "auto")) {
 		u32 project = hextoul(argv[2], NULL);
@@ -10909,6 +10974,13 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "                                      vendor-logo-late: alias of vendor-logo-chroma; loading late is now the default\n"
 	   "                                      vendor-logo-early: loads before the display sequence -- known broken, kept to chase why\n"
 	   "       h713_disp panel-test <id> <mode> <stride>  - same, with AFBD 0x05600170 forced to <stride> bytes (hex)\n"
+	   "h713_disp logo-live <project-id> [file.bmp] - publish the logo and LEAVE THE MIPS\n"
+	   "                                      RUNNING. Diagnostic only, never a boot path:\n"
+	   "                                      every other render quiesces first, so this is\n"
+	   "                                      the only way to get an image on the glass with\n"
+	   "                                      the firmware window layer live (needed to test\n"
+	   "                                      the scaler at 0x05000000). Expect contention --\n"
+	   "                                      if the logo does not survive, that IS the result\n"
 	   "h713_disp auto <project-id> [nowait] [logo [file.bmp]] - load from eMMC and run\n"
 	   "                                      logo: publish the boot logo and leave it up (product boot step)\n"
 	   "                                            optional file.bmp on mmc 1:2 is a custom 1280x720 24-bit logo (no hash);\n"
