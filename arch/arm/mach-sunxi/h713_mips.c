@@ -94,6 +94,16 @@
 #define H713_MIPS_TRACE_TIMEOUT_US	10000000
 #define H713_MIPS_DISP_READY_TIMEOUT_US	4000000
 #define H713_MIPS_TRACE_OFF		0x00040000UL
+/*
+ * The CPU_COMM SMM heap begins at shared+0x2ccf0, so shared+0x40000 is
+ * unsuitable for a trace that runs while IPC is live.  The exact display.bin
+ * has a zero-filled, unused gap between the comm-trace trampolines (ending at
+ * firmware+0xac4) and the exception vectors (firmware+0x1000).  Keep this
+ * mailbox in that guarded firmware gap instead.
+ */
+#define H713_MIPS_COMM_TRACE_ADDR	(H713_MIPS_FW_ADDR + 0xe00UL)
+#define H713_MIPS_COMM_TRACE_MIPS_HI	0xab10U
+#define H713_MIPS_COMM_TRACE_MIPS_LO	0x0e00U
 #define H713_MIPS_TRACE_MARKER_COUNT	88
 #define H713_MIPS_TRACE_DBG_ADDR	88
 #define H713_MIPS_TRACE_DBG_SIZE	89
@@ -101,24 +111,6 @@
 #define H713_MIPS_TRACE_REG_OBJECT	91
 #define H713_MIPS_TRACE_REG_CALLBACK	92
 #define H713_MIPS_TRACE_COUNT		93
-#define H713_MIPS_COMM_TRACE_STAGE_OFF	H713_MIPS_TRACE_OFF
-#define H713_MIPS_COMM_TRACE_MAGIC_OFF	(H713_MIPS_TRACE_OFF + 4)
-#define H713_MIPS_COMM_TRACE_QUEUE_OFF	(H713_MIPS_TRACE_OFF + 8)
-#define H713_MIPS_COMM_TRACE_CALL_OFF	(H713_MIPS_TRACE_OFF + 12)
-#define H713_MIPS_COMM_TRACE_ACK_OFF	(H713_MIPS_TRACE_OFF + 16)
-#define H713_MIPS_SOURCE_TRACE_STAGE_OFF	(H713_MIPS_TRACE_OFF + 0x20)
-#define H713_MIPS_SOURCE_TRACE_EVENT_OFF	(H713_MIPS_TRACE_OFF + 0x24)
-#define H713_MIPS_SOURCE_TRACE_NEW_OFF	(H713_MIPS_TRACE_OFF + 0x28)
-#define H713_MIPS_SOURCE_TRACE_OLD_OFF	(H713_MIPS_TRACE_OFF + 0x2c)
-#define H713_MIPS_SOURCE_TRACE_QUEUE_OFF	(H713_MIPS_TRACE_OFF + 0x30)
-#define H713_MIPS_SOURCE_TRACE_WORKER_OFF (H713_MIPS_TRACE_OFF + 0x34)
-#define H713_MIPS_VP_INIT_TRACE_OFF	(H713_MIPS_TRACE_OFF + 0x38)
-#define H713_MIPS_FRAME_TRACE_STAGE_OFF	(H713_MIPS_TRACE_OFF + 0x40)
-#define H713_MIPS_FRAME_TRACE_DIRTY_OFF	(H713_MIPS_TRACE_OFF + 0x44)
-#define H713_MIPS_FRAME_TRACE_MODE_OFF	(H713_MIPS_TRACE_OFF + 0x48)
-#define H713_MIPS_FRAME_TRACE_CTRL_OFF	(H713_MIPS_TRACE_OFF + 0x4c)
-#define H713_MIPS_FRAME_TRACE_LATCH_OFF	(H713_MIPS_TRACE_OFF + 0x50)
-#define H713_MIPS_FRAME_TRACE_DIRTY_LATCH_OFF (H713_MIPS_TRACE_OFF + 0x54)
 #define H713_MIPS_COMM_TRACE_MAGIC	0x434f4d4d
 #define H713_MIPS_STABILITY_SECONDS	60
 #define H713_MIPS_DIAG_OFF		0x00041000UL
@@ -1914,10 +1906,11 @@ static const struct h713_mips_patch h713_mips_trace_patches[] = {
  *   f002  RETURN_ACK HISR dispatcher returned
  *   f003  RETURN_ACK HISR wrapper is returning
  *
- * The final three trampolines follow THal_Vp_SetSource below CPU_COMM. They
- * publish through the same uncached alias because the stock source globals
- * live in cached MIPS KSEG0 and therefore cannot be inspected reliably from
- * ARM with fwmd:
+ * The final three trampolines follow THal_Vp_SetSource below CPU_COMM. The
+ * patch installer relocates all this trace's uncached stores to the guarded
+ * firmware gap at 0xab100e00; the old 0xae340000 target lies inside the
+ * CPU_COMM SMM heap. The stock source globals live in cached MIPS KSEG0 and
+ * therefore cannot be inspected reliably from ARM with fwmd:
  *
  *   5101  source callback received an event
  *   5102  source callback returned from its nonblocking queue send
@@ -3125,29 +3118,25 @@ static const char *h713_mips_frame_trace_stage_name(u32 stage)
 
 static void h713_mips_print_comm_trace(void)
 {
-	u32 magic = h713_mips_read_shmem(H713_MIPS_COMM_TRACE_MAGIC_OFF);
-	u32 stage = h713_mips_read_shmem(H713_MIPS_COMM_TRACE_STAGE_OFF);
-	u32 call_stage = h713_mips_read_shmem(H713_MIPS_COMM_TRACE_CALL_OFF);
-	u32 queue_status = h713_mips_read_shmem(H713_MIPS_COMM_TRACE_QUEUE_OFF);
-	u32 ack_stage = h713_mips_read_shmem(H713_MIPS_COMM_TRACE_ACK_OFF);
-	u32 source_stage = h713_mips_read_shmem(
-		H713_MIPS_SOURCE_TRACE_STAGE_OFF);
-	u32 source_event = h713_mips_read_shmem(
-		H713_MIPS_SOURCE_TRACE_EVENT_OFF);
-	u32 source_new = h713_mips_read_shmem(H713_MIPS_SOURCE_TRACE_NEW_OFF);
-	u32 source_old = h713_mips_read_shmem(H713_MIPS_SOURCE_TRACE_OLD_OFF);
-	u32 source_queue = h713_mips_read_shmem(
-		H713_MIPS_SOURCE_TRACE_QUEUE_OFF);
-	u32 source_worker = h713_mips_read_shmem(
-		H713_MIPS_SOURCE_TRACE_WORKER_OFF);
-	u32 vp_init_stage = h713_mips_read_shmem(H713_MIPS_VP_INIT_TRACE_OFF);
-	u32 frame_stage = h713_mips_read_shmem(H713_MIPS_FRAME_TRACE_STAGE_OFF);
-	u32 frame_dirty = h713_mips_read_shmem(H713_MIPS_FRAME_TRACE_DIRTY_OFF);
-	u32 frame_mode = h713_mips_read_shmem(H713_MIPS_FRAME_TRACE_MODE_OFF);
-	u32 frame_ctrl = h713_mips_read_shmem(H713_MIPS_FRAME_TRACE_CTRL_OFF);
-	u32 frame_latch = h713_mips_read_shmem(H713_MIPS_FRAME_TRACE_LATCH_OFF);
-	u32 frame_dirty_latch = h713_mips_read_shmem(
-		H713_MIPS_FRAME_TRACE_DIRTY_LATCH_OFF);
+	ulong trace = H713_MIPS_COMM_TRACE_ADDR;
+	u32 magic = readl(trace + 4);
+	u32 stage = readl(trace);
+	u32 call_stage = readl(trace + 12);
+	u32 queue_status = readl(trace + 8);
+	u32 ack_stage = readl(trace + 16);
+	u32 source_stage = readl(trace + 0x20);
+	u32 source_event = readl(trace + 0x24);
+	u32 source_new = readl(trace + 0x28);
+	u32 source_old = readl(trace + 0x2c);
+	u32 source_queue = readl(trace + 0x30);
+	u32 source_worker = readl(trace + 0x34);
+	u32 vp_init_stage = readl(trace + 0x38);
+	u32 frame_stage = readl(trace + 0x40);
+	u32 frame_dirty = readl(trace + 0x44);
+	u32 frame_mode = readl(trace + 0x48);
+	u32 frame_ctrl = readl(trace + 0x4c);
+	u32 frame_latch = readl(trace + 0x50);
+	u32 frame_dirty_latch = readl(trace + 0x54);
 
 	if (magic != H713_MIPS_COMM_TRACE_MAGIC) {
 		printf("H713 comm trace: not installed for this boot "
@@ -3178,16 +3167,15 @@ static void h713_mips_print_comm_trace(void)
 
 static int h713_mips_apply_comm_trace(void)
 {
-	ulong trace = H713_MIPS_SHMEM_ADDR + H713_MIPS_TRACE_OFF;
+	ulong trace = H713_MIPS_COMM_TRACE_ADDR;
+	int base_count = 0;
+	int store_count = 0;
 	int i;
 
-	for (i = 0; i < ARRAY_SIZE(h713_mips_comm_trace_patches); i++) {
-		const struct h713_mips_patch *patch =
-			&h713_mips_comm_trace_patches[i];
-
-		if (readl(patch->addr) != patch->expected) {
-			printf("H713 MIPS: comm trace site 0x%08lx is not pristine\n",
-			       patch->addr);
+	for (i = 0; i <= 0x54; i += sizeof(u32)) {
+		if (readl(trace + i)) {
+			printf("H713 MIPS: comm trace mailbox 0x%08lx is not pristine\n",
+			       trace + i);
 			return -EINVAL;
 		}
 	}
@@ -3195,8 +3183,54 @@ static int h713_mips_apply_comm_trace(void)
 	for (i = 0; i < ARRAY_SIZE(h713_mips_comm_trace_patches); i++) {
 		const struct h713_mips_patch *patch =
 			&h713_mips_comm_trace_patches[i];
+		u32 word = patch->replacement;
+		u32 op = word >> 26;
+		u32 reg = (word >> 16) & 0x1f;
 
-		writel(patch->replacement, patch->addr);
+		if (readl(patch->addr) != patch->expected) {
+			printf("H713 MIPS: comm trace site 0x%08lx is not pristine\n",
+			       patch->addr);
+			return -EINVAL;
+		}
+		if (op == 0x0f && (reg == 24 || reg == 26) &&
+		    (word & 0xffff) == 0xae34)
+			base_count++;
+		else if (op == 0x2b &&
+			 (((word >> 21) & 0x1f) == 24 ||
+			  ((word >> 21) & 0x1f) == 26) &&
+			 (word & 0xffff) <= 0x54)
+			store_count++;
+	}
+	if (base_count != 58 || store_count != 69) {
+		printf("H713 MIPS: comm trace relocation count mismatch (%d bases, %d stores)\n",
+		       base_count, store_count);
+		return -EINVAL;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(h713_mips_comm_trace_patches); i++) {
+		const struct h713_mips_patch *patch =
+			&h713_mips_comm_trace_patches[i];
+
+		u32 word = patch->replacement;
+		u32 op = word >> 26;
+		u32 reg = (word >> 16) & 0x1f;
+
+		/*
+		 * Retarget only this trace's stores: lui t8/k0,0xae34 and
+		 * sw <value>,offset(t8/k0).  The original patch table remains
+		 * readable alongside the exact-image guards above.  All offsets
+		 * fit after adding 0xe00; unrelated firmware stores are untouched.
+		 */
+		if (op == 0x0f && (reg == 24 || reg == 26) &&
+		    (word & 0xffff) == 0xae34)
+			word = (word & 0xffff0000) |
+				H713_MIPS_COMM_TRACE_MIPS_HI;
+		else if (op == 0x2b &&
+			 (((word >> 21) & 0x1f) == 24 ||
+			  ((word >> 21) & 0x1f) == 26) &&
+			 (word & 0xffff) <= 0x54)
+			word += H713_MIPS_COMM_TRACE_MIPS_LO;
+		writel(word, patch->addr);
 	}
 	writel(0, trace);
 	writel(H713_MIPS_COMM_TRACE_MAGIC, trace + 4);
@@ -3219,7 +3253,8 @@ static int h713_mips_apply_comm_trace(void)
 	flush_cache(trace, CONFIG_SYS_CACHELINE_SIZE);
 	flush_cache(H713_MIPS_FW_ADDR, H713_MIPS_FW_WINDOW_SIZE);
 	h713_comm_trace_active = true;
-	printf("H713 MIPS: CPU_COMM RETURN progress trace installed\n");
+	printf("H713 MIPS: CPU_COMM RETURN progress trace installed at 0x%08lx\n",
+	       trace);
 
 	return 0;
 }
@@ -9413,8 +9448,7 @@ static int h713_comm_call(u32 comp_id, const u32 *params, uint nparams,
 
 				for (action_waited = 0; action_waited < 1000;
 				     action_waited++) {
-					action_stage = h713_mips_read_shmem(
-						H713_MIPS_COMM_TRACE_STAGE_OFF);
+					action_stage = readl(H713_MIPS_COMM_TRACE_ADDR);
 					if (action_stage == 0xc013 ||
 					    action_stage == 0xd103 ||
 					    action_stage == 0xc111)
