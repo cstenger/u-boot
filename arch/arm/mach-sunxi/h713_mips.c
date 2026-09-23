@@ -95,15 +95,17 @@
 #define H713_MIPS_DISP_READY_TIMEOUT_US	4000000
 #define H713_MIPS_TRACE_OFF		0x00040000UL
 /*
- * The CPU_COMM SMM heap begins at shared+0x2ccf0, so shared+0x40000 is
- * unsuitable for a trace that runs while IPC is live.  The exact display.bin
- * has a zero-filled, unused gap between the comm-trace trampolines (ending at
- * firmware+0xac4) and the exception vectors (firmware+0x1000).  Keep this
- * mailbox in that guarded firmware gap instead.
+ * The CPU_COMM SMM heap includes shared+0x40000.  The firmware's apparently
+ * empty boot-code gap at 0x4b100e00 later changed one trace word unexpectedly
+ * during SetSource(2).  Place the mailbox in a separate 4 KiB page after the
+ * documented decoder buffer, before the temporary boot logo.  The matching
+ * diagnostic kernel DTS reserves this page from Linux as no-map.
  */
-#define H713_MIPS_COMM_TRACE_ADDR	(H713_MIPS_FW_ADDR + 0xe00UL)
-#define H713_MIPS_COMM_TRACE_MIPS_HI	0xab10U
-#define H713_MIPS_COMM_TRACE_MIPS_LO	0x0e00U
+#define H713_MIPS_COMM_TRACE_ADDR	0x4d980000UL
+#define H713_MIPS_COMM_TRACE_SIZE	0x1000UL
+#define H713_MIPS_COMM_TRACE_MIPS_HI	0xad98U
+#define H713_MIPS_COMM_TRACE_MIPS_LO	0x0000U
+#define H713_MIPS_COMM_TRACE_CANARY	0x43414e31U
 #define H713_MIPS_TRACE_MARKER_COUNT	88
 #define H713_MIPS_TRACE_DBG_ADDR	88
 #define H713_MIPS_TRACE_DBG_SIZE	89
@@ -1907,9 +1909,9 @@ static const struct h713_mips_patch h713_mips_trace_patches[] = {
  *   f003  RETURN_ACK HISR wrapper is returning
  *
  * The final three trampolines follow THal_Vp_SetSource below CPU_COMM. The
- * patch installer relocates all this trace's uncached stores to the guarded
- * firmware gap at 0xab100e00; the old 0xae340000 target lies inside the
- * CPU_COMM SMM heap. The stock source globals live in cached MIPS KSEG0 and
+ * patch installer retargets all this trace's uncached stores to the dedicated
+ * page at 0xad980000; the old 0xae340000 target lies inside the CPU_COMM SMM
+ * heap. The stock source globals live in cached MIPS KSEG0 and
  * therefore cannot be inspected reliably from ARM with fwmd:
  *
  *   5101  source callback received an event
@@ -3172,14 +3174,6 @@ static int h713_mips_apply_comm_trace(void)
 	int store_count = 0;
 	int i;
 
-	for (i = 0; i <= 0x54; i += sizeof(u32)) {
-		if (readl(trace + i)) {
-			printf("H713 MIPS: comm trace mailbox 0x%08lx is not pristine\n",
-			       trace + i);
-			return -EINVAL;
-		}
-	}
-
 	for (i = 0; i < ARRAY_SIZE(h713_mips_comm_trace_patches); i++) {
 		const struct h713_mips_patch *patch =
 			&h713_mips_comm_trace_patches[i];
@@ -3207,6 +3201,10 @@ static int h713_mips_apply_comm_trace(void)
 		return -EINVAL;
 	}
 
+	/* U-Boot owns this page before Linux; old DRAM contents are arbitrary. */
+	memset((void *)trace, 0, H713_MIPS_COMM_TRACE_SIZE);
+	flush_cache(trace, H713_MIPS_COMM_TRACE_SIZE);
+
 	for (i = 0; i < ARRAY_SIZE(h713_mips_comm_trace_patches); i++) {
 		const struct h713_mips_patch *patch =
 			&h713_mips_comm_trace_patches[i];
@@ -3218,8 +3216,8 @@ static int h713_mips_apply_comm_trace(void)
 		/*
 		 * Retarget only this trace's stores: lui t8/k0,0xae34 and
 		 * sw <value>,offset(t8/k0).  The original patch table remains
-		 * readable alongside the exact-image guards above.  All offsets
-		 * fit after adding 0xe00; unrelated firmware stores are untouched.
+		 * readable alongside the exact-image guards above.  The low address
+		 * half is zero for this page; unrelated firmware stores are untouched.
 		 */
 		if (op == 0x0f && (reg == 24 || reg == 26) &&
 		    (word & 0xffff) == 0xae34)
@@ -3250,7 +3248,9 @@ static int h713_mips_apply_comm_trace(void)
 	writel(0, trace + 0x4c);
 	writel(~0U, trace + 0x50);
 	writel(~0U, trace + 0x54);
-	flush_cache(trace, CONFIG_SYS_CACHELINE_SIZE);
+	writel(H713_MIPS_COMM_TRACE_CANARY, trace + 0x80);
+	writel(H713_MIPS_COMM_TRACE_CANARY, trace + 0xffc);
+	flush_cache(trace, H713_MIPS_COMM_TRACE_SIZE);
 	flush_cache(H713_MIPS_FW_ADDR, H713_MIPS_FW_WINDOW_SIZE);
 	h713_comm_trace_active = true;
 	printf("H713 MIPS: CPU_COMM RETURN progress trace installed at 0x%08lx\n",
