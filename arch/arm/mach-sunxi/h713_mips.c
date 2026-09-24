@@ -1919,6 +1919,12 @@ static const struct h713_mips_patch h713_mips_trace_patches[] = {
  *   5201  source worker dequeued a source-change event
  *   5202  source worker found new source equal to its current source
  *   5203  source worker completed the source transition
+ *   5301  SetSource adapter entered the firmware implementation
+ *   5302  SetSource implementation returned to its adapter
+ *
+ * The adapter stage and requested source are at trace+0x58/+0x5c. They are
+ * independent of the CPU_COMM worker and source-event markers: a RETURN can
+ * arrive without any of those markers changing, as observed for source 3.
  *
  * THal_Vp_Init's registered adapter gets one more persistent slot.  Its
  * three stock inputs are [0, 1, physical address of a 0xd800-byte buffer].
@@ -1946,6 +1952,23 @@ static const struct h713_mips_patch h713_mips_trace_patches[] = {
  * preserve every displaced stock instruction.
  */
 static const struct h713_mips_patch h713_mips_comm_trace_patches[] = {
+	/* Record the adapter's requested source before the actual SetSource call. */
+	{ 0x4b101000, 0x00000000, 0x3c18ae34 }, /* lui t8, trace page */
+	{ 0x4b101004, 0x00000000, 0x34195301 }, /* ori t9, zero, 0x5301 */
+	{ 0x4b101008, 0x00000000, 0xaf190058 }, /* sw t9, +0x58(t8) */
+	{ 0x4b10100c, 0x00000000, 0xaf04005c }, /* sw a0, +0x5c(t8) */
+	{ 0x4b101010, 0x00000000, 0x0ac52d12 }, /* j 0x8b14b448 */
+	{ 0x4b101014, 0x00000000, 0x00000000 },
+	{ 0x4b10a228, 0x0ec52d12, 0x0ec40400 }, /* jal adapter trace */
+
+	/* Record a return, preserving the adapter's store and saved ra load. */
+	{ 0x4b101020, 0x00000000, 0x3c1aae34 },
+	{ 0x4b101024, 0x00000000, 0x341b5302 },
+	{ 0x4b101028, 0x00000000, 0xaf5b0058 },
+	{ 0x4b10102c, 0x00000000, 0x0ac4288e }, /* j 0x8b10a238 */
+	{ 0x4b101030, 0x00000000, 0x8fbf0014 }, /* lw ra, 0x14(sp) */
+	{ 0x4b10a230, 0x8fbf0014, 0x0ac40408 }, /* j return trace */
+
 	/* Release semaphore acquired -> marker a002 -> original logger. */
 	{ 0x4b1004c0, 0x00000000, 0x3c1aae34 },
 	{ 0x4b1004c4, 0x00000000, 0x341ba002 },
@@ -3121,24 +3144,36 @@ static const char *h713_mips_frame_trace_stage_name(u32 stage)
 static void h713_mips_print_comm_trace(void)
 {
 	ulong trace = H713_MIPS_COMM_TRACE_ADDR;
-	u32 magic = readl(trace + 4);
-	u32 stage = readl(trace);
-	u32 call_stage = readl(trace + 12);
-	u32 queue_status = readl(trace + 8);
-	u32 ack_stage = readl(trace + 16);
-	u32 source_stage = readl(trace + 0x20);
-	u32 source_event = readl(trace + 0x24);
-	u32 source_new = readl(trace + 0x28);
-	u32 source_old = readl(trace + 0x2c);
-	u32 source_queue = readl(trace + 0x30);
-	u32 source_worker = readl(trace + 0x34);
-	u32 vp_init_stage = readl(trace + 0x38);
-	u32 frame_stage = readl(trace + 0x40);
-	u32 frame_dirty = readl(trace + 0x44);
-	u32 frame_mode = readl(trace + 0x48);
-	u32 frame_ctrl = readl(trace + 0x4c);
-	u32 frame_latch = readl(trace + 0x50);
-	u32 frame_dirty_latch = readl(trace + 0x54);
+	u32 magic, stage, call_stage, queue_status, ack_stage;
+	u32 source_stage, source_event, source_new, source_old;
+	u32 source_queue, source_worker, vp_init_stage;
+	u32 frame_stage, frame_dirty, frame_mode, frame_ctrl, frame_latch;
+	u32 frame_dirty_latch, adapter_stage, adapter_source;
+
+	/* The MIPS writes through its uncached alias; ARM's prior snapshot is stale. */
+	invalidate_dcache_range(trace,
+				trace + ALIGN(0x60, CONFIG_SYS_CACHELINE_SIZE));
+
+	magic = readl(trace + 4);
+	stage = readl(trace);
+	call_stage = readl(trace + 12);
+	queue_status = readl(trace + 8);
+	ack_stage = readl(trace + 16);
+	source_stage = readl(trace + 0x20);
+	source_event = readl(trace + 0x24);
+	source_new = readl(trace + 0x28);
+	source_old = readl(trace + 0x2c);
+	source_queue = readl(trace + 0x30);
+	source_worker = readl(trace + 0x34);
+	vp_init_stage = readl(trace + 0x38);
+	frame_stage = readl(trace + 0x40);
+	frame_dirty = readl(trace + 0x44);
+	frame_mode = readl(trace + 0x48);
+	frame_ctrl = readl(trace + 0x4c);
+	frame_latch = readl(trace + 0x50);
+	frame_dirty_latch = readl(trace + 0x54);
+	adapter_stage = readl(trace + 0x58);
+	adapter_source = readl(trace + 0x5c);
 
 	if (magic != H713_MIPS_COMM_TRACE_MAGIC) {
 		printf("H713 comm trace: not installed for this boot "
@@ -3161,10 +3196,22 @@ static void h713_mips_print_comm_trace(void)
 	       h713_mips_source_trace_stage_name(source_worker), source_event,
 	       source_new, source_old, source_queue,
 	       source_stage >= 0x5102 && source_queue == 0 ? " (success)" : "");
+	printf("H713 source adapter: stage=0x%04x requested=%u\n",
+	       adapter_stage, adapter_source);
 	printf("H713 frame trace: stage=0x%04x (%s), dirty=%08x mode=%08x "
 	       "ctrl=%08x commit=%08x dirty-latch=%08x\n", frame_stage,
 	       h713_mips_frame_trace_stage_name(frame_stage), frame_dirty,
 	       frame_mode, frame_ctrl, frame_latch, frame_dirty_latch);
+}
+
+static u32 h713_mips_read_comm_trace_stage(void)
+{
+	ulong trace = H713_MIPS_COMM_TRACE_ADDR;
+
+	/* A cached zero hid completed MIPS RETURNs during the U-Boot wait loop. */
+	invalidate_dcache_range(trace, trace + CONFIG_SYS_CACHELINE_SIZE);
+
+	return readl(trace);
 }
 
 static int h713_mips_apply_comm_trace(void)
@@ -3192,10 +3239,10 @@ static int h713_mips_apply_comm_trace(void)
 		else if (op == 0x2b &&
 			 (((word >> 21) & 0x1f) == 24 ||
 			  ((word >> 21) & 0x1f) == 26) &&
-			 (word & 0xffff) <= 0x54)
+			 (word & 0xffff) <= 0x5c)
 			store_count++;
 	}
-	if (base_count != 58 || store_count != 69) {
+	if (base_count != 60 || store_count != 72) {
 		printf("H713 MIPS: comm trace relocation count mismatch (%d bases, %d stores)\n",
 		       base_count, store_count);
 		return -EINVAL;
@@ -3226,7 +3273,7 @@ static int h713_mips_apply_comm_trace(void)
 		else if (op == 0x2b &&
 			 (((word >> 21) & 0x1f) == 24 ||
 			  ((word >> 21) & 0x1f) == 26) &&
-			 (word & 0xffff) <= 0x54)
+			 (word & 0xffff) <= 0x5c)
 			word += H713_MIPS_COMM_TRACE_MIPS_LO;
 		writel(word, patch->addr);
 	}
@@ -3242,6 +3289,8 @@ static int h713_mips_apply_comm_trace(void)
 	writel(~0U, trace + 0x30);
 	writel(0, trace + 0x34);
 	writel(0, trace + 0x38);
+	writel(0, trace + 0x58);
+	writel(~0U, trace + 0x5c);
 	writel(0, trace + 0x40);
 	writel(0, trace + 0x44);
 	writel(~0U, trace + 0x48);
@@ -9448,7 +9497,7 @@ static int h713_comm_call(u32 comp_id, const u32 *params, uint nparams,
 
 				for (action_waited = 0; action_waited < 1000;
 				     action_waited++) {
-					action_stage = readl(H713_MIPS_COMM_TRACE_ADDR);
+					action_stage = h713_mips_read_comm_trace_stage();
 					if (action_stage == 0xc013 ||
 					    action_stage == 0xd103 ||
 					    action_stage == 0xc111)
