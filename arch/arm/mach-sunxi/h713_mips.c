@@ -1927,6 +1927,10 @@ static const struct h713_mips_patch h713_mips_trace_patches[] = {
  * trace+0x58/+0x5c/+0x60/+0x64/+0x68. They are
  * independent of the CPU_COMM worker and source-event markers: a RETURN can
  * arrive without any of those markers changing, as observed for source 3.
+ * Filtered event-zero/source-3 callback, worker, and transition-completion
+ * counters occupy +0x6c/+0x70/+0x7c. The worker also records its previous
+ * and new source at +0x74/+0x78. These survive later event-1 updates to the
+ * shared last-event fields at +0x24/+0x28.
  *
  * THal_Vp_Init's registered adapter gets one more persistent slot.  Its
  * three stock inputs are [0, 1, physical address of a 0xd800-byte buffer].
@@ -1985,6 +1989,47 @@ static const struct h713_mips_patch h713_mips_comm_trace_patches[] = {
 	{ 0x4b1010d4, 0x00000000, 0x0ac42478 }, /* j 0x8b1091e0 */
 	{ 0x4b1010d8, 0x00000000, 0x00000000 },
 	{ 0x4b1091d8, 0x0040f809, 0x0ac40430 }, /* j 0x8b1010c0 */
+
+	/* Count source-3 dequeues before the original equal/transition branch.
+	 * t8 is the uncached trace-page base, t9 scratch. Replay the displaced
+	 * old-source store, then return to the unmodified branch. */
+	{ 0x4b100b00, 0x00000000, 0xaf16002c }, /* sw s6, +0x2c(t8) */
+	{ 0x4b100b04, 0x00000000, 0x3bd90003 }, /* xori t9, fp, 3 */
+	{ 0x4b100b08, 0x00000000, 0x17200006 }, /* bnez t9, 0x8b100b24 */
+	{ 0x4b100b0c, 0x00000000, 0x00000000 },
+	{ 0x4b100b10, 0x00000000, 0x8f190070 }, /* lw t9, count(t8) */
+	{ 0x4b100b14, 0x00000000, 0x27390001 }, /* addiu t9, t9, 1 */
+	{ 0x4b100b18, 0x00000000, 0xaf190070 }, /* sw t9, count(t8) */
+	{ 0x4b100b1c, 0x00000000, 0xaf1e0078 }, /* sw fp, last-new(t8) */
+	{ 0x4b100b20, 0x00000000, 0xaf160074 }, /* sw s6, last-old(t8) */
+	{ 0x4b100b24, 0x00000000, 0x0ac4025d }, /* j 0x8b100974 */
+	{ 0x4b100b28, 0x00000000, 0x00000000 },
+
+	/* The callback's last-event slots can be overwritten by a later event-1
+	 * notification. Keep a separate event-zero/source-3 enqueue counter. */
+	{ 0x4b100b40, 0x00000000, 0x8cb90000 }, /* lw t9, 0(a1): event */
+	{ 0x4b100b44, 0x00000000, 0x17200008 }, /* bnez t9, 0x8b100b68 */
+	{ 0x4b100b48, 0x00000000, 0x00000000 },
+	{ 0x4b100b4c, 0x00000000, 0x8cb90004 }, /* lw t9, 4(a1): source */
+	{ 0x4b100b50, 0x00000000, 0x3b390003 }, /* xori t9, t9, 3 */
+	{ 0x4b100b54, 0x00000000, 0x17200004 }, /* bnez t9, 0x8b100b68 */
+	{ 0x4b100b58, 0x00000000, 0x00000000 },
+	{ 0x4b100b5c, 0x00000000, 0x8f19006c }, /* lw t9, count(t8) */
+	{ 0x4b100b60, 0x00000000, 0x27390001 }, /* addiu t9, t9, 1 */
+	{ 0x4b100b64, 0x00000000, 0xaf19006c }, /* sw t9, count(t8) */
+	{ 0x4b100b68, 0x00000000, 0x0ac57118 }, /* j 0x8b15c460 */
+	{ 0x4b100b6c, 0x00000000, 0x00000000 },
+
+	/* Count source-3 transitions only after the general transition path
+	 * finishes, then replay its original jump to the worker loop. */
+	{ 0x4b100b80, 0x00000000, 0x3bd90003 }, /* xori t9, fp, 3 */
+	{ 0x4b100b84, 0x00000000, 0x17200004 }, /* bnez t9, 0x8b100b98 */
+	{ 0x4b100b88, 0x00000000, 0x00000000 },
+	{ 0x4b100b8c, 0x00000000, 0x8f19007c }, /* lw t9, count(t8) */
+	{ 0x4b100b90, 0x00000000, 0x27390001 }, /* addiu t9, t9, 1 */
+	{ 0x4b100b94, 0x00000000, 0xaf19007c }, /* sw t9, count(t8) */
+	{ 0x4b100b98, 0x00000000, 0x0ac424cf }, /* j 0x8b10933c */
+	{ 0x4b100b9c, 0x00000000, 0x00000000 },
 
 	/* Release semaphore acquired -> marker a002 -> original logger. */
 	{ 0x4b1004c0, 0x00000000, 0x3c1aae34 },
@@ -2379,7 +2424,7 @@ static const struct h713_mips_patch h713_mips_comm_trace_patches[] = {
 	{ 0x4b1008f0, 0x00000000, 0xaf190024 }, /* sw t9, 0x24(t8) */
 	{ 0x4b1008f4, 0x00000000, 0x8cb90004 }, /* lw t9, 4(a1) */
 	{ 0x4b1008f8, 0x00000000, 0xaf190028 }, /* sw t9, 0x28(t8) */
-	{ 0x4b1008fc, 0x00000000, 0x0ac57118 }, /* j 0x8b15c460 */
+	{ 0x4b1008fc, 0x00000000, 0x0ac402d0 }, /* j filtered source-3 counter */
 	{ 0x4b100900, 0x00000000, 0x00000000 },
 	{ 0x4b107580, 0x0ec57118, 0x0ec40238 }, /* jal 0x8b1008e0 */
 
@@ -2399,8 +2444,8 @@ static const struct h713_mips_patch h713_mips_comm_trace_patches[] = {
 	{ 0x4b100960, 0x00000000, 0x3c18ae34 }, /* lui t8, 0xae34 */
 	{ 0x4b100964, 0x00000000, 0x34195201 }, /* ori t9, zero, 0x5201 */
 	{ 0x4b100968, 0x00000000, 0xaf190034 }, /* sw t9, 0x34(t8) */
-	{ 0x4b10096c, 0x00000000, 0xaf1e0028 }, /* sw fp, 0x28(t8) */
-	{ 0x4b100970, 0x00000000, 0xaf16002c }, /* sw s6, 0x2c(t8) */
+	{ 0x4b10096c, 0x00000000, 0x0ac402c0 }, /* j source-3 worker counter */
+	{ 0x4b100970, 0x00000000, 0xaf1e0028 }, /* delay: sw fp, +0x28 */
 	{ 0x4b100974, 0x00000000, 0x13d60003 }, /* beq fp, s6, equal */
 	{ 0x4b100978, 0x00000000, 0x00000000 },
 	{ 0x4b10097c, 0x00000000, 0x0ac42557 }, /* j 0x8b10955c */
@@ -2416,7 +2461,7 @@ static const struct h713_mips_patch h713_mips_comm_trace_patches[] = {
 	{ 0x4b1009a0, 0x00000000, 0x3c18ae34 }, /* lui t8, 0xae34 */
 	{ 0x4b1009a4, 0x00000000, 0x34195203 }, /* ori t9, zero, 0x5203 */
 	{ 0x4b1009a8, 0x00000000, 0xaf190034 }, /* sw t9, 0x34(t8) */
-	{ 0x4b1009ac, 0x00000000, 0x0ac424cf }, /* j 0x8b10933c */
+	{ 0x4b1009ac, 0x00000000, 0x0ac402e0 }, /* j source-3 completion counter */
 	{ 0x4b1009b0, 0x00000000, 0x00000000 },
 	{ 0x4b1095a0, 0x1000ff66, 0x0ac40268 }, /* j 0x8b1009a0 */
 
@@ -3166,11 +3211,13 @@ static void h713_mips_print_comm_trace(void)
 	u32 source_queue, source_worker, vp_init_stage;
 	u32 frame_stage, frame_dirty, frame_mode, frame_ctrl, frame_latch;
 	u32 frame_dirty_latch, adapter_stage, adapter_source, adapter_callback;
-	u32 dispatch_target, dispatch_source;
+	u32 dispatch_target, dispatch_source, source3_callback_count;
+	u32 source3_worker_count, source3_worker_old, source3_worker_new;
+	u32 source3_transition_count;
 
 	/* The MIPS writes through its uncached alias; ARM's prior snapshot is stale. */
 	invalidate_dcache_range(trace,
-				trace + ALIGN(0x6c, CONFIG_SYS_CACHELINE_SIZE));
+				trace + ALIGN(0x80, CONFIG_SYS_CACHELINE_SIZE));
 
 	magic = readl(trace + 4);
 	stage = readl(trace);
@@ -3195,6 +3242,11 @@ static void h713_mips_print_comm_trace(void)
 	adapter_callback = readl(trace + 0x60);
 	dispatch_target = readl(trace + 0x64);
 	dispatch_source = readl(trace + 0x68);
+	source3_callback_count = readl(trace + 0x6c);
+	source3_worker_count = readl(trace + 0x70);
+	source3_worker_old = readl(trace + 0x74);
+	source3_worker_new = readl(trace + 0x78);
+	source3_transition_count = readl(trace + 0x7c);
 
 	if (magic != H713_MIPS_COMM_TRACE_MAGIC) {
 		printf("H713 comm trace: not installed for this boot "
@@ -3221,6 +3273,11 @@ static void h713_mips_print_comm_trace(void)
 	       adapter_stage, adapter_source, adapter_callback);
 	printf("H713 source dispatch: target=%08x source=%08x\n",
 	       dispatch_target, dispatch_source);
+	printf("H713 source 3: callback-event0=%u worker-event0=%u "
+	       "transition-complete=%u worker-old=%08x worker-new=%08x\n",
+	       source3_callback_count, source3_worker_count,
+	       source3_transition_count,
+	       source3_worker_old, source3_worker_new);
 	printf("H713 frame trace: stage=0x%04x (%s), dirty=%08x mode=%08x "
 	       "ctrl=%08x commit=%08x dirty-latch=%08x\n", frame_stage,
 	       h713_mips_frame_trace_stage_name(frame_stage), frame_dirty,
@@ -3262,10 +3319,10 @@ static int h713_mips_apply_comm_trace(void)
 		else if (op == 0x2b &&
 			 (((word >> 21) & 0x1f) == 24 ||
 			  ((word >> 21) & 0x1f) == 26) &&
-			 (word & 0xffff) <= 0x68)
+			 (word & 0xffff) <= 0x7c)
 			store_count++;
 	}
-	if (base_count != 61 || store_count != 75) {
+	if (base_count != 61 || store_count != 80) {
 		printf("H713 MIPS: comm trace relocation count mismatch (%d bases, %d stores)\n",
 		       base_count, store_count);
 		return -EINVAL;
@@ -3296,7 +3353,7 @@ static int h713_mips_apply_comm_trace(void)
 		else if (op == 0x2b &&
 			 (((word >> 21) & 0x1f) == 24 ||
 			  ((word >> 21) & 0x1f) == 26) &&
-			 (word & 0xffff) <= 0x68)
+			 (word & 0xffff) <= 0x7c)
 			word += H713_MIPS_COMM_TRACE_MIPS_LO;
 		writel(word, patch->addr);
 	}
@@ -3317,6 +3374,11 @@ static int h713_mips_apply_comm_trace(void)
 	writel(~0U, trace + 0x60);
 	writel(~0U, trace + 0x64);
 	writel(~0U, trace + 0x68);
+	writel(0, trace + 0x6c);
+	writel(0, trace + 0x70);
+	writel(~0U, trace + 0x74);
+	writel(~0U, trace + 0x78);
+	writel(0, trace + 0x7c);
 	writel(0, trace + 0x40);
 	writel(0, trace + 0x44);
 	writel(~0U, trace + 0x48);
