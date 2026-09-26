@@ -1932,6 +1932,14 @@ static const struct h713_mips_patch h713_mips_trace_patches[] = {
  * and new source at +0x74/+0x78. These survive later event-1 updates to the
  * shared last-event fields at +0x24/+0x28.
  *
+ * The VIncap decoder has a separate, capture-only hook immediately after it
+ * masks the live status byte with the enabled-event byte.  The hook records
+ * only the already-read t1 mask; it never performs an ARM-side read of the
+ * capture register window.  It preserves t8, t9, the stack pointer, and the
+ * decoder's original a3 load, then resumes before the acknowledge sequence.
+ * The total interrupt and cap-vde/cap-vs/cap-mode_change counts occupy
+ * trace+0x84..+0x90.  The established page guard remains at +0x80.
+ *
  * THal_Vp_Init's registered adapter gets one more persistent slot.  Its
  * three stock inputs are [0, 1, physical address of a 0xd800-byte buffer].
  * These markers distinguish an internal initializer failure from a bad bulk
@@ -1958,6 +1966,38 @@ static const struct h713_mips_patch h713_mips_trace_patches[] = {
  * preserve every displaced stock instruction.
  */
 static const struct h713_mips_patch h713_mips_comm_trace_patches[] = {
+	/* Capture the VIncap event mask without reading capture MMIO from ARM.
+	 * The patched jump retains the original nor in its delay slot. */
+	{ 0x4b100ba0, 0x00000000, 0x27bdfff8 }, /* addiu sp, sp, -8 */
+	{ 0x4b100ba4, 0x00000000, 0xafb80000 }, /* sw t8, 0(sp) */
+	{ 0x4b100ba8, 0x00000000, 0xafb90004 }, /* sw t9, 4(sp) */
+	{ 0x4b100bac, 0x00000000, 0x3c18ae34 }, /* lui t8, trace page */
+	{ 0x4b100bb0, 0x00000000, 0x31390001 }, /* andi t9, t1, cap-vde */
+	{ 0x4b100bb4, 0x00000000, 0x13200003 }, /* beqz t9, cap-vs */
+	{ 0x4b100bb8, 0x00000000, 0x8f190088 }, /* delay: lw vde-count */
+	{ 0x4b100bbc, 0x00000000, 0x27390001 },
+	{ 0x4b100bc0, 0x00000000, 0xaf190088 },
+	{ 0x4b100bc4, 0x00000000, 0x31390002 }, /* andi t9, t1, cap-vs */
+	{ 0x4b100bc8, 0x00000000, 0x13200003 }, /* beqz t9, mode-change */
+	{ 0x4b100bcc, 0x00000000, 0x8f19008c }, /* delay: lw vs-count */
+	{ 0x4b100bd0, 0x00000000, 0x27390001 },
+	{ 0x4b100bd4, 0x00000000, 0xaf19008c },
+	{ 0x4b100bd8, 0x00000000, 0x31390004 }, /* andi t9, t1, mode-change */
+	{ 0x4b100bdc, 0x00000000, 0x13200003 }, /* beqz t9, total */
+	{ 0x4b100be0, 0x00000000, 0x8f190090 }, /* delay: lw mode-count */
+	{ 0x4b100be4, 0x00000000, 0x27390001 },
+	{ 0x4b100be8, 0x00000000, 0xaf190090 },
+	{ 0x4b100bec, 0x00000000, 0x8f190084 }, /* lw t9, total(t8) */
+	{ 0x4b100bf0, 0x00000000, 0x27390001 },
+	{ 0x4b100bf4, 0x00000000, 0xaf190084 },
+	{ 0x4b100bf8, 0x00000000, 0x8fb80000 }, /* lw t8, 0(sp) */
+	{ 0x4b100bfc, 0x00000000, 0x8fb90004 }, /* lw t9, 4(sp) */
+	{ 0x4b100c00, 0x00000000, 0x27bd0008 }, /* addiu sp, sp, 8 */
+	{ 0x4b100c04, 0x00000000, 0x8c470008 }, /* displaced lw a3, 8(v0) */
+	{ 0x4b100c08, 0x00000000, 0x0ac618eb }, /* j 0x8b1863ac */
+	{ 0x4b100c0c, 0x00000000, 0x00000000 },
+	{ 0x4b1863a4, 0x8c470008, 0x0ac402e8 }, /* j capture trace */
+
 	/* Record the adapter's requested source before the actual SetSource call. */
 	{ 0x4b101000, 0x00000000, 0x3c18ae34 }, /* lui t8, trace page */
 	{ 0x4b101004, 0x00000000, 0x34195301 }, /* ori t9, zero, 0x5301 */
@@ -3214,10 +3254,11 @@ static void h713_mips_print_comm_trace(void)
 	u32 dispatch_target, dispatch_source, source3_callback_count;
 	u32 source3_worker_count, source3_worker_old, source3_worker_new;
 	u32 source3_transition_count;
+	u32 cap_irq_count, cap_vde_count, cap_vs_count, cap_mode_count;
 
 	/* The MIPS writes through its uncached alias; ARM's prior snapshot is stale. */
 	invalidate_dcache_range(trace,
-				trace + ALIGN(0x80, CONFIG_SYS_CACHELINE_SIZE));
+				trace + ALIGN(0x9c, CONFIG_SYS_CACHELINE_SIZE));
 
 	magic = readl(trace + 4);
 	stage = readl(trace);
@@ -3247,6 +3288,10 @@ static void h713_mips_print_comm_trace(void)
 	source3_worker_old = readl(trace + 0x74);
 	source3_worker_new = readl(trace + 0x78);
 	source3_transition_count = readl(trace + 0x7c);
+	cap_irq_count = readl(trace + 0x84);
+	cap_vde_count = readl(trace + 0x88);
+	cap_vs_count = readl(trace + 0x8c);
+	cap_mode_count = readl(trace + 0x90);
 
 	if (magic != H713_MIPS_COMM_TRACE_MAGIC) {
 		printf("H713 comm trace: not installed for this boot "
@@ -3282,6 +3327,8 @@ static void h713_mips_print_comm_trace(void)
 	       "ctrl=%08x commit=%08x dirty-latch=%08x\n", frame_stage,
 	       h713_mips_frame_trace_stage_name(frame_stage), frame_dirty,
 	       frame_mode, frame_ctrl, frame_latch, frame_dirty_latch);
+	printf("H713 capture trace: irq=%u vde=%u vs=%u mode-change=%u\n",
+	       cap_irq_count, cap_vde_count, cap_vs_count, cap_mode_count);
 }
 
 static u32 h713_mips_read_comm_trace_stage(void)
@@ -3319,10 +3366,10 @@ static int h713_mips_apply_comm_trace(void)
 		else if (op == 0x2b &&
 			 (((word >> 21) & 0x1f) == 24 ||
 			  ((word >> 21) & 0x1f) == 26) &&
-			 (word & 0xffff) <= 0x7c)
+			 (word & 0xffff) <= 0x90)
 			store_count++;
 	}
-	if (base_count != 61 || store_count != 80) {
+	if (base_count != 62 || store_count != 84) {
 		printf("H713 MIPS: comm trace relocation count mismatch (%d bases, %d stores)\n",
 		       base_count, store_count);
 		return -EINVAL;
@@ -3353,7 +3400,7 @@ static int h713_mips_apply_comm_trace(void)
 		else if (op == 0x2b &&
 			 (((word >> 21) & 0x1f) == 24 ||
 			  ((word >> 21) & 0x1f) == 26) &&
-			 (word & 0xffff) <= 0x7c)
+			 (word & 0xffff) <= 0x90)
 			word += H713_MIPS_COMM_TRACE_MIPS_LO;
 		writel(word, patch->addr);
 	}
@@ -3379,6 +3426,12 @@ static int h713_mips_apply_comm_trace(void)
 	writel(~0U, trace + 0x74);
 	writel(~0U, trace + 0x78);
 	writel(0, trace + 0x7c);
+	writel(0, trace + 0x84);
+	writel(0, trace + 0x88);
+	writel(0, trace + 0x8c);
+	writel(0, trace + 0x90);
+	writel(0, trace + 0x94);
+	writel(0, trace + 0x98);
 	writel(0, trace + 0x40);
 	writel(0, trace + 0x44);
 	writel(~0U, trace + 0x48);
